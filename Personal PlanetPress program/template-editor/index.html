@@ -1,12 +1,458 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PlanetPress Template Editor</title>
-  </head>
-  <body>
-    <div id="app"></div>
-    <script type="module" src="/src/main.ts"></script>
-  </body>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PlanetPress Template Editor</title>
+</head>
+<body>
+
+<header>
+  <h1>PlanetPress Template Editor</h1>
+  <button id="btn-open">Open Template</button>
+  <button id="btn-recents" class="secondary" title="Recently opened templates" style="padding:6px 8px;">▼</button>
+  <button id="btn-open-folder" class="secondary">Open Folder</button>
+  <div id="recents-menu"></div>
+  <button id="btn-back" class="secondary" style="display:none;">← Back to folder</button>
+  <button id="btn-compare" class="secondary" disabled title="Compare current template with another">Compare…</button>
+  <button id="btn-save" class="secondary" disabled>Save Current File (Ctrl+S)</button>
+  <button id="btn-rezip" disabled>Review &amp; Save</button>
+  <span id="filename">No template open</span>
+  <span id="status"></span>
+</header>
+
+<main>
+  <aside id="sidebar">
+    <div id="folder-panel" style="display:none;">
+      <div class="sidebar-header">
+        <span>Templates in folder</span>
+        <button id="btn-rescan" title="Rescan folder">↻</button>
+      </div>
+      <div id="folder-name"></div>
+      <div id="templates-list"></div>
+    </div>
+    <div id="tree-panel" style="display:none; flex:1;">
+      <div class="sidebar-header">
+        <span id="tree-title">Files</span>
+      </div>
+      <div class="mode-toggle">
+        <button id="mode-files" class="active">Files</button>
+        <button id="mode-nav">Sections</button>
+        <button id="mode-scripts">Scripts</button>
+        <button id="mode-theme" style="display:none;" title="Word theme — colour palette, font scheme, named styles">Theme</button>
+        <button id="mode-notes" title="Per-template notes (saved as a .notes.md sidecar in the same folder)">Notes</button>
+        <button id="mode-search">Search</button>
+      </div>
+      <div id="file-toolbar">
+        <button id="btn-file-new" title="Add a new file">+ New</button>
+        <button id="btn-file-rename" title="Rename selected file" disabled>Rename</button>
+        <button id="btn-file-delete" title="Delete selected file" disabled>Delete</button>
+        <button id="btn-file-unlock" title="Strip the read-only markers from snippets, translations, js, fonts, and color-profiles so you can add files into them" disabled>🔓 Unlock</button>
+        <span class="spacer"></span>
+        <span class="ctx-path" id="file-toolbar-ctx" title=""></span>
+      </div>
+      <div id="tree"></div>
+      <div id="nav-panel">
+        <div id="nav-list"></div>
+      </div>
+      <div id="scripts-panel">
+        <div id="scripts-toolbar">
+          <button id="btn-script-new" title="Add a new script">+ New</button>
+          <button id="btn-script-delete" title="Delete selected script" disabled>Delete</button>
+          <span class="spacer"></span>
+        </div>
+        <div id="scripts-kind-chips" title="Filter by script kind">
+          <button class="chip active" data-kind="ALL">All</button>
+          <button class="chip" data-kind="TEXT" title="STANDARD field-text scripts (FLD)">FLD</button>
+          <button class="chip" data-kind="CONDITIONAL" title="Conditional show/hide scripts (IF)">IF</button>
+          <button class="chip" data-kind="CONTROL" title="CONTROL / JS scripts">JS</button>
+        </div>
+        <input id="scripts-search" type="text" placeholder="Filter scripts (by name or @find@)" autocomplete="off" spellcheck="false">
+        <div id="scripts-bulk-bar" title="Acts on every visible script that's checked">
+          <label class="bulk-all"><input type="checkbox" id="scripts-bulk-all"> <span id="scripts-bulk-count">0 selected</span></label>
+          <span class="spacer"></span>
+          <button id="scripts-bulk-enable" disabled title="Enable all checked scripts">Enable</button>
+          <button id="scripts-bulk-disable" disabled title="Disable all checked scripts">Disable</button>
+          <button id="scripts-bulk-delete" disabled class="danger" title="Delete all checked scripts">Delete</button>
+        </div>
+        <div id="scripts-list"></div>
+      </div>
+      <div id="search-panel">
+        <input id="search-input" type="text" placeholder="Search across files (Ctrl+Shift+F)" autocomplete="off" spellcheck="false">
+        <div class="search-options">
+          <label><input type="checkbox" id="search-case"> Aa</label>
+          <label><input type="checkbox" id="search-regex"> .*</label>
+          <label><input type="checkbox" id="search-word"> ⌐W</label>
+        </div>
+        <div id="search-summary"></div>
+        <div id="search-results"></div>
+      </div>
+      <div id="theme-panel">
+        <div id="theme-toolbar">
+          <button id="btn-theme-copy" title="Copy the extracted palette + styles as a CSS block">Copy as CSS</button>
+          <span class="spacer"></span>
+        </div>
+        <div id="theme-content">
+          <div class="empty-msg">Open a .docx to view its theme.</div>
+        </div>
+      </div>
+      <div id="notes-panel">
+        <div id="notes-toolbar">
+          <span class="name" id="notes-filename">(no template open)</span>
+          <button id="btn-notes-save" title="Save the notes file to disk" disabled>Save</button>
+        </div>
+        <textarea id="notes-textarea" placeholder="Per-template scratch notes. Saved as a .notes.md sidecar next to the template (you'll be prompted to grant write access on first save). Ignored by Connect." spellcheck="false"></textarea>
+        <div id="notes-empty" style="display:none;">Open a template to edit its notes.</div>
+      </div>
+    </div>
+  </aside>
+  <div class="resizer" id="resizer"></div>
+  <div id="editor-wrap">
+    <div id="empty">
+      <div style="font-size: 48px;">📦</div>
+      <div><strong>Open a single template</strong> or a <strong>folder</strong> of templates.</div>
+      <div>Supports <code>.OL-template</code>, <code>.OL-datamapper</code>, and <code>.OL-datamodel</code>. The file is unzipped in memory; edit any text file inside, save the edit, then <em>Rezip &amp; Overwrite</em> writes it back to disk.</div>
+      <div style="margin-top: 6px;">Word <code>.docx</code> files open read-only with a rendered <em>Document</em> preview (Copy HTML) and a <em>Theme</em> sidebar showing the doc's colour palette, font scheme, and named styles.</div>
+      <div style="margin-top: 8px; font-size: 11px;">Requires Chrome or Edge (File System Access API).</div>
+    </div>
+    <div id="editor-tab" style="display:none;">
+      <span id="tab-name"></span>
+      <span class="lang" id="tab-lang"></span>
+      <span id="tab-size"></span>
+      <div class="actions">
+        <button id="btn-format" title="Pretty-print this file (Ctrl+Alt+L)">Format</button>
+        <button id="btn-preview" title="Preview HTML with template assets" disabled>Preview</button>
+      </div>
+    </div>
+    <div id="editor-content">
+      <div id="overlay-form-banner">
+        <span id="overlay-form-banner-msg">This file has a known schema. Open it as a form?</span>
+        <span class="spacer"></span>
+        <button id="overlay-form-banner-open">Open as form</button>
+      </div>
+      <div id="editor-host">
+        <div id="editor" style="display:none;"></div>
+        <div id="binary-view"></div>
+        <div id="script-form-view">
+          <div class="form-title" id="sf-title">Script editor</div>
+          <div class="form-sub" id="sf-sub"></div>
+
+          <div class="row">
+            <div class="field">
+              <label>Name</label>
+              <input type="text" id="sf-name" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="field" style="flex:0 0 200px;">
+              <label>Type</label>
+              <input type="text" id="sf-type" readonly tabindex="-1" title="Script kind — derived from the underlying XML, not editable here" style="font-family:monospace;background:#2a2a2a;color:var(--muted);cursor:default;">
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="field">
+              <label>Find Text <span class="hint">@token@ in HTML to replace</span></label>
+              <input type="text" id="sf-find" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="field" style="flex:0 0 130px;">
+              <label>Enabled</label>
+              <div class="checkbox-row" style="padding-top:6px;">
+                <input type="checkbox" id="sf-enabled">
+                <span>Active</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="section" id="sf-standard-section" style="display:none;">
+            <h3>Field binding (Standard text script)</h3>
+            <div class="row">
+              <div class="field" style="flex:2;">
+                <label>Field path</label>
+                <input type="text" id="sf-field-path" list="datamodel-fields" autocomplete="off" spellcheck="false">
+                <datalist id="datamodel-fields"></datalist>
+                <div class="field-meta" id="sf-field-meta"></div>
+              </div>
+              <div class="field" style="flex:0 0 160px;">
+                <label>Type</label>
+                <select id="sf-field-type">
+                  <option value="STRING">STRING</option>
+                  <option value="BOOLEAN">BOOLEAN</option>
+                  <option value="INTEGER">INTEGER</option>
+                  <option value="FLOAT">FLOAT</option>
+                  <option value="CURRENCY">CURRENCY</option>
+                  <option value="DATE">DATE</option>
+                  <option value="DATETIME">DATETIME</option>
+                  <option value="TIME">TIME</option>
+                  <option value="HTMLSTRING">HTMLSTRING</option>
+                  <option value="OBJECT">OBJECT</option>
+                </select>
+              </div>
+              <div class="field" style="flex:0 0 160px;">
+                <label>Insert method</label>
+                <select id="sf-insert-method">
+                  <option value="HTML">HTML</option>
+                  <option value="TEXT">TEXT</option>
+                </select>
+              </div>
+            </div>
+            <div class="row">
+              <div class="field">
+                <label>Prefix</label>
+                <input type="text" id="sf-prefix" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="field">
+                <label>Suffix</label>
+                <input type="text" id="sf-suffix" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="field" style="flex:0 0 160px;">
+                <label>Format</label>
+                <select id="sf-format-type">
+                  <option value="NONE">NONE</option>
+                  <option value="CURRENCY">CURRENCY</option>
+                  <option value="NUMBER">NUMBER</option>
+                  <option value="DATE">DATE</option>
+                  <option value="BOOLEAN">BOOLEAN</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div class="section" id="sf-conditional-section" style="display:none;">
+            <h3>Conditional script (show / hide based on a data field)</h3>
+            <div class="row">
+              <div class="field" style="flex:2;">
+                <label>Field path</label>
+                <input type="text" id="sf-cond-field" list="datamodel-fields" autocomplete="off" spellcheck="false">
+                <div class="field-meta" id="sf-cond-field-meta"></div>
+              </div>
+              <div class="field" style="flex:0 0 160px;">
+                <label>Field type</label>
+                <select id="sf-cond-field-type">
+                  <option value="STRING">STRING</option>
+                  <option value="BOOLEAN">BOOLEAN</option>
+                  <option value="INTEGER">INTEGER</option>
+                  <option value="FLOAT">FLOAT</option>
+                  <option value="CURRENCY">CURRENCY</option>
+                  <option value="DATE">DATE</option>
+                  <option value="DATETIME">DATETIME</option>
+                </select>
+              </div>
+            </div>
+            <div class="row">
+              <div class="field" style="flex:0 0 200px;">
+                <label>Condition</label>
+                <select id="sf-condition">
+                  <option value="EQUAL_TO">EQUAL_TO</option>
+                  <option value="NOT_EQUAL_TO">NOT_EQUAL_TO</option>
+                  <option value="GREATER_THAN">GREATER_THAN</option>
+                  <option value="GREATER_THAN_OR_EQUAL">GREATER_THAN_OR_EQUAL</option>
+                  <option value="LESS_THAN">LESS_THAN</option>
+                  <option value="LESS_THAN_OR_EQUAL">LESS_THAN_OR_EQUAL</option>
+                  <option value="CONTAINS">CONTAINS</option>
+                  <option value="STARTS_WITH">STARTS_WITH</option>
+                  <option value="ENDS_WITH">ENDS_WITH</option>
+                  <option value="MATCHES">MATCHES</option>
+                  <option value="IS_EMPTY">IS_EMPTY</option>
+                  <option value="IS_NOT_EMPTY">IS_NOT_EMPTY</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>Value <span class="hint">compared against the field</span></label>
+                <input type="text" id="sf-cond-value" autocomplete="off" spellcheck="false">
+              </div>
+            </div>
+            <div class="row">
+              <div class="field" style="flex:0 0 160px;">
+                <label>Action</label>
+                <select id="sf-cond-action">
+                  <option value="SHOW">SHOW</option>
+                  <option value="HIDE">HIDE</option>
+                </select>
+              </div>
+              <div class="field" style="flex:0 0 200px;">
+                <label>Case insensitive</label>
+                <div class="checkbox-row" style="padding-top:6px;">
+                  <input type="checkbox" id="sf-cond-case">
+                  <span>Ignore case when comparing</span>
+                </div>
+              </div>
+              <div class="field" style="flex:0 0 220px;">
+                <label>Toggle visibility</label>
+                <div class="checkbox-row" style="padding-top:6px;">
+                  <input type="checkbox" id="sf-cond-toggle">
+                  <span>Use display, not removal</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="section">
+            <h3>Selection &amp; scope</h3>
+            <div class="row">
+              <div class="field" style="flex:0 0 180px;">
+                <label>Scope</label>
+                <select id="sf-scope">
+                  <option value="NONE">NONE</option>
+                  <option value="RESULT_SET">RESULT_SET</option>
+                  <option value="DETAIL">DETAIL</option>
+                </select>
+              </div>
+              <div class="field" style="flex:0 0 180px;">
+                <label>Selector type</label>
+                <select id="sf-selector-type">
+                  <option value="TEXT">TEXT</option>
+                  <option value="CSS">CSS</option>
+                  <option value="XPATH">XPATH</option>
+                  <option value="QUERY">QUERY</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>Selector text</label>
+                <input type="text" id="sf-selector-text" autocomplete="off" spellcheck="false">
+              </div>
+            </div>
+          </div>
+
+          <div class="section" id="sf-source-section">
+            <h3>Source <span class="hint" style="font-weight:normal; text-transform:none; letter-spacing:0;">JavaScript body for CONTROL / advanced scripts</span></h3>
+            <div id="script-source-host"></div>
+          </div>
+
+          <div class="section" id="sf-usages-section">
+            <h3>Usages <span class="hint" style="font-weight:normal; text-transform:none; letter-spacing:0;">where this script's findText appears in HTML</span></h3>
+            <div id="sf-usages"></div>
+          </div>
+
+          <div class="form-actions">
+            <button id="sf-apply">Apply to XML</button>
+            <button id="sf-revert" class="secondary">Revert</button>
+            <button id="sf-delete" style="background:var(--danger);">Delete script</button>
+            <span class="spacer"></span>
+            <span class="raw-link" id="sf-open-raw">Open raw XML…</span>
+            <button id="sf-close" class="ghost">Close</button>
+          </div>
+        </div>
+        <div id="overlay-form-view">
+          <div class="form-title" id="of-title">Form view</div>
+          <div class="form-sub" id="of-sub"></div>
+          <div id="of-fields"></div>
+          <div class="form-actions">
+            <button id="of-apply">Apply to file</button>
+            <button id="of-revert" class="secondary">Revert</button>
+            <span class="spacer"></span>
+            <span class="raw-link" id="of-open-raw">Open raw…</span>
+            <button id="of-close" class="ghost">Close</button>
+          </div>
+        </div>
+        <div id="scenario-form-view">
+          <h2 id="scn-form-title">Scenario editor</h2>
+          <div class="form-sub" id="scn-form-sub"></div>
+          <div id="scn-form-body"></div>
+          <div class="actions">
+            <button id="scn-form-apply">Apply &amp; preview</button>
+            <button id="scn-form-save-as" class="secondary">Save as new XML…</button>
+            <button id="scn-form-revert" class="secondary">Revert</button>
+            <span style="flex:1;"></span>
+            <button id="scn-form-close" class="secondary">Close</button>
+          </div>
+        </div>
+      </div>
+      <div class="preview-resizer" id="preview-resizer" style="display:none;"></div>
+      <div id="preview-pane">
+        <div id="preview-header">
+          <span class="pv-title" id="preview-title">Preview</span>
+          <div class="pv-tabs" title="Switch preview mode">
+            <button id="btn-pv-tab-data" class="active" title="Resolve @field@ tokens with sample values from the datamodel">With&nbsp;Data</button>
+            <button id="btn-pv-tab-raw" title="Render the raw template — no datamodel substitution, tokens shown literally">Raw</button>
+            <button id="btn-pv-tab-split" title="Side-by-side: With Data on the left, Raw on the right">Split</button>
+            <button id="btn-pv-tab-css" title="Show the merged CSS that the preview is using">CSS</button>
+          </div>
+          <div class="zoom-cluster" title="Page zoom (Ctrl+scroll over preview)">
+            <button id="btn-preview-zoom-out" title="Zoom out">−</button>
+            <span id="preview-zoom-level" title="Click to reset to 100%">100%</span>
+            <button id="btn-preview-zoom-in" title="Zoom in">+</button>
+          </div>
+          <button id="btn-preview-refresh" title="Re-render the preview">↻ Refresh</button>
+          <button id="btn-preview-newtab" title="Open in new tab">↗ New tab</button>
+          <button id="btn-preview-close" title="Close preview">×</button>
+        </div>
+        <div id="preview-scenario-row">
+          <div id="preview-scenario-wrap" style="display:none;" title="Render the preview against a DataMapper sample XML instead of the datamodel's lastValue">
+            <span class="lbl">Scenario:</span>
+            <select id="preview-scenario">
+              <option value="">(datamodel sample)</option>
+            </select>
+            <button id="btn-scenario-load" title="Load scenarios from a .OL-datamapper">…</button>
+            <button id="btn-scenario-matrix" title="Coverage matrix — every scenario × every section in one view" disabled>▦</button>
+            <button id="btn-scenario-diff" title="Diff two scenarios side by side" disabled>≠</button>
+            <button id="btn-scenario-edit" title="Edit selected scenario as a form" disabled>✎</button>
+          </div>
+        </div>
+        <div id="preview-body">
+          <div id="preview-tokens-strip">
+            <span class="t-label">Unresolved:</span>
+            <span class="t-list" id="preview-tokens-list"></span>
+            <button class="dismiss" id="btn-preview-tokens-dismiss" title="Hide this strip">×</button>
+          </div>
+          <iframe id="preview-frame" sandbox="allow-same-origin allow-scripts" srcdoc="<div style='font:13px sans-serif;color:#888;padding:16px'>Pick an HTML file and click Preview.</div>"></iframe>
+          <div id="preview-split">
+            <div class="pv-split-pane">
+              <div class="pv-split-label data"><span class="dot"></span>With Data</div>
+              <iframe id="preview-frame-data" class="pv-split-frame" sandbox="allow-same-origin allow-scripts"></iframe>
+            </div>
+            <div class="pv-split-pane">
+              <div class="pv-split-label raw"><span class="dot"></span>Raw</div>
+              <iframe id="preview-frame-raw" class="pv-split-frame" sandbox="allow-same-origin allow-scripts"></iframe>
+            </div>
+          </div>
+          <div id="preview-css-view">
+            <div id="preview-css-summary">
+              <span id="preview-css-stats">No CSS yet</span>
+              <span class="spacer"></span>
+              <button id="btn-preview-css-copy" title="Copy all CSS to clipboard">Copy</button>
+            </div>
+            <pre id="preview-css-code"><span class="comment">/* Render a template to see its merged CSS here. */</span></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<div id="modal-backdrop" class="modal-backdrop">
+  <div class="modal">
+    <div class="modal-header">
+      <h2 id="modal-title">Diff</h2>
+      <button id="modal-close" class="secondary">Close</button>
+    </div>
+    <div class="modal-body">
+      <aside id="modal-sidebar" class="modal-sidebar"></aside>
+      <div id="modal-main" class="modal-main"><div class="diff-empty">Pick a file on the left.</div></div>
+    </div>
+    <div class="modal-footer">
+      <span id="modal-status"></span>
+      <button id="modal-cancel" class="secondary">Cancel</button>
+      <button id="modal-action">Confirm</button>
+    </div>
+  </div>
+</div>
+
+
+<!--
+  CDN dependencies. Versions are pinned and SRI integrity hashes attached.
+  If you upgrade a version, recompute the sha384 with:
+    node -e "https.get(URL, r => { const c = []; r.on('data', x => c.push(x)); r.on('end', () => console.log(crypto.createHash('sha384').update(Buffer.concat(c)).digest('base64'))); })"
+  Note: SRI on monaco's loader.js only protects the loader itself - the
+  language/editor chunks it fetches dynamically are not covered.
+-->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"
+        integrity="sha384-+mbV2IY1Zk/X1p/nWllGySJSUN8uMs+gUAN10Or95UBH0fpj6GfKgPmgC5EXieXG"
+        crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsdiff/5.1.0/diff.min.js"
+        integrity="sha384-kfJm1UHujU89hXr0VHT0u0t4lqavqaoomP6wix8D9fhzTeFvC9DYyaT36//Qd144"
+        crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"
+        integrity="sha384-SF/kPhqG3NMxqsYAbQqHkdF53WQx8yTkY0Ys+M+ayeC20QNujPyyxIuUEdEf0eG/"
+        crossorigin="anonymous"></script>
+<script type="module" src="/src/main.ts"></script>
+</body>
 </html>

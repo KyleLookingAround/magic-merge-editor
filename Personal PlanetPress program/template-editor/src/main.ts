@@ -1,9 +1,9 @@
-// Entry point. Phase 3 will carve modules out of template-editor.html in this order:
-//   state -> recents -> monaco-host -> fs -> tree -> editor -> search ->
-//   review-modal -> preview -> scripts-panel
-// Smoke against M2L-KFI.OL-template after each step.
+// Phase 3 entry point. The full editor logic still lives in legacy.ts
+// as a verbatim copy of the original inline <script>. Modules are being
+// carved out incrementally in this order:
+//   state -> recents -> monaco-host -> fs -> tree -> editor ->
+//   search -> review-modal -> preview -> scripts-panel
+// Smoke against M2L-KFI.OL-template after each carve.
 
-const app = document.querySelector<HTMLDivElement>('#app');
-if (app) {
-  app.textContent = 'PlanetPress Template Editor — scaffold';
-}
+import './styles.css';
+import './legacy';

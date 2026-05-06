@@ -1,0 +1,5948 @@
+// @ts-nocheck
+// Phase 3 baseline: lightly-modified copy of the inline <script> from
+// template-editor.html (lines 1394-7387). Do NOT edit logic here -
+// modifications belong in extracted ES modules.
+//
+// Already carved (real ES modules, imported below):
+//   state    -> ./state.ts
+//   recents  -> ./recents.ts (pure DB + format helpers; menu wiring still here)
+//
+// Still to carve (search this file for "CARVE:" anchors):
+//   monaco-host    - require.config + monaco bootstrap (~line 22)
+//                    + registerFieldTokenCompletion
+//   fs             - pickAndOpenFile / pickAndOpenFolder / scanFolderTemplates
+//                    / loadFromHandle / rezipAndSave / decodeBytes / decodeXmlEntities
+//                    / encodeXmlText / encodeXmlAttr / TEXT_EXTS / LANG_BY_EXT / extOf
+//   tree           - buildTree / renderNode / refreshTreeDirtyMarkers / revealInTree
+//                    / file add-rename-delete (promptNewFile / renameFile / deleteFile
+//                    / openNewFileModal / openContextMenu) + locked-folder unlock
+//   editor         - openFile / commitCurrentEdit / validateXml / formatCurrent
+//                    / formatXml + Monaco model management
+//   search         - setSidebarMode / runSearch / appendSearchFile / renderSnippet
+//                    / jumpToSearch
+//   review-modal   - openModal / closeModal / renderDiff / reviewAndSave
+//                    / compareTemplates / zipTextMap
+//   preview        - togglePreview / openPreview / closePreview / refreshPreview
+//                    / buildPreviewHtml + zoom controls + token-jump handlers
+//                    + DOCX theme extractor (parseDocxTheme / renderThemePanel
+//                    / buildThemeCss) + applyDatamodelPersonalization
+//                    + collectUnresolvedTokens + renderTokensStrip + renderCssView
+//   scripts-panel  - parseScriptsFromXml / serializeScriptBack / refreshScriptsList
+//                    / renderScriptsList / openScriptForm / closeScriptForm
+//                    / applyScriptForm / createScript / deleteScript / cloneScript
+//                    / toggleScriptEnabled / moveScript / bulk* / scenario* / notes*
+//                    / recentScripts* / openCoverageMatrix / openScenarioDiff
+//                    / openOverlayForm / openPresetOverlay / parseDatamodelFields
+//                    / renderNavigator
+//
+// External globals (JSZip, Diff, monaco loader) are still loaded
+// from CDN <script> tags in index.html and remain on window.
+//
+// Carve methodology that worked for state/recents:
+//   1. Create src/<name>.ts exporting the pure functions/types.
+//   2. Replace the in-place block here with a "CARVE:" comment + import
+//      added at the top of this file.
+//   3. For monkey-patches (`const _orig = X; X = async function ...`),
+//      keep both the original and the patch in legacy.ts until ALL
+//      callers/dependents have moved out, then convert to a hook system.
+//   4. After each carve: `npx tsc --noEmit && npx vite build`, then
+//      smoke-test the built dist/index.html against M2L-KFI.OL-template.
+import { state } from './state';
+import { recentsAdd, recentsList, recentsRemove, recentsClear, formatRecentTime } from './recents';
+
+(function () {
+'use strict';
+
+// Default indent for newly-created <script> elements inside index.xml.
+// Matches PlanetPress's existing 16-space indentation of script siblings.
+const DEFAULT_SCRIPT_INDENT = ' '.repeat(16);
+
+// ---------- state ----------
+// Carved out to ./state.ts. Imported above; same object identity, same keys.
+
+// ---------- monaco bootstrap ----------
+require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } });
+require(['vs/editor/editor.main'], () => {
+  state.editor = monaco.editor.create(document.getElementById('editor'), {
+    value: '',
+    theme: 'vs-dark',
+    automaticLayout: true,
+    minimap: { enabled: false },
+    wordWrap: 'on',
+    fontSize: 13,
+    scrollBeyondLastLine: false,
+  });
+  state.editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => commitCurrentEdit(true));
+  state.monacoReady = true;
+  document.getElementById('btn-save').disabled = !state.currentPath;
+
+  // Register @field@ token autocomplete for HTML files. Reads from
+  // scriptsState.datamodelFields (populated when a template with a
+  // datamodel is opened) so the suggestion list always reflects the
+  // current template's data shape.
+  registerFieldTokenCompletion(['html']);
+});
+
+// Provides autocomplete for `@field@` placeholders inside template HTML.
+// Triggers on `@`, also fires while typing more characters after it.
+// Selection inserts `path@` so the closing delimiter is added automatically;
+// if a closing `@` already follows the cursor, the existing one is consumed
+// instead. Skips occurrences where the `@` is preceded by a word char (that
+// `@` is almost certainly the closing delimiter of an already-typed token).
+function registerFieldTokenCompletion(languages) {
+  if (typeof monaco === 'undefined') return;
+  const TOKEN_RE = /@([A-Za-z0-9_./\-]*)$/;
+  const provider = {
+    triggerCharacters: ['@'],
+    provideCompletionItems(model, position) {
+      const fields = (typeof scriptsState !== 'undefined' && scriptsState.datamodelFields) || [];
+      // Drop table-typed entries — those aren't directly substitutable as a token.
+      const candidates = fields.filter(f => f && f.type !== 'table');
+      if (!candidates.length) return { suggestions: [] };
+
+      const lineText = model.getLineContent(position.lineNumber);
+      const before = lineText.slice(0, position.column - 1);
+      const m = TOKEN_RE.exec(before);
+      if (!m) return { suggestions: [] };
+      const word = m[1];
+      const atIdx = before.length - word.length - 1; // 0-based line index of `@`
+      const prevChar = atIdx > 0 ? lineText.charAt(atIdx - 1) : '';
+      if (/[A-Za-z0-9_./\-]/.test(prevChar)) return { suggestions: [] };
+
+      // After-cursor: if there's already a closing `@` immediately following
+      // (with optional word chars in between), include those chars in the
+      // replace range and skip the auto-added closing `@`.
+      const after = lineText.slice(position.column - 1);
+      const afterMatch = /^[A-Za-z0-9_./\-]*@/.exec(after);
+
+      const range = {
+        startLineNumber: position.lineNumber,
+        endLineNumber: position.lineNumber,
+        startColumn: atIdx + 2, // 1-based column right after the `@`
+        endColumn: position.column + (afterMatch ? afterMatch[0].length : 0),
+      };
+
+      const truncate = (s, n) => (s && s.length > n) ? s.slice(0, n) + '…' : (s || '');
+      const suggestions = candidates.map(f => {
+        const tail = afterMatch ? '' : '@';
+        const sample = f.lastValue ? '  =  ' + truncate(String(f.lastValue), 60) : '';
+        return {
+          label: '@' + f.path + '@',
+          insertText: f.path + tail,
+          range,
+          filterText: f.path,
+          sortText: f.path,
+          kind: monaco.languages.CompletionItemKind.Variable,
+          detail: (f.type || 'STRING') + sample,
+          documentation: f.lastValue
+            ? { value: '**Sample value**\n\n```\n' + String(f.lastValue) + '\n```' }
+            : undefined,
+        };
+      });
+      return { suggestions };
+    },
+  };
+  for (const lang of languages) {
+    monaco.languages.registerCompletionItemProvider(lang, provider);
+  }
+}
+
+// ---------- helpers ----------
+const TEXT_EXTS = new Set([
+  'xml','html','htm','js','mjs','css','json','txt','md','svg','xsl','xslt',
+  'csv','tsv','yml','yaml','config','log','properties','ini',
+  // PlanetPress / Connect XML formats
+  'ol-datamodel','ol-jobpreset','ol-outputpreset','ol-script','ol-config',
+]);
+const LANG_BY_EXT = {
+  xml: 'xml', xsl: 'xml', xslt: 'xml', svg: 'xml', config: 'xml',
+  html: 'html', htm: 'html',
+  js: 'javascript', mjs: 'javascript',
+  css: 'css',
+  json: 'json',
+  md: 'markdown',
+  yml: 'yaml', yaml: 'yaml',
+  'ol-datamodel': 'xml', 'ol-jobpreset': 'xml', 'ol-outputpreset': 'xml',
+  'ol-script': 'xml', 'ol-config': 'xml',
+};
+const IMAGE_EXTS = new Set(['png','jpg','jpeg','gif','bmp','webp','ico']);
+// Top-level container files we treat as zip archives to unpack.
+const ZIP_EXTS = new Set(['ol-template','ol-datamapper','zip']);
+
+function extOf(path) {
+  const m = /\.([^.\/]+)$/.exec(path);
+  return m ? m[1].toLowerCase() : '';
+}
+function langFor(path) { return LANG_BY_EXT[extOf(path)] || 'plaintext'; }
+function isTextPath(path) { return TEXT_EXTS.has(extOf(path)); }
+function isImagePath(path) { return IMAGE_EXTS.has(extOf(path)); }
+function isZipExt(path) { return ZIP_EXTS.has(extOf(path)); }
+
+// ---------- shared XML / text helpers ----------
+// These were originally defined deep inside the Scripts feature. They're
+// hoisted up so anything in the file (preview tokens, navigator, search,
+// new-file dialog, presets editor) can reuse the same encode/decode rules
+// rather than re-implementing them implicitly. Round-trip safe: the encoder
+// escapes the same five entities the decoder recognises (& < > " ').
+
+function decodeXmlEntities(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+function encodeXmlText(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+function encodeXmlAttr(s) {
+  // encodeXmlText already escapes both quotes, so attr context is just text.
+  return encodeXmlText(s);
+}
+
+// Find the indentation prefix on the line that contains a given absolute
+// offset. Used by anything that splices text into another text and wants
+// the new content to honour the surrounding indentation (clone/create/
+// delete script, +New file dialog, format helpers).
+function indentAt(text, offset) {
+  let i = offset;
+  while (i > 0 && text[i - 1] !== '\n') i--;
+  let j = i;
+  while (j < text.length && (text[j] === ' ' || text[j] === '\t')) j++;
+  return text.slice(i, j);
+}
+
+// Replace the inner text of a single top-level child tag inside a chunk.
+// Preserves indentation; supports empty-element <tag/> by expanding it.
+// Hoisted up so the preset overlay form can splice fields back the same
+// way serializeScriptBack does — this is the standard "_raw + offset
+// splice" pattern that the rest of the file uses for XML mutations.
+function replaceTagInner(chunk, tag, newInner) {
+  const reFull = new RegExp(`(<${tag}(?:\\s[^>]*)?)>([\\s\\S]*?)(<\\/${tag}>)`);
+  if (reFull.test(chunk)) {
+    return chunk.replace(reFull, (_m, open, _old, close) => `${open}>${newInner}${close}`);
+  }
+  // self-closing: <tag/> -> <tag>X</tag>
+  const reSelf = new RegExp(`<${tag}(\\s[^>]*)?\\s*/>`);
+  if (reSelf.test(chunk)) {
+    return chunk.replace(reSelf, (_m, attrs) => `<${tag}${attrs || ''}>${newInner}</${tag}>`);
+  }
+  return chunk; // tag absent — leave as-is
+}
+
+// ---------- generic memoise-by-key cache ----------
+// Lifted from scriptsState.usagesCache so the same one-shot-cache pattern
+// can be reused elsewhere (preview unresolved tokens, search results,
+// compare-templates modal). Each cache holds plain values keyed by string.
+// Call .invalidate() whenever underlying state changes (file mutations,
+// host-file switch, etc.) — there's no auto-invalidation.
+function makeMemoCache() {
+  const store = Object.create(null);
+  return {
+    get(key) { return store[key]; },
+    has(key) { return Object.prototype.hasOwnProperty.call(store, key); },
+    set(key, value) { store[key] = value; return value; },
+    getOrCompute(key, compute) {
+      if (Object.prototype.hasOwnProperty.call(store, key)) return store[key];
+      const v = compute();
+      store[key] = v;
+      return v;
+    },
+    invalidate(key) {
+      if (key == null) {
+        for (const k of Object.keys(store)) delete store[k];
+      } else {
+        delete store[key];
+      }
+    },
+  };
+}
+
+// Sniff whether bytes look like text. Used as fallback for unknown extensions.
+function looksLikeText(bytes) {
+  if (!bytes || bytes.length === 0) return true;
+  // ZIP / common binary magic
+  if (bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4B) return false; // PK
+  if (bytes.length >= 4 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46) return false; // %PDF
+  if (bytes.length >= 4 && bytes[0] === 0x89 && bytes[1] === 0x50) return false; // PNG
+  const limit = Math.min(bytes.length, 4096);
+  let nulls = 0;
+  for (let i = 0; i < limit; i++) {
+    if (bytes[i] === 0) { nulls++; if (nulls > 1) return false; }
+  }
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice(0, limit));
+    return true;
+  } catch (_) {
+    // Treat as text anyway if mostly printable — falls back to latin1 decode at load
+    return true;
+  }
+}
+
+function setStatus(msg, kind) {
+  const el = document.getElementById('status');
+  el.textContent = msg || '';
+  el.className = kind || '';
+  if (msg && kind === 'ok') {
+    setTimeout(() => { if (el.textContent === msg) { el.textContent = ''; el.className = ''; } }, 4000);
+  }
+}
+
+function decodeBytes(bytes) {
+  // Try UTF-8 first; fall back to latin1.
+  try {
+    const txt = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return txt;
+  } catch (e) {
+    return new TextDecoder('latin1').decode(bytes);
+  }
+}
+
+// ---------- open / load ----------
+document.getElementById('btn-open').addEventListener('click', () => pickAndOpenFile());
+document.getElementById('btn-open-folder').addEventListener('click', () => pickAndOpenFolder());
+document.getElementById('btn-save').addEventListener('click', () => commitCurrentEdit(true));
+document.getElementById('btn-rezip').addEventListener('click', rezipAndSave);
+document.getElementById('btn-back').addEventListener('click', backToFolderList);
+document.getElementById('btn-rescan').addEventListener('click', () => state.dirHandle && scanFolderTemplates(state.dirHandle, true));
+
+async function pickAndOpenFile() {
+  if (!window.showOpenFilePicker) {
+    alert('Your browser doesn\'t support the File System Access API. Please open this in Chrome or Edge.');
+    return;
+  }
+  if (hasUnsaved() && !confirm('You have unsaved edits. Discard them and open a new file?')) return;
+  let handle;
+  try {
+    [handle] = await window.showOpenFilePicker({ multiple: false });
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    setStatus('Open failed: ' + e.message, 'err');
+    return;
+  }
+  // Leaving folder mode: hide back button + folder panel
+  state.dirHandle = null; state.folderTemplates = []; state.dirName = null;
+  document.getElementById('btn-back').style.display = 'none';
+  document.getElementById('folder-panel').style.display = 'none';
+  await loadFromHandle(handle);
+}
+
+async function pickAndOpenFolder() {
+  if (!window.showDirectoryPicker) {
+    alert('Your browser doesn\'t support directory picking. Please open this in Chrome or Edge.');
+    return;
+  }
+  if (hasUnsaved() && !confirm('You have unsaved edits. Discard them and open a new folder?')) return;
+  let dirHandle;
+  try {
+    dirHandle = await window.showDirectoryPicker();
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    setStatus('Open folder failed: ' + e.message, 'err');
+    return;
+  }
+  state.dirHandle = dirHandle;
+  state.dirName = dirHandle.name;
+  await scanFolderTemplates(dirHandle, false);
+  // Show the folder panel; hide tree until a template is picked
+  document.getElementById('folder-panel').style.display = '';
+  document.getElementById('tree-panel').style.display = 'none';
+  document.getElementById('folder-name').textContent = dirHandle.name;
+  document.getElementById('btn-back').style.display = 'none'; // already in list view
+  document.getElementById('empty').classList.remove('hidden');
+  document.getElementById('editor-tab').style.display = 'none';
+  document.getElementById('editor').style.display = 'none';
+  document.getElementById('binary-view').classList.remove('show');
+  document.getElementById('btn-rezip').disabled = true;
+  document.getElementById('btn-save').disabled = true;
+  document.getElementById('filename').textContent = `Folder: ${dirHandle.name}`;
+}
+
+async function scanFolderTemplates(dirHandle, isRescan) {
+  setStatus('Scanning folder...');
+  const items = [];
+  try {
+    for await (const entry of dirHandle.values()) {
+      if (entry.kind !== 'file') continue;
+      const ext = extOf(entry.name);
+      if (ZIP_EXTS.has(ext) || ext === 'ol-datamodel' || ext === 'docx') {
+        items.push({ name: entry.name, handle: entry, ext });
+      }
+    }
+  } catch (e) {
+    setStatus('Scan failed: ' + e.message, 'err');
+    return;
+  }
+  items.sort((a, b) => a.name.localeCompare(b.name));
+  state.folderTemplates = items;
+  renderTemplatesList();
+  setStatus(`Found ${items.length} template${items.length === 1 ? '' : 's'}${isRescan ? ' (rescanned)' : ''}.`, 'ok');
+}
+
+function renderTemplatesList() {
+  const list = document.getElementById('templates-list');
+  list.innerHTML = '';
+  if (!state.folderTemplates.length) {
+    list.innerHTML = '<div class="empty-msg">No .OL-template / .OL-datamapper / .OL-datamodel / .docx files found.</div>';
+    return;
+  }
+  for (const t of state.folderTemplates) {
+    const el = document.createElement('div');
+    el.className = 'template-item';
+    if (state.fileHandle && state.fileHandle.name === t.name) el.classList.add('active');
+    const kindLabel = t.ext === 'ol-datamapper' ? 'DM' : t.ext === 'ol-datamodel' ? 'MDL' : 'TPL';
+    el.innerHTML = `<span class="kind">${kindLabel}</span><span>${escapeHtml(t.name)}</span>`;
+    el.addEventListener('click', async () => {
+      if (hasUnsaved() && !confirm('You have unsaved edits in the current template. Discard them?')) return;
+      await loadFromHandle(t.handle);
+    });
+    list.appendChild(el);
+  }
+}
+
+async function backToFolderList() {
+  if (hasUnsaved() && !confirm('You have unsaved edits. Discard them?')) return;
+  // Return to folder list view
+  document.getElementById('folder-panel').style.display = '';
+  document.getElementById('tree-panel').style.display = 'none';
+  document.getElementById('btn-back').style.display = 'none';
+  document.getElementById('editor-tab').style.display = 'none';
+  document.getElementById('editor').style.display = 'none';
+  document.getElementById('binary-view').classList.remove('show');
+  document.getElementById('empty').classList.remove('hidden');
+  document.getElementById('btn-rezip').disabled = true;
+  document.getElementById('btn-save').disabled = true;
+  document.getElementById('filename').textContent = `Folder: ${state.dirName}`;
+  // Drop the current template state so it's not accidentally rezipped
+  state.zip = null; state.fileHandle = null; state.fileName = null; state.files = {};
+  state.currentPath = null; state.standalone = null;
+  state.isDocx = false; state.docxBytes = null;
+  Object.values(state.monacoModels).forEach(m => m.dispose());
+  state.monacoModels = {};
+  // Reset .docx-conditional UI bits and close any open preview
+  document.getElementById('mode-theme').style.display = 'none';
+  document.getElementById('mode-nav').style.display = '';
+  document.getElementById('mode-scripts').style.display = '';
+  if (previewState && previewState.open) closePreview();
+  renderTemplatesList();
+}
+
+function hasUnsaved() {
+  return Object.values(state.files).some(f => f.dirty)
+      || (state.standalone && state.standalone.dirty);
+}
+
+async function loadFromHandle(handle) {
+  setStatus('Reading...');
+  const file = await handle.getFile();
+  const headBytes = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+  const isZip = headBytes.length >= 2 && headBytes[0] === 0x50 && headBytes[1] === 0x4B;
+
+  // Reset state for new file
+  state.zip = null;
+  state.standalone = null;
+  state.isDocx = false;
+  state.docxBytes = null;
+  if (typeof previewState === 'object') {
+    previewState.lastDocxHtml = '';
+    previewState.lastDocxHtmlFor = null;
+  }
+  state.fileHandle = handle;
+  state.fileName = handle.name;
+  state.files = {};
+  state.currentPath = null;
+  Object.values(state.monacoModels).forEach(m => m.dispose());
+  state.monacoModels = {};
+
+  if (isZip) {
+    let zip;
+    try {
+      zip = await JSZip.loadAsync(file);
+    } catch (e) {
+      setStatus('Not a valid zip: ' + e.message, 'err');
+      return;
+    }
+    state.zip = zip;
+
+    const paths = [];
+    zip.forEach((path, entry) => { if (!entry.dir) paths.push(path); });
+
+    const progressEvery = Math.max(1, Math.floor(paths.length / 20));
+    let i = 0;
+    for (const path of paths) {
+      const entry = zip.file(path);
+      const bytes = await entry.async('uint8array');
+      // Decide text vs binary: known text extension OR sniff
+      const known = isTextPath(path);
+      const isText = known || (!isImagePath(path) && looksLikeText(bytes));
+      state.files[path] = isText
+        ? { content: decodeBytes(bytes), isText: true, dirty: false }
+        : { content: bytes, isText: false, dirty: false };
+      i++;
+      if (i % progressEvery === 0) setStatus(`Reading... ${i}/${paths.length}`);
+    }
+    // Detect Word .docx packages — they're zips containing word/document.xml.
+    // Be permissive about path casing and separators; some packagers have been
+    // observed to write `Word/Document.xml` or use backslashes. We also fall
+    // back to a filename-extension check so a renamed/repackaged docx still
+    // gets the docx UI even if its part name is unusual.
+    const looksLikeDocx = paths.some(p => /(?:^|[\/\\])word[\/\\]document\.xml$/i.test(p))
+      || extOf(handle.name) === 'docx';
+    state.isDocx = looksLikeDocx;
+    console.log('[docx] detection', { fileName: handle.name, isDocx: state.isDocx, partCount: paths.length, hasWordDocXml: paths.some(p => /(?:^|[\/\\])word[\/\\]document\.xml$/i.test(p)) });
+    document.getElementById('tree-title').textContent = handle.name;
+    buildTree();
+    // Rezip-and-overwrite is unsafe for .docx — JSZip rebuild doesn't preserve
+    // the package invariants (Content_Types ordering, rels, embedded media). The
+    // editor is read-only for Word docs; users get the file tree, preview, and
+    // theme extractor instead.
+    document.getElementById('btn-rezip').disabled = state.isDocx;
+    if (state.isDocx) {
+      document.getElementById('btn-rezip').title = 'Save disabled for .docx — modifying the package can corrupt it. Use Word to edit the source.';
+    } else {
+      document.getElementById('btn-rezip').title = '';
+    }
+    setStatus(`Loaded ${paths.length} files${state.isDocx ? ' (Word document — read-only)' : ''}.`, 'ok');
+  } else {
+    // Standalone file (e.g. a bare .OL-datamodel XML on disk)
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const isText = isTextPath(handle.name) || looksLikeText(bytes);
+    if (!isText) {
+      setStatus('That file is binary and isn\'t a zip — nothing to edit.', 'err');
+      return;
+    }
+    state.standalone = {
+      isText: true,
+      content: decodeBytes(bytes),
+      dirty: false,
+    };
+    // Use a single virtual entry in state.files so the editor logic reuses
+    state.files[handle.name] = { content: state.standalone.content, isText: true, dirty: false, standalone: true };
+    document.getElementById('tree-title').textContent = handle.name;
+    buildTree();
+    document.getElementById('btn-rezip').disabled = false; // re-used: writes the standalone file
+    setStatus('Loaded standalone file.', 'ok');
+  }
+
+  document.getElementById('filename').textContent = handle.name;
+  document.getElementById('filename').classList.remove('dirty');
+  document.getElementById('empty').classList.add('hidden');
+  document.getElementById('tree-panel').style.display = '';
+  document.getElementById('btn-rezip').textContent = state.zip ? 'Rezip & Overwrite' : 'Save & Overwrite';
+
+  // Toggle .docx-conditional UI elements based on what we just loaded.
+  // (Single spot so it stays correct across zip / docx / standalone.)
+  document.getElementById('mode-theme').style.display = state.isDocx ? '' : 'none';
+  document.getElementById('mode-nav').style.display = state.isDocx ? 'none' : '';
+  document.getElementById('mode-scripts').style.display = state.isDocx ? 'none' : '';
+  // If the user was sitting on Theme/Sections/Scripts and opens an incompatible
+  // file, fall back to Files mode so they don't see an empty/wrong panel.
+  const themeOn = document.getElementById('mode-theme').classList.contains('active');
+  const navOn = document.getElementById('mode-nav').classList.contains('active');
+  const scriptsOn = document.getElementById('mode-scripts').classList.contains('active');
+  if ((themeOn && !state.isDocx) || ((navOn || scriptsOn) && state.isDocx)) {
+    setSidebarMode('files');
+  }
+
+  // If we came from folder mode, show the back button and keep folder panel visible
+  if (state.dirHandle) {
+    document.getElementById('btn-back').style.display = '';
+    document.getElementById('folder-panel').style.display = '';
+    renderTemplatesList(); // refresh active highlight
+  }
+
+  // Auto-open the first text file (or the only file in standalone mode)
+  const firstText = Object.entries(state.files).find(([, f]) => f.isText);
+  if (firstText) openFile(firstText[0]);
+
+}
+
+// ---------- file tree ----------
+// PlanetPress packages frequently use BACKSLASH separators inside zip entries
+// (e.g. `public\document\css\Header.css`). Split on either separator so the
+// tree nests properly regardless of which form the original packager wrote.
+// Also: zero-byte entries whose path matches one of OL Connect's reserved
+// "locked" folders (snippets / translations / js / fonts / color-profiles)
+// are folder markers, not files — render them as empty folders with a 🔒.
+function buildTree() {
+  const root = { name: '', children: {}, files: [] };
+  for (const path of Object.keys(state.files).sort()) {
+    const parts = path.split(/[/\\]/);
+    let node = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const seg = parts[i];
+      node.children[seg] = node.children[seg] || { name: seg, children: {}, files: [] };
+      node = node.children[seg];
+    }
+    const leaf = parts[parts.length - 1];
+    // Folder-marker entry: zero bytes + matches a known locked folder name.
+    // Promote to a child folder rather than listing as a file.
+    if (isLockedFolderMarker(path, state.files[path])) {
+      node.children[leaf] = node.children[leaf] || { name: leaf, children: {}, files: [], lockedMarker: path };
+      continue;
+    }
+    node.files.push({ name: leaf, path });
+  }
+  const treeEl = document.getElementById('tree');
+  treeEl.innerHTML = '';
+  treeEl.appendChild(renderNode(root, ''));
+}
+
+function renderNode(node, prefix) {
+  const frag = document.createDocumentFragment();
+  // Directories first (alphabetical)
+  const dirNames = Object.keys(node.children).sort();
+  for (const dirName of dirNames) {
+    const child = node.children[dirName];
+    const dirEl = document.createElement('div');
+    dirEl.className = 'tree-item dir';
+    const header = document.createElement('div');
+    header.className = 'tree-item';
+    const lockBadge = child.lockedMarker
+      ? ' <span class="badge" style="background:#5a4a1a;color:#f0c674;font-size:9px;margin-left:4px;padding:0 4px;border-radius:2px;" title="Locked by OL Connect — click 🔓 Unlock in the toolbar">LOCKED</span>'
+      : '';
+    header.innerHTML = `<span class="icon">▸</span><span class="name">${escapeHtml(dirName)}</span>${lockBadge}`;
+    header.style.padding = '0';
+    const wrap = document.createElement('div');
+    wrap.className = 'children';
+    wrap.appendChild(renderNode(node.children[dirName], prefix + dirName + '/'));
+    let collapsed = false;
+    header.addEventListener('click', () => {
+      collapsed = !collapsed;
+      wrap.style.display = collapsed ? 'none' : '';
+      header.querySelector('.icon').textContent = collapsed ? '▸' : '▾';
+    });
+    // expand by default
+    header.querySelector('.icon').textContent = '▾';
+    const block = document.createElement('div');
+    block.appendChild(header);
+    block.appendChild(wrap);
+    frag.appendChild(block);
+  }
+  // Files
+  const sortedFiles = node.files.slice().sort((a, b) => a.name.localeCompare(b.name));
+  for (const f of sortedFiles) {
+    const item = document.createElement('div');
+    item.className = 'tree-item file';
+    item.dataset.path = f.path;
+    const icon = isTextPath(f.path) ? '📄' : (isImagePath(f.path) ? '🖼️' : '🔒');
+    item.innerHTML = `<span class="icon">${icon}</span><span class="name">${escapeHtml(f.name)}</span>`;
+    if (state.files[f.path] && state.files[f.path].dirty) item.classList.add('dirty');
+    item.addEventListener('click', () => openFile(f.path));
+    frag.appendChild(item);
+  }
+  return frag;
+}
+
+function refreshTreeDirtyMarkers() {
+  document.querySelectorAll('.tree-item.file').forEach(el => {
+    const p = el.dataset.path;
+    if (state.files[p] && state.files[p].dirty) el.classList.add('dirty');
+    else el.classList.remove('dirty');
+  });
+  const anyDirty = Object.values(state.files).some(f => f.dirty);
+  document.getElementById('filename').classList.toggle('dirty', anyDirty);
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ---------- editor open / commit ----------
+function openFile(path) {
+  // Commit any pending live edit on the current file's model first (handled per-model)
+  state.currentPath = path;
+  document.querySelectorAll('.tree-item.file').forEach(el => {
+    el.classList.toggle('active', el.dataset.path === path);
+  });
+  const tab = document.getElementById('editor-tab');
+  document.getElementById('tab-name').textContent = path;
+  document.getElementById('tab-lang').textContent = langFor(path);
+  const f = state.files[path];
+
+  const editorEl = document.getElementById('editor');
+  const binaryEl = document.getElementById('binary-view');
+  binaryEl.classList.remove('show');
+  binaryEl.innerHTML = '';
+  tab.style.display = 'flex';
+
+  if (f.isText) {
+    const sizeKb = (new Blob([f.content]).size / 1024).toFixed(1);
+    document.getElementById('tab-size').textContent = sizeKb + ' KB';
+    editorEl.style.display = '';
+    if (!state.monacoReady) {
+      // Defer until ready
+      const tries = setInterval(() => {
+        if (state.monacoReady) { clearInterval(tries); openFile(path); }
+      }, 100);
+      return;
+    }
+    let model = state.monacoModels[path];
+    if (!model) {
+      model = monaco.editor.createModel(f.content, langFor(path));
+      model.onDidChangeContent(() => {
+        // mark dirty live; we don't push to state.files content until commit
+        f.dirty = true;
+        refreshTreeDirtyMarkers();
+        document.getElementById('btn-save').disabled = false;
+      });
+      state.monacoModels[path] = model;
+    }
+    state.editor.setModel(model);
+    state.editor.focus();
+    document.getElementById('btn-save').disabled = state.isDocx; // .docx is read-only
+    // .docx packages always allow Preview (renders the whole document via mammoth);
+    // otherwise Preview only makes sense for HTML files.
+    document.getElementById('btn-preview').disabled =
+      !['html','htm'].includes(extOf(path));
+    if (document.getElementById('preview-pane').classList.contains('show') &&
+        ['html','htm'].includes(extOf(path))) {
+      refreshPreview();
+    }
+  } else {
+    editorEl.style.display = 'none';
+    document.getElementById('btn-preview').disabled = true;
+    document.getElementById('btn-save').disabled = true;
+    const bytes = f.content;
+    const sizeKb = (bytes.length / 1024).toFixed(1);
+    document.getElementById('tab-size').textContent = sizeKb + ' KB (binary)';
+    binaryEl.classList.add('show');
+    if (isImagePath(path)) {
+      const blob = new Blob([bytes]);
+      const url = URL.createObjectURL(blob);
+      binaryEl.innerHTML = `<div>${escapeHtml(path)}</div><img src="${url}" alt="">`;
+    } else {
+      binaryEl.innerHTML = `<div>🔒 Binary file (${sizeKb} KB)</div>
+        <div>This file isn't editable as text. It will be preserved unchanged when you rezip.</div>`;
+    }
+  }
+}
+
+function commitCurrentEdit(showStatus) {
+  if (!state.currentPath) return;
+  const f = state.files[state.currentPath];
+  if (!f || !f.isText) return;
+  const model = state.monacoModels[state.currentPath];
+  if (!model) return;
+  const newContent = model.getValue();
+
+  // Validate XML/HTML/SVG on commit
+  const ext = extOf(state.currentPath);
+  if (['xml','xsl','xslt','svg','config'].includes(ext)) {
+    const v = validateXml(newContent, false);
+    if (!v.ok) {
+      const proceed = confirm(`XML validation warning in ${state.currentPath}:\n\n${v.error}\n\nKeep edit anyway?`);
+      if (!proceed) return;
+    }
+  } else if (ext === 'html' || ext === 'htm') {
+    const v = validateXml(newContent, true);
+    if (!v.ok && showStatus) setStatus('HTML parse note: ' + v.error, 'warn');
+  } else if (ext === 'json') {
+    try { JSON.parse(newContent); } catch (e) {
+      const proceed = confirm(`JSON parse error in ${state.currentPath}:\n\n${e.message}\n\nKeep edit anyway?`);
+      if (!proceed) return;
+    }
+  }
+
+  f.content = newContent;
+  f.dirty = true; // still dirty until rezip-save writes it to disk
+  refreshTreeDirtyMarkers();
+  if (showStatus) setStatus('Edit committed (not yet written to disk).', 'ok');
+}
+
+function validateXml(text, asHtml) {
+  try {
+    const parser = new DOMParser();
+    const mime = asHtml ? 'text/html' : 'application/xml';
+    const doc = parser.parseFromString(text, mime);
+    const errEl = doc.getElementsByTagName('parsererror')[0];
+    if (errEl) {
+      // Take a one-line summary
+      const msg = errEl.textContent.replace(/\s+/g, ' ').trim().slice(0, 240);
+      return { ok: false, error: msg };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// ---------- save (rezip if zip, plain write if standalone) ----------
+async function rezipAndSave() {
+  if (!state.fileHandle) return;
+  commitCurrentEdit(false);
+
+  document.getElementById('btn-rezip').disabled = true;
+  try {
+    let blob;
+    if (state.zip) {
+      setStatus('Building zip...');
+      const out = new JSZip();
+      const order = [];
+      state.zip.forEach((path, entry) => { if (!entry.dir) order.push({ path, entry }); });
+      for (const { path, entry } of order) {
+        const f = state.files[path];
+        if (!f) continue;
+        const date = entry.date || new Date();
+        if (f.isText) out.file(path, f.content, { date });
+        else out.file(path, f.content, { date, binary: true });
+      }
+      blob = await out.generateAsync({
+        type: 'blob',
+        compression: 'DEFLATE',
+        compressionOptions: { level: 6 },
+      });
+    } else if (state.standalone) {
+      const f = state.files[state.fileName];
+      blob = new Blob([f.content], { type: 'text/plain' });
+    } else {
+      return;
+    }
+
+    if (state.fileHandle.queryPermission) {
+      const perm = await state.fileHandle.queryPermission({ mode: 'readwrite' });
+      if (perm !== 'granted') {
+        const req = await state.fileHandle.requestPermission({ mode: 'readwrite' });
+        if (req !== 'granted') {
+          setStatus('Write permission denied.', 'err');
+          document.getElementById('btn-rezip').disabled = false;
+          return;
+        }
+      }
+    }
+    const writable = await state.fileHandle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+
+    for (const f of Object.values(state.files)) f.dirty = false;
+    if (state.standalone) state.standalone.dirty = false;
+    refreshTreeDirtyMarkers();
+
+    const sizeKb = (blob.size / 1024).toFixed(1);
+    setStatus(`Saved ${state.fileName} (${sizeKb} KB).`, 'ok');
+  } catch (e) {
+    setStatus('Save failed: ' + e.message, 'err');
+    console.error(e);
+  } finally {
+    document.getElementById('btn-rezip').disabled = false;
+  }
+}
+
+// ---------- resizer ----------
+(function () {
+  const sidebar = document.getElementById('sidebar');
+  const r = document.getElementById('resizer');
+  let dragging = false;
+  r.addEventListener('mousedown', e => { dragging = true; document.body.style.cursor = 'col-resize'; e.preventDefault(); });
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const min = 200, max = 700;
+    let w = e.clientX;
+    w = Math.max(min, Math.min(max, w));
+    sidebar.style.width = w + 'px';
+  });
+  document.addEventListener('mouseup', () => { dragging = false; document.body.style.cursor = ''; });
+})();
+
+// ---------- guard against leaving with unsaved edits ----------
+window.addEventListener('beforeunload', e => {
+  if (hasUnsaved()) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+// ============================================================
+// FORMAT (pretty-print)
+// ============================================================
+document.getElementById('btn-format').addEventListener('click', formatCurrent);
+
+function formatCurrent() {
+  if (!state.currentPath) return;
+  const f = state.files[state.currentPath];
+  if (!f || !f.isText) return;
+  const model = state.monacoModels[state.currentPath];
+  if (!model) return;
+  const text = model.getValue();
+  const ext = extOf(state.currentPath);
+  let out = null, label = '';
+  try {
+    if (ext === 'json') { out = JSON.stringify(JSON.parse(text), null, 2); label = 'JSON'; }
+    else if (['xml','xsl','xslt','svg','config','html','htm','ol-datamodel','ol-jobpreset','ol-outputpreset','ol-script','ol-config'].includes(ext)) {
+      out = formatXml(text); label = 'XML';
+    } else { setStatus('No formatter for this file type.', 'warn'); return; }
+  } catch (e) {
+    setStatus('Format failed: ' + e.message, 'err');
+    return;
+  }
+  if (out === text) { setStatus('Already formatted.', 'ok'); return; }
+  // Replace whole document via Monaco edit so undo works
+  const range = model.getFullModelRange();
+  state.editor.executeEdits('format', [{ range, text: out }]);
+  setStatus(`Formatted as ${label}.`, 'ok');
+}
+
+function formatXml(xml) {
+  // Protect CDATA, comments, processing instructions
+  const stash = [];
+  const protect = (re) => {
+    xml = xml.replace(re, m => { stash.push(m); return 'STASH' + (stash.length - 1) + 'HSATS'; }); //`${stash.length - 1}`; });
+  };
+  protect(/<!\[CDATA\[[\s\S]*?\]\]>/g);
+  protect(/<!--[\s\S]*?-->/g);
+  protect(/<\?[\s\S]*?\?>/g);
+
+  // Insert breaks between tags but keep text content tied to its tags
+  xml = xml.replace(/>\s+</g, '><');
+  xml = xml.replace(/></g, '>\n<');
+
+  const lines = xml.split('\n');
+  let indent = 0;
+  const indentStr = '  ';
+  const out = [];
+  for (let raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    const isClose = /^<\/[^>]+>$/.test(line);
+    const isSelfClose = /<[^>]+\/>$/.test(line) || /^<[?!]/.test(line);
+    const isInlineFull = /^<([^\s\/>]+)[^>]*>[\s\S]*<\/\1>$/.test(line); // <a>x</a>
+    if (isClose) indent = Math.max(0, indent - 1);
+    out.push(indentStr.repeat(indent) + line);
+    if (!isClose && !isSelfClose && !isInlineFull && /^<[^\/!?]/.test(line)) indent++;
+  }
+  let result = out.join('\n');
+  result = result.replace(/STASH(\d+)HSATS/g, (_, i) => stash[+i]);
+  return result;
+}
+function _formatXmlOldRestore() { /* placeholder to keep file readable */
+  result = result.replace(/(\d+)/g, (_, i) => stash[+i]);
+  return result;
+}
+
+// ============================================================
+// SIDEBAR MODE TOGGLE (Files / Search)
+// ============================================================
+document.getElementById('mode-files').addEventListener('click', () => setSidebarMode('files'));
+document.getElementById('mode-search').addEventListener('click', () => setSidebarMode('search'));
+document.getElementById('mode-theme').addEventListener('click', () => setSidebarMode('theme'));
+
+function setSidebarMode(mode) {
+  const isFiles = mode === 'files';
+  const isNav = mode === 'nav';
+  const isScripts = mode === 'scripts';
+  const isSearch = mode === 'search';
+  const isTheme = mode === 'theme';
+  document.getElementById('mode-files').classList.toggle('active', isFiles);
+  const navBtn = document.getElementById('mode-nav');
+  if (navBtn) navBtn.classList.toggle('active', isNav);
+  const scriptsBtn = document.getElementById('mode-scripts');
+  if (scriptsBtn) scriptsBtn.classList.toggle('active', isScripts);
+  const themeBtn = document.getElementById('mode-theme');
+  if (themeBtn) themeBtn.classList.toggle('active', isTheme);
+  document.getElementById('mode-search').classList.toggle('active', isSearch);
+  document.getElementById('tree').style.display = isFiles ? '' : 'none';
+  const fileToolbar = document.getElementById('file-toolbar');
+  if (fileToolbar) fileToolbar.style.display = isFiles ? '' : 'none';
+  const navPanel = document.getElementById('nav-panel');
+  if (navPanel) navPanel.classList.toggle('show', isNav);
+  const scriptsPanel = document.getElementById('scripts-panel');
+  if (scriptsPanel) scriptsPanel.classList.toggle('show', isScripts);
+  document.getElementById('search-panel').classList.toggle('show', isSearch);
+  const themePanel = document.getElementById('theme-panel');
+  if (themePanel) themePanel.classList.toggle('show', isTheme);
+  if (isSearch) document.getElementById('search-input').focus();
+  if (isScripts && typeof refreshScriptsList === 'function') {
+    refreshScriptsList();
+    document.getElementById('scripts-search').focus();
+  }
+  if (isNav && typeof renderNavigator === 'function') renderNavigator();
+  if (isTheme && typeof renderThemePanel === 'function') renderThemePanel();
+}
+
+// Ctrl+Shift+F opens search
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
+    if (state.fileHandle) { e.preventDefault(); setSidebarMode('search'); }
+  }
+  if ((e.ctrlKey || e.metaKey) && e.altKey && (e.key === 'L' || e.key === 'l')) {
+    // Shift+Alt+F is hard to listen for; offer Ctrl+Alt+L too
+    e.preventDefault(); formatCurrent();
+  }
+});
+
+// ============================================================
+// SEARCH ACROSS FILES
+// ============================================================
+let searchDebounce = null;
+['search-input','search-case','search-regex','search-word'].forEach(id => {
+  document.getElementById(id).addEventListener('input', () => {
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(runSearch, 150);
+  });
+});
+document.getElementById('search-input').addEventListener('keydown', e => {
+  if (e.key === 'Escape') { e.target.value = ''; runSearch(); }
+});
+
+function runSearch() {
+  const q = document.getElementById('search-input').value;
+  const resultsEl = document.getElementById('search-results');
+  const summary = document.getElementById('search-summary');
+  resultsEl.innerHTML = '';
+  if (!q) { summary.textContent = ''; return; }
+
+  const caseSensitive = document.getElementById('search-case').checked;
+  const useRegex = document.getElementById('search-regex').checked;
+  const wholeWord = document.getElementById('search-word').checked;
+
+  let pattern;
+  try {
+    let src = useRegex ? q : q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (wholeWord) src = `\\b(?:${src})\\b`;
+    pattern = new RegExp(src, caseSensitive ? 'g' : 'gi');
+  } catch (e) {
+    summary.textContent = 'Bad regex: ' + e.message;
+    return;
+  }
+
+  let totalHits = 0; let filesHit = 0;
+  const MAX_HITS_PER_FILE = 50;
+  const MAX_TOTAL = 1000;
+
+  const paths = Object.keys(state.files).sort();
+  for (const path of paths) {
+    const f = state.files[path];
+    if (!f.isText) continue;
+    // Use the live-edited content if there's a model
+    const text = state.monacoModels[path] ? state.monacoModels[path].getValue() : f.content;
+    if (!text) continue;
+
+    const hits = [];
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length && hits.length < MAX_HITS_PER_FILE; i++) {
+      const line = lines[i];
+      pattern.lastIndex = 0;
+      let m;
+      while ((m = pattern.exec(line)) !== null) {
+        hits.push({ lineNo: i + 1, col: m.index, match: m[0], lineText: line });
+        if (m.index === pattern.lastIndex) pattern.lastIndex++;
+        if (hits.length >= MAX_HITS_PER_FILE) break;
+      }
+    }
+    if (!hits.length) continue;
+    filesHit++;
+    totalHits += hits.length;
+    appendSearchFile(resultsEl, path, hits, pattern);
+    if (totalHits >= MAX_TOTAL) {
+      const more = document.createElement('div');
+      more.className = 'search-hit';
+      more.textContent = `… stopped at ${MAX_TOTAL} matches`;
+      resultsEl.appendChild(more);
+      break;
+    }
+  }
+  summary.textContent = totalHits ? `${totalHits} match${totalHits === 1 ? '' : 'es'} in ${filesHit} file${filesHit === 1 ? '' : 's'}` : 'No matches';
+}
+
+function appendSearchFile(container, path, hits, pattern) {
+  const head = document.createElement('div');
+  head.className = 'search-file';
+  head.textContent = `${path}  (${hits.length})`;
+  head.style.cursor = 'pointer';
+  head.addEventListener('click', () => openFile(path));
+  container.appendChild(head);
+  for (const hit of hits) {
+    const el = document.createElement('div');
+    el.className = 'search-hit';
+    el.title = hit.lineText.trim();
+    const lineno = `<span class="lineno">${hit.lineNo}:</span>`;
+    // Build snippet with mark
+    const snippet = renderSnippet(hit.lineText, pattern);
+    el.innerHTML = lineno + snippet;
+    el.addEventListener('click', () => {
+      openFile(path);
+      // After Monaco loads/sets the model, position the cursor
+      setTimeout(() => {
+        if (state.editor && state.monacoModels[path]) {
+          state.editor.revealLineInCenter(hit.lineNo);
+          state.editor.setPosition({ lineNumber: hit.lineNo, column: hit.col + 1 });
+          state.editor.focus();
+        }
+      }, 50);
+    });
+    container.appendChild(el);
+  }
+}
+
+function renderSnippet(line, pattern) {
+  // Trim very long lines around the first match
+  let trimmed = line;
+  pattern.lastIndex = 0;
+  const m = pattern.exec(line);
+  let prefix = '';
+  if (line.length > 200 && m) {
+    const start = Math.max(0, m.index - 30);
+    if (start > 0) prefix = '…';
+    trimmed = line.slice(start, start + 200);
+  }
+  pattern.lastIndex = 0;
+  const escaped = escapeHtml(trimmed).replace(new RegExp(pattern.source, pattern.flags), m => `<mark>${escapeHtml(m)}</mark>`);
+  return prefix + escaped;
+}
+
+// ============================================================
+// MODAL helpers
+// ============================================================
+const modalEls = {
+  backdrop: document.getElementById('modal-backdrop'),
+  title: document.getElementById('modal-title'),
+  sidebar: document.getElementById('modal-sidebar'),
+  main: document.getElementById('modal-main'),
+  status: document.getElementById('modal-status'),
+  cancel: document.getElementById('modal-cancel'),
+  action: document.getElementById('modal-action'),
+  close: document.getElementById('modal-close'),
+};
+modalEls.close.addEventListener('click', closeModal);
+modalEls.cancel.addEventListener('click', closeModal);
+modalEls.backdrop.addEventListener('click', e => { if (e.target === modalEls.backdrop) closeModal(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && modalEls.backdrop.classList.contains('show')) closeModal(); });
+
+function openModal(title, actionLabel, onAction) {
+  modalEls.title.textContent = title;
+  modalEls.action.textContent = actionLabel;
+  modalEls.action.onclick = onAction;
+  modalEls.backdrop.classList.add('show');
+}
+function closeModal() {
+  modalEls.backdrop.classList.remove('show');
+  modalEls.sidebar.innerHTML = '';
+  modalEls.main.innerHTML = '<div class="diff-empty">Pick a file on the left.</div>';
+  modalEls.status.textContent = '';
+  modalEls.action.onclick = null;
+}
+
+function renderDiff(originalText, currentText) {
+  const main = modalEls.main;
+  if (!window.Diff) { main.innerHTML = '<div class="diff-empty">diff library failed to load.</div>'; return; }
+  if (originalText === currentText) {
+    main.innerHTML = '<div class="diff-empty">No changes.</div>';
+    return;
+  }
+  const patch = Diff.structuredPatch('original', 'current', originalText || '', currentText || '', '', '', { context: 3 });
+  const frag = document.createDocumentFragment();
+  if (!patch.hunks.length) {
+    main.innerHTML = '<div class="diff-empty">No textual differences.</div>';
+    return;
+  }
+  for (const hunk of patch.hunks) {
+    const h = document.createElement('div');
+    h.className = 'diff-hunk-header';
+    h.textContent = `@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@`;
+    frag.appendChild(h);
+    for (const ln of hunk.lines) {
+      const el = document.createElement('div');
+      el.className = 'diff-line ' + (ln[0] === '+' ? 'add' : ln[0] === '-' ? 'del' : 'ctx');
+      el.textContent = ln.slice(1);
+      frag.appendChild(el);
+    }
+  }
+  const wrap = document.createElement('div');
+  wrap.className = 'diff-pane';
+  wrap.appendChild(frag);
+  main.innerHTML = '';
+  main.appendChild(wrap);
+}
+
+// Track standalone original so diff works for non-zip files
+// (Consumed by the live reviewAndSave defined further below.)
+const _origLoadFromHandle = loadFromHandle;
+loadFromHandle = async function (handle) {
+  await _origLoadFromHandle(handle);
+  if (state.standalone) state.standalone.original = state.standalone.content;
+};
+
+// ============================================================
+// COMPARE TWO TEMPLATES
+// ============================================================
+document.getElementById('btn-compare').addEventListener('click', compareTemplates);
+
+async function compareTemplates() {
+  if (!state.zip) {
+    setStatus('Open a template first, then click Compare to pick a second one.', 'warn');
+    return;
+  }
+  if (!window.showOpenFilePicker) return;
+  let handle;
+  try {
+    [handle] = await window.showOpenFilePicker({ multiple: false });
+  } catch (e) { if (e.name !== 'AbortError') setStatus(e.message, 'err'); return; }
+
+  setStatus('Loading second template...');
+  const file = await handle.getFile();
+  let other;
+  try { other = await JSZip.loadAsync(file); }
+  catch (e) { setStatus('Not a valid zip: ' + e.message, 'err'); return; }
+
+  // Build map of path -> text content (for text files only) for both
+  const A = await zipTextMap(state.zip);
+  const B = await zipTextMap(other);
+
+  const allPaths = new Set([...Object.keys(A), ...Object.keys(B)]);
+  const items = [];
+  for (const p of [...allPaths].sort()) {
+    const a = A[p], b = B[p];
+    if (a === undefined && b !== undefined) items.push({ path: p, status: 'added', a: '', b });
+    else if (a !== undefined && b === undefined) items.push({ path: p, status: 'removed', a, b: '' });
+    else if (a !== b) items.push({ path: p, status: 'modified', a, b });
+  }
+
+  if (!items.length) { setStatus('Templates are identical (text content).', 'ok'); return; }
+
+  openModal(`Compare — ${state.fileName} ↔ ${handle.name}`, 'Close', closeModal);
+  modalEls.status.textContent = `${items.length} differing file${items.length === 1 ? '' : 's'}.`;
+
+  modalEls.sidebar.innerHTML = '';
+  items.forEach((it, i) => {
+    const el = document.createElement('div');
+    el.className = 'modal-file-item' + (i === 0 ? ' active' : '');
+    const badge = it.status === 'added' ? 'ADD' : it.status === 'removed' ? 'DEL' : 'CHG';
+    el.innerHTML = `<span class="badge ${it.status}">${badge}</span><span style="overflow:hidden;text-overflow:ellipsis;">${escapeHtml(it.path)}</span>`;
+    el.addEventListener('click', () => {
+      modalEls.sidebar.querySelectorAll('.modal-file-item').forEach(x => x.classList.remove('active'));
+      el.classList.add('active');
+      renderDiff(it.a, it.b);
+    });
+    modalEls.sidebar.appendChild(el);
+  });
+  renderDiff(items[0].a, items[0].b);
+  setStatus('', '');
+}
+
+async function zipTextMap(zip) {
+  const out = {};
+  const paths = [];
+  zip.forEach((p, e) => { if (!e.dir) paths.push(p); });
+  for (const p of paths) {
+    const bytes = await zip.file(p).async('uint8array');
+    if (isTextPath(p) || (!isImagePath(p) && looksLikeText(bytes))) {
+      try { out[p] = decodeBytes(bytes); } catch (_) { /* skip */ }
+    }
+  }
+  return out;
+}
+
+// Enable Compare button once a zip-based template is open
+const _origLoad2 = loadFromHandle;
+loadFromHandle = async function (handle) {
+  await _origLoad2(handle);
+  document.getElementById('btn-compare').disabled = !state.zip;
+  // Reset preview when switching templates
+  closePreview();
+};
+
+// ============================================================
+// HTML PREVIEW (split iframe)
+// ============================================================
+const previewState = {
+  open: false,
+  blobUrls: [],  // urls created for the current preview, to revoke later
+  htmlPath: null,
+  zoom: 1,
+  mode: 'data',  // 'data' | 'raw' | 'split' | 'css' | 'doc'
+  modeByPath: {}, // htmlPath -> mode (per-template memory; in-memory only)
+  lastCss: '',   // cached merged CSS for the current preview (for CSS tab + copy)
+  lastDocxHtml: '', // cached HTML from the most recent mammoth render (for Copy HTML)
+  lastDocxHtmlFor: null, // fileName the cached HTML was rendered from (cache key)
+  unresolved: [], // distinct @tokens@ the last render couldn't resolve
+  tokensDismissed: false, // user clicked × on the strip — re-show on refresh
+};
+const ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];
+
+document.getElementById('btn-preview').addEventListener('click', togglePreview);
+document.getElementById('btn-preview-refresh').addEventListener('click', refreshPreview);
+document.getElementById('btn-preview-newtab').addEventListener('click', openPreviewNewTab);
+document.getElementById('btn-preview-close').addEventListener('click', closePreview);
+document.getElementById('btn-preview-zoom-in').addEventListener('click', () => stepZoom(1));
+document.getElementById('btn-preview-zoom-out').addEventListener('click', () => stepZoom(-1));
+document.getElementById('preview-zoom-level').addEventListener('click', () => setZoom(1));
+document.getElementById('btn-pv-tab-data').addEventListener('click', () => setPreviewMode('data'));
+document.getElementById('btn-pv-tab-raw').addEventListener('click', () => setPreviewMode('raw'));
+document.getElementById('btn-pv-tab-split').addEventListener('click', () => setPreviewMode('split'));
+document.getElementById('btn-pv-tab-css').addEventListener('click', () => setPreviewMode('css'));
+document.getElementById('btn-preview-css-copy').addEventListener('click', () => {
+  const css = previewState.lastCss || '';
+  if (!css) { setStatus('No CSS to copy yet.', 'warn'); return; }
+  navigator.clipboard.writeText(css).then(
+    () => setStatus('CSS copied to clipboard.', 'ok'),
+    () => setStatus('Copy failed.', 'err'),
+  );
+});
+document.getElementById('btn-preview-tokens-dismiss').addEventListener('click', () => {
+  previewState.tokensDismissed = true;
+  document.getElementById('preview-tokens-strip').classList.remove('show');
+});
+
+function setPreviewMode(mode) {
+  if (!['data','raw','split','css'].includes(mode)) return;
+  previewState.mode = mode;
+  // Reset the dismissed-strip flag so a fresh switch re-shows it if relevant.
+  // (Per-template memory is written inside refreshPreview, after htmlPath updates.)
+  previewState.tokensDismissed = false;
+
+  document.getElementById('btn-pv-tab-data').classList.toggle('active', mode === 'data');
+  document.getElementById('btn-pv-tab-raw').classList.toggle('active', mode === 'raw');
+  document.getElementById('btn-pv-tab-split').classList.toggle('active', mode === 'split');
+  document.getElementById('btn-pv-tab-css').classList.toggle('active', mode === 'css');
+  // Zoom only meaningful for the iframe modes (data/raw/split/doc)
+  const zoomCluster = document.querySelector('#preview-header .zoom-cluster');
+  if (zoomCluster) zoomCluster.style.visibility = (mode === 'css') ? 'hidden' : 'visible';
+  // Copy HTML button is only meaningful in doc mode
+  // Switch which body view is visible
+  const frame = document.getElementById('preview-frame');
+  const split = document.getElementById('preview-split');
+  const cssView = document.getElementById('preview-css-view');
+  // Single iframe is reused for data/raw/doc; split has its own; css has its own.
+  frame.classList.toggle('hidden', mode !== 'data' && mode !== 'raw' && mode !== 'doc');
+  split.classList.toggle('show', mode === 'split');
+  cssView.classList.toggle('show', mode === 'css');
+  if (previewState.open) refreshPreview();
+}
+
+function stepZoom(dir) {
+  const cur = previewState.zoom;
+  let idx = ZOOM_STEPS.findIndex(z => Math.abs(z - cur) < 0.001);
+  if (idx === -1) {
+    // current zoom not on the step list — find nearest
+    idx = ZOOM_STEPS.reduce((best, z, i) => Math.abs(z - cur) < Math.abs(ZOOM_STEPS[best] - cur) ? i : best, 0);
+  }
+  idx = Math.max(0, Math.min(ZOOM_STEPS.length - 1, idx + dir));
+  setZoom(ZOOM_STEPS[idx]);
+}
+
+function setZoom(z) {
+  previewState.zoom = z;
+  document.getElementById('preview-zoom-level').textContent = Math.round(z * 100) + '%';
+  document.getElementById('btn-preview-zoom-out').disabled = z <= ZOOM_STEPS[0];
+  document.getElementById('btn-preview-zoom-in').disabled = z >= ZOOM_STEPS[ZOOM_STEPS.length - 1];
+  applyZoomToFrame();
+}
+
+function applyZoomToFrame() {
+  // Apply to whichever frames are currently visible.
+  applyZoomToFrameEl(document.getElementById('preview-frame'));
+  if (previewState.mode === 'split') {
+    applyZoomToFrameEl(document.getElementById('preview-frame-data'));
+    applyZoomToFrameEl(document.getElementById('preview-frame-raw'));
+  }
+}
+
+function applyZoomToFrameEl(frame) {
+  if (!frame) return;
+  let doc;
+  try { doc = frame.contentDocument; } catch (_) { doc = null; }
+  if (!doc || !doc.documentElement) return;
+  let style = doc.getElementById('__cw_zoom__');
+  if (!style) {
+    style = doc.createElement('style');
+    style.id = '__cw_zoom__';
+    (doc.head || doc.documentElement).appendChild(style);
+  }
+  // Use `zoom` (Chromium) — it scales layout *and* font sizes naturally.
+  // Fallback to transform-origin scale via wrapper if needed (skipped for simplicity; Chromium target).
+  style.textContent = 'html { zoom: ' + previewState.zoom + '; }';
+}
+
+// Ctrl + scroll over the preview pane to zoom
+document.getElementById('preview-pane').addEventListener('wheel', e => {
+  if (!e.ctrlKey && !e.metaKey) return;
+  e.preventDefault();
+  stepZoom(e.deltaY < 0 ? 1 : -1);
+}, { passive: false });
+
+function togglePreview() {
+  if (previewState.open) closePreview();
+  else openPreview();
+}
+
+function openPreview() {
+  if (!state.currentPath) return;
+  const ext = extOf(state.currentPath);
+  if (!['html','htm'].includes(ext)) {
+    setStatus('Preview only supports HTML files.', 'warn');
+    return;
+  }
+  previewState.open = true;
+  document.getElementById('preview-pane').classList.add('show');
+  document.getElementById('preview-resizer').style.display = '';
+  document.getElementById('btn-preview').classList.add('active');
+  // Restore the mode the user last picked for this template (default: data)
+  const restored = previewState.modeByPath[state.currentPath] || previewState.mode || 'data';
+  setPreviewMode(restored); // calls refreshPreview internally
+}
+
+function closePreview() {
+  previewState.open = false;
+  document.getElementById('preview-pane').classList.remove('show');
+  document.getElementById('preview-resizer').style.display = 'none';
+  document.getElementById('btn-preview').classList.remove('active');
+  revokePreviewBlobs();
+}
+
+function revokePreviewBlobs() {
+  for (const u of previewState.blobUrls) URL.revokeObjectURL(u);
+  previewState.blobUrls = [];
+}
+
+// ============================================================
+// DOCX theme extractor (sidebar Theme mode)
+// ============================================================
+// Parses word/theme/theme1.xml + word/styles.xml and renders a
+// designer-friendly summary: colour palette, font scheme, and named styles.
+// The "Copy as CSS" button serialises the same data as a CSS block with
+// custom properties + named-style classes the user can drop into any
+// stylesheet that needs to match the Word source.
+const themeState = {
+  palette: [],   // [{ key, name, hex }]
+  fonts: { major: { latin: '', ea: '', cs: '' }, minor: { latin: '', ea: '', cs: '' } },
+  styles: [],    // [{ id, name, type, font, sizePt, color, bold, italic }]
+};
+
+function getZipText(path) {
+  // Tolerate the backslash-vs-forward-slash thing PlanetPress zips do; docx
+  // shouldn't have it but it's cheap insurance. Also do a case-insensitive
+  // fallback in case a packager wrote unusual casing.
+  let f = state.files[path] || state.files[path.replace(/\//g, '\\')];
+  if (!f) {
+    const wantLower = path.toLowerCase();
+    const match = Object.keys(state.files).find(k =>
+      k.toLowerCase() === wantLower ||
+      k.toLowerCase().replace(/\\/g, '/') === wantLower);
+    if (match) f = state.files[match];
+  }
+  if (!f) return null;
+  return typeof f.content === 'string' ? f.content : decodeBytes(f.content);
+}
+
+function parseDocxTheme() {
+  themeState.palette = [];
+  themeState.fonts = { major: { latin: '', ea: '', cs: '' }, minor: { latin: '', ea: '', cs: '' } };
+  themeState.styles = [];
+
+  const themeXml = getZipText('word/theme/theme1.xml');
+  if (themeXml) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(themeXml, 'application/xml');
+    // Colour palette: <a:clrScheme><a:dk1>/<a:lt1>/.../<a:accent6>/<a:hlink>/<a:folHlink>
+    // Each child holds either <a:srgbClr val="HEX"/> or <a:sysClr val="..." lastClr="HEX"/>.
+    const PALETTE_KEYS = [
+      ['dk1', 'Text 1 (dk1)'], ['lt1', 'Background 1 (lt1)'],
+      ['dk2', 'Text 2 (dk2)'], ['lt2', 'Background 2 (lt2)'],
+      ['accent1', 'Accent 1'], ['accent2', 'Accent 2'], ['accent3', 'Accent 3'],
+      ['accent4', 'Accent 4'], ['accent5', 'Accent 5'], ['accent6', 'Accent 6'],
+      ['hlink', 'Hyperlink'], ['folHlink', 'Followed hyperlink'],
+    ];
+    const scheme = doc.getElementsByTagNameNS('*', 'clrScheme')[0];
+    if (scheme) {
+      for (const [k, label] of PALETTE_KEYS) {
+        const el = Array.from(scheme.children).find(c => c.localName === k);
+        if (!el) continue;
+        const srgb = Array.from(el.children).find(c => c.localName === 'srgbClr');
+        const sys = Array.from(el.children).find(c => c.localName === 'sysClr');
+        const hex = srgb ? srgb.getAttribute('val')
+                  : sys  ? sys.getAttribute('lastClr')
+                  : null;
+        if (hex) themeState.palette.push({ key: k, name: label, hex: '#' + hex.toUpperCase() });
+      }
+    }
+    // Font scheme: <a:fontScheme><a:majorFont><a:latin typeface=".."/><a:ea/><a:cs/>
+    const fontScheme = doc.getElementsByTagNameNS('*', 'fontScheme')[0];
+    if (fontScheme) {
+      for (const role of ['majorFont', 'minorFont']) {
+        const f = Array.from(fontScheme.children).find(c => c.localName === role);
+        if (!f) continue;
+        const slot = role === 'majorFont' ? 'major' : 'minor';
+        for (const script of ['latin', 'ea', 'cs']) {
+          const el = Array.from(f.children).find(c => c.localName === script);
+          if (el) themeState.fonts[slot][script] = el.getAttribute('typeface') || '';
+        }
+      }
+    }
+  }
+
+  const stylesXml = getZipText('word/styles.xml');
+  if (stylesXml) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(stylesXml, 'application/xml');
+    // Each <w:style w:type="paragraph|character|table" w:styleId="...">
+    //   <w:name w:val="..."/>
+    //   <w:rPr> <w:rFonts w:ascii=".."/> <w:sz w:val=".."/> <w:color w:val="HEX"/> <w:b/> <w:i/>
+    const styles = Array.from(doc.getElementsByTagNameNS('*', 'style'));
+    const wAttr = (el, name) => el ? (el.getAttribute('w:' + name) || el.getAttribute(name) || null) : null;
+    for (const s of styles) {
+      const type = wAttr(s, 'type') || '';
+      const id = wAttr(s, 'styleId') || '';
+      // Skip table cell defaults / character defaults to keep the list useful;
+      // numbering styles aren't very interesting either.
+      if (!['paragraph', 'character', 'table'].includes(type)) continue;
+      const nameEl = Array.from(s.children).find(c => c.localName === 'name');
+      const name = wAttr(nameEl, 'val') || id;
+      const rPr = Array.from(s.children).find(c => c.localName === 'rPr');
+      let font = null, sizePt = null, color = null, bold = false, italic = false;
+      if (rPr) {
+        const rFonts = Array.from(rPr.children).find(c => c.localName === 'rFonts');
+        if (rFonts) font = wAttr(rFonts, 'ascii') || wAttr(rFonts, 'hAnsi') || null;
+        const sz = Array.from(rPr.children).find(c => c.localName === 'sz');
+        if (sz) {
+          const v = parseInt(wAttr(sz, 'val') || '', 10);
+          if (!isNaN(v)) sizePt = v / 2; // half-points
+        }
+        const colorEl = Array.from(rPr.children).find(c => c.localName === 'color');
+        if (colorEl) {
+          const v = wAttr(colorEl, 'val');
+          if (v && v !== 'auto') color = '#' + v.toUpperCase();
+        }
+        bold = !!Array.from(rPr.children).find(c => c.localName === 'b');
+        italic = !!Array.from(rPr.children).find(c => c.localName === 'i');
+      }
+      themeState.styles.push({ id, name, type, font, sizePt, color, bold, italic });
+    }
+    // Sort: paragraph styles first, then character, then table; alphabetical by name.
+    const order = { paragraph: 0, character: 1, table: 2 };
+    themeState.styles.sort((a, b) => {
+      const t = order[a.type] - order[b.type];
+      return t !== 0 ? t : a.name.localeCompare(b.name);
+    });
+  }
+}
+
+function renderThemePanel() {
+  const host = document.getElementById('theme-content');
+  if (!state.isDocx) {
+    host.innerHTML = '<div class="empty-msg">Open a .docx to view its theme.</div>';
+    return;
+  }
+  parseDocxTheme();
+  const parts = [];
+
+  parts.push('<h3>Colour palette</h3>');
+  if (themeState.palette.length) {
+    parts.push('<div class="theme-swatches">');
+    for (const c of themeState.palette) {
+      parts.push(
+        '<div class="theme-swatch" title="' + escapeHtml(c.key) + '">' +
+        '<span class="chip" style="background:' + escapeHtml(c.hex) + '"></span>' +
+        '<span class="label">' + escapeHtml(c.name) + '</span>' +
+        '<span class="hex">' + escapeHtml(c.hex) + '</span>' +
+        '</div>'
+      );
+    }
+    parts.push('</div>');
+  } else {
+    parts.push('<div class="empty-msg">No colour scheme found in theme1.xml.</div>');
+  }
+
+  parts.push('<h3>Font scheme</h3>');
+  parts.push('<div class="theme-fonts">');
+  parts.push(
+    '<div class="theme-font-row"><span class="role">Heading</span>' +
+    '<span class="face">' + escapeHtml(themeState.fonts.major.latin || '—') + '</span></div>'
+  );
+  parts.push(
+    '<div class="theme-font-row"><span class="role">Body</span>' +
+    '<span class="face">' + escapeHtml(themeState.fonts.minor.latin || '—') + '</span></div>'
+  );
+  parts.push('</div>');
+
+  parts.push('<h3>Named styles <span style="color:var(--muted);font-weight:normal;text-transform:none;letter-spacing:0;">(' + themeState.styles.length + ')</span></h3>');
+  if (themeState.styles.length) {
+    parts.push('<div class="theme-styles">');
+    for (const s of themeState.styles) {
+      const meta = [];
+      if (s.font) meta.push(escapeHtml(s.font));
+      if (s.sizePt) meta.push(s.sizePt + 'pt');
+      if (s.color) meta.push('<span class="swatch-inline" style="background:' + escapeHtml(s.color) + '"></span>' + escapeHtml(s.color));
+      if (s.bold) meta.push('bold');
+      if (s.italic) meta.push('italic');
+      meta.push(s.type);
+      parts.push(
+        '<div class="theme-style-row">' +
+        '<span class="name">' + escapeHtml(s.name) + '</span>' +
+        '<span class="id">' + escapeHtml(s.id) + '</span>' +
+        '<span class="meta">' + meta.join(' · ') + '</span>' +
+        '</div>'
+      );
+    }
+    parts.push('</div>');
+  } else {
+    parts.push('<div class="empty-msg">No named styles found in styles.xml.</div>');
+  }
+
+  host.innerHTML = parts.join('');
+}
+
+function buildThemeCss() {
+  if (!themeState.palette.length && !themeState.styles.length) return '';
+  const lines = [];
+  lines.push('/* Extracted from ' + (state.fileName || 'Word document') + ' */');
+  lines.push(':root {');
+  for (const c of themeState.palette) {
+    lines.push('  --theme-' + c.key + ': ' + c.hex + ';');
+  }
+  if (themeState.fonts.major.latin) {
+    lines.push('  --theme-font-heading: "' + themeState.fonts.major.latin + '";');
+  }
+  if (themeState.fonts.minor.latin) {
+    lines.push('  --theme-font-body: "' + themeState.fonts.minor.latin + '";');
+  }
+  lines.push('}');
+  if (themeState.styles.length) {
+    lines.push('');
+    lines.push('/* Named styles */');
+    for (const s of themeState.styles) {
+      const cls = '.style-' + s.id.replace(/[^A-Za-z0-9_-]/g, '-');
+      const decls = [];
+      if (s.font) decls.push('font-family: "' + s.font + '"');
+      if (s.sizePt) decls.push('font-size: ' + s.sizePt + 'pt');
+      if (s.color) decls.push('color: ' + s.color);
+      if (s.bold) decls.push('font-weight: bold');
+      if (s.italic) decls.push('font-style: italic');
+      if (!decls.length) continue;
+      lines.push(cls + ' { ' + decls.join('; ') + '; } /* ' + s.name + ' */');
+    }
+  }
+  return lines.join('\n');
+}
+
+document.getElementById('btn-theme-copy').addEventListener('click', () => {
+  if (!state.isDocx) { setStatus('Open a .docx first.', 'warn'); return; }
+  const css = buildThemeCss();
+  if (!css) { setStatus('No theme data to copy.', 'warn'); return; }
+  navigator.clipboard.writeText(css).then(
+    () => setStatus('Theme CSS copied to clipboard.', 'ok'),
+    () => setStatus('Copy failed.', 'err'),
+  );
+});
+
+function refreshPreview() {
+  if (!previewState.open) return;
+  // Doc mode used to render the whole .docx via mammoth.js. Removed because
+  // mammoth never reliably converted these templates; the Theme panel and the
+  // file tree still expose everything useful from the .docx.
+  if (previewState.mode === 'doc') {
+    const frame = document.getElementById('preview-frame');
+    if (frame) frame.srcdoc = '<div style="font:13px sans-serif;color:#888;padding:16px;line-height:1.5">Document preview was removed (mammoth.js was unreliable on these templates).<br><br>Use the <strong>Theme</strong> sidebar for colours, fonts, and styles, or open the .docx in Word directly.</div>';
+    return;
+  }
+  // Pick the HTML to render: prefer the currently-open HTML file, else stick with the last one.
+  let target = null;
+  if (state.currentPath && ['html','htm'].includes(extOf(state.currentPath))) {
+    target = state.currentPath;
+  } else if (previewState.htmlPath && state.files[previewState.htmlPath]) {
+    target = previewState.htmlPath;
+  }
+  if (!target) return;
+  const text = state.monacoModels[target]
+    ? state.monacoModels[target].getValue()
+    : state.files[target].content;
+
+  previewState.htmlPath = target;
+  document.getElementById('preview-title').textContent = target;
+  // Now that htmlPath is known, save the mode preference for this template too.
+  previewState.modeByPath[target] = previewState.mode;
+
+  const mode = previewState.mode;
+  if (mode === 'css') {
+    // Build once with-data so cssBlocks reflect the actual render.
+    buildPreviewHtml(target, text, { withData: true });
+    renderCssView();
+    renderTokensStrip();
+    return;
+  }
+
+  if (mode === 'split') {
+    // Build both flavors.
+    const builtData = buildPreviewHtml(target, text, { withData: true });
+    // Stash unresolved tokens from the with-data render — that's the meaningful set.
+    const unresolvedFromData = previewState.unresolved.slice();
+    const builtRaw = buildPreviewHtml(target, text, { withData: false });
+    // Restore unresolved from the data render so the strip reflects "what's missing".
+    previewState.unresolved = unresolvedFromData;
+    const fData = document.getElementById('preview-frame-data');
+    const fRaw  = document.getElementById('preview-frame-raw');
+    fData.onload = () => { applyZoomToFrameEl(fData); attachTokenJumpHandlers(fData); };
+    fRaw.onload  = () => { applyZoomToFrameEl(fRaw);  attachTokenJumpHandlers(fRaw);  };
+    fData.srcdoc = builtData;
+    fRaw.srcdoc  = builtRaw;
+    renderTokensStrip();
+    return;
+  }
+
+  // 'data' or 'raw' single-iframe modes
+  const withData = mode === 'data';
+  const built = buildPreviewHtml(target, text, { withData });
+  const frame = document.getElementById('preview-frame');
+  frame.onload = () => { applyZoomToFrame(); attachTokenJumpHandlers(frame); };
+  frame.srcdoc = built;
+  renderTokensStrip();
+}
+
+// Render (or hide) the unresolved-tokens strip based on the last build's findings.
+function renderTokensStrip() {
+  const strip = document.getElementById('preview-tokens-strip');
+  const list = document.getElementById('preview-tokens-list');
+  const tokens = previewState.unresolved || [];
+  // Strip is meaningful in data + split modes; raw shows the markers in-frame; CSS hides it.
+  const meaningful = (previewState.mode === 'data' || previewState.mode === 'split');
+  if (!meaningful || !tokens.length || previewState.tokensDismissed) {
+    strip.classList.remove('show');
+    return;
+  }
+  list.innerHTML = '';
+  for (const tok of tokens) {
+    const chip = document.createElement('span');
+    chip.className = 't-chip';
+    chip.textContent = tok;
+    // If we have a script bound to this token, mark it and make the chip jump.
+    const bound = scriptByToken(tok);
+    if (bound) {
+      chip.classList.add('has-script');
+      chip.title = 'Jump to script: ' + (bound.name || tok);
+      chip.addEventListener('click', () => jumpToScriptByToken(tok));
+    } else {
+      chip.title = 'No script binds this token — value is missing from the datamodel sample';
+    }
+    list.appendChild(chip);
+  }
+  strip.classList.add('show');
+}
+
+// Find a script whose findText matches the @token@ exactly.
+function scriptByToken(token) {
+  const list = (scriptsState && scriptsState.list) || [];
+  return list.find(s => s.findText === token) || null;
+}
+
+// Switch the sidebar to the Scripts panel and open the matching script's form.
+function jumpToScriptByToken(token) {
+  const s = scriptByToken(token);
+  if (!s) {
+    setStatus('No script binds ' + token, 'warn');
+    return;
+  }
+  if (typeof setSidebarMode === 'function') setSidebarMode('scripts');
+  if (typeof openScriptForm === 'function') openScriptForm(s.id);
+  setStatus('Jumped to script: ' + (s.name || token), 'ok');
+}
+
+// Wire click handlers onto __cw_raw_token spans inside an iframe so users can
+// jump from a token in the rendered preview straight to its script binding.
+function attachTokenJumpHandlers(frame) {
+  let doc;
+  try { doc = frame.contentDocument; } catch (_) { return; }
+  if (!doc || !doc.body) return;
+  doc.body.querySelectorAll('.__cw_raw_token').forEach(el => {
+    if (el.dataset.cwBound === '1') return; // idempotent
+    el.dataset.cwBound = '1';
+    el.style.cursor = 'pointer';
+    el.title = 'Click: jump to the script that binds this token';
+    el.addEventListener('click', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      const token = el.textContent.trim();
+      if (!token) return;
+      jumpToScriptByToken(token);
+    });
+  });
+}
+
+function openPreviewNewTab() {
+  if (!previewState.open || !state.currentPath) return;
+  const text = state.monacoModels[state.currentPath]
+    ? state.monacoModels[state.currentPath].getValue()
+    : state.files[state.currentPath].content;
+  // New-tab opens the same flavor as the active iframe; CSS tab opens the With-Data render.
+  const withData = previewState.mode !== 'raw';
+  const built = buildPreviewHtml(state.currentPath, text, { withData });
+  const blob = new Blob([built], { type: 'text/html' });
+  const url = URL.createObjectURL(blob);
+  window.open(url, '_blank');
+  // Revoke after a delay so the new tab can load it
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+// Render the cached merged CSS into the CSS tab, with light syntax highlighting
+// and a per-source separator so it's clear which file each rule came from.
+function renderCssView() {
+  const codeEl = document.getElementById('preview-css-code');
+  const statsEl = document.getElementById('preview-css-stats');
+  const blocks = previewState.lastCssBlocks || [];
+  if (!blocks.length) {
+    codeEl.innerHTML = '<span class="comment">/* No CSS found in this template. */</span>';
+    statsEl.textContent = 'No CSS yet';
+    return;
+  }
+  const escape = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // Lightweight tokenizer — good enough for highlighting, not a real parser.
+  function highlight(css) {
+    // Strip /* comments */ and re-inject with a marker so we can colour them.
+    let s = css;
+    s = escape(s);
+    s = s.replace(/\/\*[\s\S]*?\*\//g, m => 'C' + m + '');
+    // @-rules
+    s = s.replace(/(@[-\w]+)/g, 'A$1');
+    // selectors (rough): everything up to the next "{" on a line that has one
+    s = s.replace(/([^{};\n]+)\{/g, (m, sel) => 'S' + sel + '{');
+    // declarations: prop: value;
+    s = s.replace(/([-\w]+)\s*:\s*([^;{}\n]+)([;}])/g, (m, p, v, t) => 'P' + p + ':V' + v + '' + t);
+    s = s
+      .replace(/C([\s\S]*?)/g, (_, x) => '<span class="comment">' + x + '</span>')
+      .replace(/A([^]*)/g, (_, x) => '<span class="at">' + x + '</span>')
+      .replace(/S([^]*)/g, (_, x) => '<span class="selector">' + x + '</span>')
+      .replace(/P([^]*)/g, (_, x) => '<span class="prop">' + x + '</span>')
+      .replace(/V([^]*)/g, (_, x) => '<span class="val">' + x + '</span>');
+    return s;
+  }
+  const html = blocks.map(b => {
+    const head = '<span class="src-tag">/* ' + escape(b.label) + ' — ' + (b.bytes || 0) + ' bytes */</span>';
+    return head + highlight(b.css);
+  }).join('\n\n');
+  codeEl.innerHTML = html;
+  const totalBytes = blocks.reduce((s, b) => s + (b.bytes || 0), 0);
+  statsEl.innerHTML =
+    '<span class="pill">' + blocks.length + ' source' + (blocks.length === 1 ? '' : 's') + '</span>' +
+    '<span class="pill">' + totalBytes.toLocaleString() + ' bytes</span>';
+}
+
+function buildPreviewHtml(htmlPath, htmlText, opts) {
+  opts = opts || {};
+  const withData = opts.withData !== false;
+  // Revoke any previous blobs to avoid leaking
+  revokePreviewBlobs();
+
+  // PlanetPress zips frequently use BACKSLASHES inside entry names (e.g.
+  // `public\document\css\Header.css`). Normalize the host HTML path and any
+  // refs we resolve to forward slashes for path math, then look up the file
+  // in state.files trying both separator flavors.
+  const htmlPathFwd = htmlPath.replace(/\\/g, '/');
+  const baseDir = htmlPathFwd.includes('/')
+    ? htmlPathFwd.substring(0, htmlPathFwd.lastIndexOf('/') + 1)
+    : '';
+
+  function normalizePath(p) {
+    const parts = p.replace(/\\/g, '/').split('/');
+    const out = [];
+    for (const part of parts) {
+      if (part === '..') out.pop();
+      else if (part !== '.' && part !== '') out.push(part);
+    }
+    return out.join('/');
+  }
+
+  // Try forward-slash key first, then backslash key. Returns the key that
+  // actually exists in state.files, or null. The returned key is what we
+  // store on cssBlocks/blobUrls so subsequent lookups stay consistent.
+  function lookupZipKey(norm) {
+    if (state.files[norm]) return norm;
+    const back = norm.replace(/\//g, '\\');
+    if (state.files[back]) return back;
+    return null;
+  }
+
+  function resolveZipPath(rel) {
+    if (!rel) return null;
+    rel = rel.trim();
+    if (/^(?:https?:|data:|blob:|mailto:|tel:|javascript:|#|\/\/)/i.test(rel)) return null;
+    rel = rel.split('?')[0].split('#')[0];
+    if (!rel) return null;
+    rel = rel.replace(/\\/g, '/');
+    if (rel.startsWith('/')) rel = rel.substring(1);
+    else rel = baseDir + rel;
+    const norm = normalizePath(rel);
+    return lookupZipKey(norm);
+  }
+
+  const mimeFor = (path) => {
+    const e = extOf(path);
+    return ({
+      css: 'text/css', js: 'text/javascript', mjs: 'text/javascript',
+      json: 'application/json', html: 'text/html', htm: 'text/html',
+      svg: 'image/svg+xml', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+      gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', ico: 'image/x-icon',
+      woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', otf: 'font/otf',
+      eot: 'application/vnd.ms-fontobject',
+    }[e]) || 'application/octet-stream';
+  };
+
+  const blobCache = new Map();
+  function blobUrlFor(zipPath) {
+    if (blobCache.has(zipPath)) return blobCache.get(zipPath);
+    const f = state.files[zipPath];
+    if (!f) return null;
+    const data = f.isText ? f.content : f.content;
+    const blob = new Blob([data], { type: mimeFor(zipPath) });
+    const url = URL.createObjectURL(blob);
+    blobCache.set(zipPath, url);
+    previewState.blobUrls.push(url);
+    return url;
+  }
+
+  // Rewrite url(...) and @import inside CSS text
+  function rewriteCss(css, cssDir) {
+    const savedBaseDir = baseDir;
+    function resolveRelToCss(rel) {
+      if (!rel) return null;
+      rel = rel.trim();
+      if (/^(?:https?:|data:|blob:|\/\/)/i.test(rel)) return null;
+      rel = rel.split('?')[0].split('#')[0];
+      if (!rel) return null;
+      rel = rel.replace(/\\/g, '/');
+      let p = rel.startsWith('/') ? rel.substring(1) : (cssDir + rel);
+      const norm = normalizePath(p);
+      return lookupZipKey(norm);
+    }
+    return css
+      .replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (m, q, url) => {
+        const zp = resolveRelToCss(url);
+        if (!zp) return m;
+        const burl = blobUrlFor(zp);
+        return burl ? 'url("' + burl + '")' : m;
+      })
+      .replace(/@import\s+(?:url\()?\s*(['"]?)([^'")\s;]+)\1\)?/g, (m, q, url) => {
+        const zp = resolveRelToCss(url);
+        if (!zp) return m;
+        const f = state.files[zp];
+        if (f && f.isText) {
+          // Inline the imported CSS so its own url() refs resolve correctly
+          const zpFwd = zp.replace(/\\/g, '/');
+          const subDir = zpFwd.includes('/') ? zpFwd.substring(0, zpFwd.lastIndexOf('/') + 1) : '';
+          return rewriteCss(f.content, subDir);
+        }
+        const burl = blobUrlFor(zp);
+        return burl ? '@import url("' + burl + '")' : m;
+      });
+  }
+
+  // Parse the HTML
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(htmlText, 'text/html');
+
+  // Track every CSS source we encounter, so the CSS tab can show the merged result.
+  const cssBlocks = [];
+
+  // Inline external stylesheets so we can rewrite url() within them.
+  // Replace <link rel="stylesheet"> with <style> containing rewritten CSS.
+  doc.querySelectorAll('link[rel~="stylesheet"][href]').forEach(link => {
+    const href = link.getAttribute('href');
+    const zp = resolveZipPath(href);
+    if (!zp) return;
+    const f = state.files[zp];
+    if (f && f.isText) {
+      const zpFwd = zp.replace(/\\/g, '/');
+      const cssDir = zpFwd.includes('/') ? zpFwd.substring(0, zpFwd.lastIndexOf('/') + 1) : '';
+      const rewritten = rewriteCss(f.content, cssDir);
+      const style = doc.createElement('style');
+      style.setAttribute('data-from', zp);
+      style.textContent = rewritten;
+      link.replaceWith(style);
+      cssBlocks.push({ label: zp + ' (linked stylesheet)', css: rewritten, bytes: rewritten.length });
+    } else {
+      const burl = blobUrlFor(zp);
+      if (burl) link.setAttribute('href', burl);
+    }
+  });
+
+  // Inline <style> blocks: rewrite url() refs (relative to the HTML file)
+  doc.querySelectorAll('style').forEach((s, i) => {
+    if (s.getAttribute('data-from')) return; // already handled above
+    const rewritten = rewriteCss(s.textContent || '', baseDir);
+    s.textContent = rewritten;
+    cssBlocks.push({ label: htmlPath + ' <style #' + (i + 1) + '>', css: rewritten, bytes: rewritten.length });
+  });
+
+  // Inline style="" attributes
+  doc.querySelectorAll('[style]').forEach(el => {
+    el.setAttribute('style', rewriteCss(el.getAttribute('style') || '', baseDir));
+  });
+
+  // Images
+  doc.querySelectorAll('img[src]').forEach(img => {
+    const zp = resolveZipPath(img.getAttribute('src'));
+    if (zp) { const u = blobUrlFor(zp); if (u) img.setAttribute('src', u); }
+    const srcset = img.getAttribute('srcset');
+    if (srcset) {
+      const rebuilt = srcset.split(',').map(part => {
+        const tok = part.trim().split(/\s+/);
+        const zp2 = resolveZipPath(tok[0]);
+        if (zp2) { const u = blobUrlFor(zp2); if (u) tok[0] = u; }
+        return tok.join(' ');
+      }).join(', ');
+      img.setAttribute('srcset', rebuilt);
+    }
+  });
+
+  // Sources (picture/video/audio)
+  doc.querySelectorAll('source[src], video[src], audio[src]').forEach(el => {
+    const zp = resolveZipPath(el.getAttribute('src'));
+    if (zp) { const u = blobUrlFor(zp); if (u) el.setAttribute('src', u); }
+  });
+
+  // Scripts — also inline them so module/relative paths inside resolve
+  doc.querySelectorAll('script[src]').forEach(s => {
+    const zp = resolveZipPath(s.getAttribute('src'));
+    if (!zp) return;
+    const f = state.files[zp];
+    if (f && f.isText) {
+      const inline = doc.createElement('script');
+      // copy type, but drop src
+      const t = s.getAttribute('type'); if (t) inline.setAttribute('type', t);
+      inline.textContent = f.content;
+      s.replaceWith(inline);
+    } else {
+      const u = blobUrlFor(zp);
+      if (u) s.setAttribute('src', u);
+    }
+  });
+
+  // Link rels other than stylesheet (icons, preload images, etc.) — rewrite href to blob url
+  doc.querySelectorAll('link[href]:not([rel~="stylesheet"])').forEach(link => {
+    const zp = resolveZipPath(link.getAttribute('href'));
+    if (zp) { const u = blobUrlFor(zp); if (u) link.setAttribute('href', u); }
+  });
+
+  // Object/embed
+  doc.querySelectorAll('object[data], embed[src], iframe[src]').forEach(el => {
+    const attr = el.tagName.toLowerCase() === 'object' ? 'data' : 'src';
+    const zp = resolveZipPath(el.getAttribute(attr));
+    if (zp) { const u = blobUrlFor(zp); if (u) el.setAttribute(attr, u); }
+  });
+
+  // Strip any <base> tag — would interfere with our resolved URLs
+  doc.querySelectorAll('base').forEach(b => b.remove());
+
+  // Resolve @field@ placeholders + apply conditional show/hide rules using
+  // values from the open template's datamodel. Both are best-effort and
+  // skipped silently if the data isn't available.
+  // In raw mode we skip personalization entirely so @field@ tokens render
+  // literally and conditional show/hide rules don't fire.
+  const resolvedCount = withData ? applyDatamodelPersonalization(doc) : 0;
+  // After (or instead of) substitution, scan the body for tokens that remain.
+  // These are "unresolved" — surfaced in the strip above the preview so the
+  // user can spot missing datamodel values or typoed placeholders at a glance.
+  previewState.unresolved = collectUnresolvedTokens(doc);
+
+  // Inject a small banner so it's clear this is a static preview.
+  const banner = doc.createElement('div');
+  let bannerText, bannerBg, bannerFg, bannerBorder;
+  if (!withData) {
+    bannerText = 'Preview (Raw) — datamodel substitution disabled; @field@ tokens shown literally';
+    bannerBg = '#e1edf7'; bannerFg = '#0a3a66'; bannerBorder = '#b6d4ee';
+  } else if (resolvedCount > 0) {
+    const scn = (typeof scenariosState !== 'undefined' && scenariosState.active) ? scenariosState.active : null;
+    if (scn) {
+      bannerText = `Preview (With Data) — scenario "${scn}", ${resolvedCount} field${resolvedCount === 1 ? '' : 's'} resolved`;
+      bannerBg = '#d1f0d4'; bannerFg = '#1f4d23'; bannerBorder = '#a8dcb0';
+    } else {
+      bannerText = `Preview (With Data) — ${resolvedCount} field${resolvedCount === 1 ? '' : 's'} resolved from datamodel sample values`;
+      bannerBg = '#fff3cd'; bannerFg = '#664d03'; bannerBorder = '#ffecb5';
+    }
+  } else {
+    bannerText = 'Preview (With Data) — open a template with a datamodel to resolve @field@ placeholders';
+    bannerBg = '#fff3cd'; bannerFg = '#664d03'; bannerBorder = '#ffecb5';
+  }
+  banner.style.cssText = 'position:fixed;top:0;left:0;right:0;background:' + bannerBg + ';color:' + bannerFg + ';border-bottom:1px solid ' + bannerBorder + ';font:11px -apple-system,sans-serif;padding:4px 8px;z-index:99999;';
+  banner.textContent = bannerText;
+  if (doc.body) doc.body.insertBefore(banner, doc.body.firstChild);
+
+  // In raw mode, give @token@ placeholders a subtle highlight so they're easy
+  // to spot at a glance. Pure CSS — does not change the underlying text.
+  if (!withData && doc.body) {
+    const tokenStyle = doc.createElement('style');
+    tokenStyle.textContent =
+      '/* injected by editor — highlight @field@ tokens in raw preview */\n' +
+      '.__cw_raw_token { background:#fde68a; color:#7c2d12; padding:0 2px; border-radius:2px; }';
+    doc.head && doc.head.appendChild(tokenStyle);
+    const re = /@[A-Za-z0-9_./\-]+@/g;
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, null);
+    const targets = [];
+    let n;
+    while ((n = walker.nextNode())) {
+      if (n.parentNode && /^(SCRIPT|STYLE)$/i.test(n.parentNode.nodeName)) continue;
+      if (re.test(n.nodeValue)) targets.push(n);
+      re.lastIndex = 0;
+    }
+    for (const t of targets) {
+      const frag = doc.createDocumentFragment();
+      let last = 0;
+      const text = t.nodeValue;
+      let m;
+      re.lastIndex = 0;
+      while ((m = re.exec(text)) !== null) {
+        if (m.index > last) frag.appendChild(doc.createTextNode(text.slice(last, m.index)));
+        const span = doc.createElement('span');
+        span.className = '__cw_raw_token';
+        span.textContent = m[0];
+        frag.appendChild(span);
+        last = m.index + m[0].length;
+      }
+      if (last < text.length) frag.appendChild(doc.createTextNode(text.slice(last)));
+      t.parentNode.replaceChild(frag, t);
+    }
+  }
+
+  // Stash the collected CSS for the CSS tab.
+  previewState.lastCssBlocks = cssBlocks;
+  previewState.lastCss = cssBlocks.map(b => '/* ' + b.label + ' */\n' + b.css).join('\n\n');
+
+  return '<!doctype html>\n' + doc.documentElement.outerHTML;
+}
+
+// Walk the body and surface every @token@-shaped string that's still present
+// after substitution (or the full set, in raw mode). Returns a sorted, deduped
+// array of token strings, e.g. ['@LenderName@', '@MissingField@'].
+function collectUnresolvedTokens(doc) {
+  if (!doc || !doc.body) return [];
+  const re = /@[A-Za-z0-9_./\-]+@/g;
+  const found = new Set();
+  // Text nodes (skip script/style — those aren't user-visible content)
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
+    acceptNode(n) {
+      if (n.parentNode && /^(SCRIPT|STYLE)$/i.test(n.parentNode.nodeName)) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  let n;
+  while ((n = walker.nextNode())) {
+    const v = n.nodeValue;
+    if (!v) continue;
+    let m; re.lastIndex = 0;
+    while ((m = re.exec(v)) !== null) found.add(m[0]);
+  }
+  // Token-bearing attributes
+  doc.body.querySelectorAll('[alt],[title],[href],[src],[value]').forEach(el => {
+    ['alt','title','href','src','value'].forEach(attr => {
+      if (!el.hasAttribute(attr)) return;
+      const v = el.getAttribute(attr);
+      if (!v) return;
+      let m; re.lastIndex = 0;
+      while ((m = re.exec(v)) !== null) found.add(m[0]);
+    });
+  });
+  return Array.from(found).sort();
+}
+
+// Substitute @field@ placeholders and apply conditional show/hide rules from
+// the script blocks in index.xml. Returns how many distinct fields resolved.
+function applyDatamodelPersonalization(doc) {
+  // Build a map of @token@ -> string value using the datamodel + script wrappers.
+  const fields = (scriptsState && scriptsState.datamodelFields) || [];
+  // Scenarios layer on top of the datamodel — they may add field paths the
+  // datamodel doesn't list, so we still want to run when fields is empty but
+  // scenario overrides are present.
+  const overrides = (typeof scenariosState !== 'undefined' && scenariosState.activeOverrides) || null;
+  if (!fields.length && !overrides) return 0;
+  if (!doc.body) return 0;
+  const valueByPath = new Map();
+  for (const f of fields) valueByPath.set(f.path, f.lastValue == null ? '' : String(f.lastValue));
+  if (overrides) {
+    for (const [path, val] of overrides.entries()) valueByPath.set(path, val == null ? '' : String(val));
+  }
+
+  // From parsed scripts: build token -> rendered value (with prefix/suffix)
+  const tokenToValue = new Map();
+  const conditionals = [];
+  for (const s of (scriptsState && scriptsState.list) || []) {
+    if (s.kind === 'TEXT' && s.findText && s.fieldPath) {
+      const v = valueByPath.has(s.fieldPath) ? valueByPath.get(s.fieldPath) : null;
+      if (v != null) {
+        tokenToValue.set(s.findText, (s.prefix || '') + v + (s.suffix || ''));
+      }
+    } else if (s.kind === 'CONDITIONAL' && s.condField && s.selectorType === 'QUERY' && s.selectorText) {
+      conditionals.push(s);
+    }
+  }
+  // Plus a fallback @path@ -> value mapping for any field not bound by a script
+  for (const [path, val] of valueByPath.entries()) {
+    const token = '@' + path + '@';
+    if (!tokenToValue.has(token)) tokenToValue.set(token, val);
+  }
+
+  if (!tokenToValue.size && !conditionals.length) return 0;
+
+  // Replace tokens in text nodes and attribute values
+  const tokens = Array.from(tokenToValue.keys());
+  if (tokens.length) {
+    // Build a single regex matching any token (must escape chars; tokens contain @)
+    const escTokens = tokens.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const re = new RegExp('(' + escTokens.join('|') + ')', 'g');
+    const replace = (text) => text.replace(re, m => tokenToValue.get(m) ?? m);
+    // Walk text nodes
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, null);
+    const replacements = [];
+    let n;
+    while ((n = walker.nextNode())) {
+      if (n.nodeValue && re.test(n.nodeValue)) replacements.push(n);
+      re.lastIndex = 0;
+    }
+    for (const n of replacements) n.nodeValue = replace(n.nodeValue);
+    // Plus a few attributes that commonly hold tokens (alt, title, href, src)
+    doc.body.querySelectorAll('[alt],[title],[href],[src],[value]').forEach(el => {
+      ['alt','title','href','src','value'].forEach(attr => {
+        if (!el.hasAttribute(attr)) return;
+        const v = el.getAttribute(attr);
+        if (v && re.test(v)) { re.lastIndex = 0; el.setAttribute(attr, replace(v)); }
+      });
+    });
+  }
+
+  // Apply conditional show/hide rules
+  for (const s of conditionals) {
+    const v = valueByPath.get(s.condField);
+    if (v == null) continue;
+    let pass;
+    const a = s.condCaseInsensitive ? String(v).toLowerCase() : String(v);
+    const b = s.condCaseInsensitive ? String(s.condValue).toLowerCase() : String(s.condValue);
+    switch (s.condition) {
+      case 'EQUAL_TO':              pass = a === b; break;
+      case 'NOT_EQUAL_TO':          pass = a !== b; break;
+      case 'GREATER_THAN':          pass = parseFloat(a) >  parseFloat(b); break;
+      case 'GREATER_THAN_OR_EQUAL': pass = parseFloat(a) >= parseFloat(b); break;
+      case 'LESS_THAN':             pass = parseFloat(a) <  parseFloat(b); break;
+      case 'LESS_THAN_OR_EQUAL':    pass = parseFloat(a) <= parseFloat(b); break;
+      case 'CONTAINS':              pass = a.indexOf(b) !== -1; break;
+      case 'STARTS_WITH':           pass = a.startsWith(b); break;
+      case 'ENDS_WITH':             pass = a.endsWith(b); break;
+      case 'IS_EMPTY':              pass = !a; break;
+      case 'IS_NOT_EMPTY':          pass = !!a; break;
+      default: pass = true;
+    }
+    const shouldShow = (s.condAction === 'SHOW') ? pass : !pass;
+    let matches;
+    try { matches = doc.body.querySelectorAll(s.selectorText); }
+    catch (_) { continue; } // bad selector
+    matches.forEach(el => {
+      if (s.condToggleVisibility !== false) {
+        el.style.display = shouldShow ? '' : 'none';
+      } else if (!shouldShow) {
+        el.remove();
+      }
+    });
+  }
+
+  return tokenToValue.size;
+}
+
+// Auto-refresh preview when committing an edit to the previewed file (or one of its referenced files)
+const _origCommit = commitCurrentEdit;
+commitCurrentEdit = function (showStatus) {
+  _origCommit(showStatus);
+  if (previewState.open) refreshPreview();
+};
+
+// Preview pane resizer
+(function () {
+  const r = document.getElementById('preview-resizer');
+  const pane = document.getElementById('preview-pane');
+  let dragging = false, startX = 0, startW = 0;
+  r.addEventListener('mousedown', e => {
+    dragging = true; startX = e.clientX; startW = pane.getBoundingClientRect().width;
+    document.body.style.cursor = 'col-resize'; e.preventDefault();
+  });
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const delta = startX - e.clientX;
+    const newW = Math.max(240, Math.min(window.innerWidth * 0.8, startW + delta));
+    pane.style.width = newW + 'px';
+  });
+  document.addEventListener('mouseup', () => { dragging = false; document.body.style.cursor = ''; });
+})();
+
+// ============================================================
+// SCRIPTS PANEL — parse <script> elements out of index.xml and
+// expose a friendly form view for editing them (LenderRegisteredName,
+// BrokerFeeOnApplicationRefundable, Control, etc.)
+// ============================================================
+const scriptsState = {
+  hostPath: null,        // which file holds the scripts (usually 'index.xml')
+  list: [],              // [{ id, name, type, findText, enabled, scope, selectorType, selectorText, source, fieldPath, fieldType, prefix, suffix, formatType, insertMethod, rawXml, _matchIndex }]
+  active: null,          // currently-edited script id
+  sourceEditor: null,    // monaco model+editor for the form's source field
+  filter: '',
+  kindFilter: 'ALL',     // 'ALL' | 'TEXT' | 'CONDITIONAL' | 'CONTROL'
+  selected: new Set(),   // bulk-selection: Set of script ids that are checked
+  // usagesCache is wired to the shared makeMemoCache helper (see top of file).
+  // Invalidated on every refreshScriptsList; one entry per script id.
+  usagesCache: makeMemoCache(),
+};
+
+const SCRIPT_HOST_CANDIDATES = ['index.xml'];
+
+// Strip CDATA sections by replacing each one with same-length whitespace.
+// We need length parity so that match offsets we pull off `safe` are still
+// valid offsets into the original text — that's how _raw and _start get
+// captured for splice-back later. Inside `inner`, content that originally
+// lived inside CDATA is now blanked out (so a literal "<script>" or
+// "<\/script>" hiding inside JS source no longer fools the outer regex).
+function stripCdataKeepingOffsets(text) {
+  return text.replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, m => ' '.repeat(m.length));
+}
+
+// Parse all <script>…<\/script> blocks from a chunk of XML text.
+// We use a regex on the raw text (rather than DOMParser) so we can
+// later splice the edited XML back into the file at the same location
+// without disturbing whitespace, comments or namespaces around it.
+function parseScriptsFromXml(xmlText) {
+  const scripts = [];
+  // Run the script-block regex against a CDATA-stripped working copy so a
+  // literal end-script tag buried inside CDATA can't terminate a real block
+  // early. Same-length blanking keeps every match offset valid against
+  // `xmlText` for downstream slicing/splicing.
+  const safe = stripCdataKeepingOffsets(xmlText);
+  // Match <script type="...">...<\/script>. type may be missing (rare).
+  const re = /<script(\s[^>]*)?>([\s\S]*?)<\/script>/g;
+  let m, idx = 0;
+  while ((m = re.exec(safe)) !== null) {
+    const fullStart = m.index;
+    const fullEnd = re.lastIndex;
+    const attrs = m[1] || '';
+    // Use the ORIGINAL text for inner so CDATA contents are preserved when
+    // we hand them to the form (a control script's source lives in CDATA).
+    // Recompute the inner span by stripping the opening/closing tags from
+    // the captured raw chunk.
+    const rawChunk = xmlText.slice(fullStart, fullEnd);
+    const openMatch = /^<script(\s[^>]*)?>/.exec(rawChunk);
+    const inner = openMatch
+      ? rawChunk.slice(openMatch[0].length, rawChunk.length - '<\/script>'.length)
+      : m[2];
+    const typeMatch = /\btype\s*=\s*"([^"]*)"/.exec(attrs);
+    const type = typeMatch ? typeMatch[1] : '';
+    // Pluck simple top-level fields (only first occurrence, top-level — these are inside <script>)
+    function pluck(tag) {
+      const r = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`);
+      const mm = r.exec(inner);
+      return mm ? mm[1] : null;
+    }
+    function pluckEmpty(tag) {
+      // also handle <tag/> empty-element form
+      if (new RegExp(`<${tag}\\s*/>`).test(inner)) return '';
+      return pluck(tag);
+    }
+    const name = pluckEmpty('name') ?? '';
+    const findText = pluckEmpty('findText') ?? '';
+    const enabled = (pluckEmpty('enabled') || '').trim() !== 'false';
+    const scope = (pluckEmpty('scope') || 'NONE').trim();
+    const selectorText = pluckEmpty('selectorText') ?? '';
+    const selectorType = (pluckEmpty('selectorType') || 'TEXT').trim();
+    const source = pluckEmpty('source') ?? '';
+
+    // STANDARD scripts have a TextScriptModel block
+    let fieldPath = '', fieldType = '', prefix = '', suffix = '', formatType = 'NONE', insertMethod = 'HTML';
+    const tsm = /<com\.objectiflune\.scripting\.text\.TextScriptModel[^>]*>([\s\S]*?)<\/com\.objectiflune\.scripting\.text\.TextScriptModel>/.exec(inner);
+    if (tsm) {
+      const tsmInner = tsm[1];
+      const fp = /<path>([\s\S]*?)<\/path>/.exec(tsmInner);
+      if (fp) fieldPath = fp[1];
+      const ft = /<entry>[\s\S]*?<field>[\s\S]*?<type>([\s\S]*?)<\/type>/.exec(tsmInner);
+      if (ft) fieldType = ft[1].trim();
+      const pf = /<prefix>([\s\S]*?)<\/prefix>/.exec(tsmInner);
+      if (pf) prefix = pf[1];
+      const sf = /<suffix>([\s\S]*?)<\/suffix>/.exec(tsmInner);
+      if (sf) suffix = sf[1];
+      const fmt = /<format(?:\s+type="([^"]*)")?\s*\/?>/.exec(tsmInner);
+      if (fmt && fmt[1]) formatType = fmt[1];
+      const im = /<insertMethod>([\s\S]*?)<\/insertMethod>/.exec(tsmInner);
+      if (im) insertMethod = im[1].trim();
+      // Empty-element prefix/suffix
+      if (prefix === null && /<prefix\s*\/>/.test(tsmInner)) prefix = '';
+      if (suffix === null && /<suffix\s*\/>/.test(tsmInner)) suffix = '';
+    }
+
+    // CONDITIONAL scripts have a ConditionalScriptModel block — show/hide based on a field+value comparison
+    let isConditional = false, condField = '', condFieldType = '', condValue = '', condition = 'EQUAL_TO', condAction = 'SHOW', condCaseInsensitive = false, condToggleVisibility = true;
+    const csm = /<com\.objectiflune\.scripting\.conditional\.ConditionalScriptModel[^>]*>([\s\S]*?)<\/com\.objectiflune\.scripting\.conditional\.ConditionalScriptModel>/.exec(inner);
+    if (csm) {
+      isConditional = true;
+      const ci = csm[1];
+      const cf = /<field>[\s\S]*?<path>([\s\S]*?)<\/path>/.exec(ci);
+      if (cf) condField = cf[1];
+      const cft = /<field>[\s\S]*?<type>([\s\S]*?)<\/type>/.exec(ci);
+      if (cft) condFieldType = cft[1].trim();
+      const cv = /<value>([\s\S]*?)<\/value>/.exec(ci);
+      if (cv) condValue = cv[1];
+      const cc = /<condition>([\s\S]*?)<\/condition>/.exec(ci);
+      if (cc) condition = cc[1].trim();
+      const ca = /<action>([\s\S]*?)<\/action>/.exec(ci);
+      if (ca) condAction = ca[1].trim();
+      const cci = /<caseInsensitive>([\s\S]*?)<\/caseInsensitive>/.exec(ci);
+      if (cci) condCaseInsensitive = cci[1].trim() === 'true';
+      const ctv = /<toggleVisibility>([\s\S]*?)<\/toggleVisibility>/.exec(ci);
+      if (ctv) condToggleVisibility = ctv[1].trim() === 'true';
+    }
+
+    scripts.push({
+      id: 'sc' + (idx++),
+      name: decodeXmlEntities(name || ''),
+      type,
+      kind: isConditional ? 'CONDITIONAL' : (tsm ? 'TEXT' : (type === 'CONTROL' ? 'CONTROL' : 'OTHER')),
+      findText: decodeXmlEntities(findText || ''),
+      enabled,
+      scope,
+      selectorText: decodeXmlEntities(selectorText || ''),
+      selectorType,
+      source: decodeXmlEntities(source || ''),
+      fieldPath,
+      fieldType,
+      prefix: decodeXmlEntities(prefix || ''),
+      suffix: decodeXmlEntities(suffix || ''),
+      formatType,
+      insertMethod,
+      // Conditional script fields
+      isConditional,
+      condField: decodeXmlEntities(condField || ''),
+      condFieldType,
+      condValue: decodeXmlEntities(condValue || ''),
+      condition,
+      condAction,
+      condCaseInsensitive,
+      condToggleVisibility,
+      _start: fullStart,
+      _end: fullEnd,
+      // Use the original text for _raw — m[0] would be the CDATA-blanked
+      // working copy, and we splice _raw back into the file later.
+      _raw: rawChunk,
+    });
+  }
+  return scripts;
+}
+
+// decodeXmlEntities / encodeXmlText / encodeXmlAttr now live in the shared
+// utilities region near the top of this script (search for "shared XML / text
+// helpers"). Hoisted so non-Scripts code paths can use the same round-trip-
+// safe encode/decode rules.
+
+// replaceTagInner has been hoisted to the shared XML / text helpers region
+// near the top of this script. Same behaviour, reused by the preset overlay
+// form too.
+
+// Build the new <script>…<\/script> XML using the form values, then splice it
+// back into the index.xml content at the same byte offsets it came from.
+function serializeScriptBack(orig, form) {
+  let raw = orig._raw;
+
+  // simple text fields
+  raw = replaceTagInner(raw, 'name', encodeXmlText(form.name));
+  raw = replaceTagInner(raw, 'findText', encodeXmlText(form.findText));
+  raw = replaceTagInner(raw, 'enabled', form.enabled ? 'true' : 'false');
+  raw = replaceTagInner(raw, 'scope', encodeXmlText(form.scope));
+  raw = replaceTagInner(raw, 'selectorType', encodeXmlText(form.selectorType));
+  raw = replaceTagInner(raw, 'selectorText', encodeXmlText(form.selectorText));
+  raw = replaceTagInner(raw, 'source', encodeXmlText(form.source));
+
+  // TEXT script block (TextScriptModel)
+  if (/TextScriptModel/.test(raw)) {
+    raw = raw.replace(/(<field>\s*<path>)([\s\S]*?)(<\/path>)/, (_m, a, _b, c) => `${a}${encodeXmlText(form.fieldPath)}${c}`);
+    raw = raw.replace(/(<field>[\s\S]*?<type>)([\s\S]*?)(<\/type>)/, (_m, a, _b, c) => `${a}${encodeXmlText(form.fieldType)}${c}`);
+    raw = raw.replace(/<prefix\s*\/>/, '<prefix></prefix>');
+    raw = raw.replace(/(<prefix>)([\s\S]*?)(<\/prefix>)/, (_m, a, _b, c) => `${a}${encodeXmlText(form.prefix)}${c}`);
+    raw = raw.replace(/<suffix\s*\/>/, '<suffix></suffix>');
+    raw = raw.replace(/(<suffix>)([\s\S]*?)(<\/suffix>)/, (_m, a, _b, c) => `${a}${encodeXmlText(form.suffix)}${c}`);
+    raw = raw.replace(/<format(\s+type="[^"]*")?\s*\/>/, `<format type="${encodeXmlAttr(form.formatType || 'NONE')}"/>`);
+    raw = raw.replace(/(<insertMethod>)([\s\S]*?)(<\/insertMethod>)/, (_m, a, _b, c) => `${a}${encodeXmlText(form.insertMethod)}${c}`);
+  }
+
+  // CONDITIONAL script block (ConditionalScriptModel)
+  if (/ConditionalScriptModel/.test(raw) && form.isConditional) {
+    // Field path (inside ConditionalScriptModel only — first <path> within that block)
+    // Use a single regex that matches inside the conditional block
+    raw = raw.replace(
+      /(<com\.objectiflune\.scripting\.conditional\.ConditionalScriptModel[^>]*>[\s\S]*?<field>[\s\S]*?<path>)([\s\S]*?)(<\/path>)/,
+      (_m, a, _b, c) => `${a}${encodeXmlText(form.condField)}${c}`
+    );
+    raw = raw.replace(
+      /(<com\.objectiflune\.scripting\.conditional\.ConditionalScriptModel[^>]*>[\s\S]*?<field>[\s\S]*?<type>)([\s\S]*?)(<\/type>)/,
+      (_m, a, _b, c) => `${a}${encodeXmlText(form.condFieldType)}${c}`
+    );
+    raw = raw.replace(/(<condition>)([\s\S]*?)(<\/condition>)/, (_m, a, _b, c) => `${a}${encodeXmlText(form.condition)}${c}`);
+    raw = raw.replace(
+      /(<com\.objectiflune\.scripting\.conditional\.ConditionalScriptModel[^>]*>[\s\S]*?<value>)([\s\S]*?)(<\/value>)/,
+      (_m, a, _b, c) => `${a}${encodeXmlText(form.condValue)}${c}`
+    );
+    raw = raw.replace(/(<action>)([\s\S]*?)(<\/action>)/, (_m, a, _b, c) => `${a}${encodeXmlText(form.condAction)}${c}`);
+    raw = raw.replace(/(<caseInsensitive>)([\s\S]*?)(<\/caseInsensitive>)/, (_m, a, _b, c) => `${a}${form.condCaseInsensitive ? 'true' : 'false'}${c}`);
+    raw = raw.replace(/(<toggleVisibility>)([\s\S]*?)(<\/toggleVisibility>)/, (_m, a, _b, c) => `${a}${form.condToggleVisibility ? 'true' : 'false'}${c}`);
+  }
+
+  return raw;
+}
+
+// Find a host file (index.xml) and reload the scripts list from its current text.
+function refreshScriptsList() {
+  scriptsState.list = [];
+  scriptsState.hostPath = null;
+  // Bust per-script usage cache. Use the shared memo helper API rather than
+  // assigning a fresh object so any external code holding a reference to
+  // scriptsState.usagesCache still sees an empty cache.
+  if (scriptsState.usagesCache && typeof scriptsState.usagesCache.invalidate === 'function') {
+    scriptsState.usagesCache.invalidate();
+  } else {
+    scriptsState.usagesCache = makeMemoCache();
+  }
+  // Drop any stale ids from the bulk-selection set — script ids are
+  // re-issued on every parse, so old ids no longer refer to anything.
+  if (scriptsState.selected) scriptsState.selected.clear();
+  for (const cand of SCRIPT_HOST_CANDIDATES) {
+    if (state.files[cand] && state.files[cand].isText) {
+      scriptsState.hostPath = cand;
+      break;
+    }
+  }
+  if (!scriptsState.hostPath) {
+    renderScriptsList();
+    refreshDatamodelFields();
+    return;
+  }
+  const text = state.monacoModels[scriptsState.hostPath]
+    ? state.monacoModels[scriptsState.hostPath].getValue()
+    : state.files[scriptsState.hostPath].content;
+  scriptsState.list = parseScriptsFromXml(text);
+  renderScriptsList();
+  refreshDatamodelFields();
+}
+
+// ============================================================
+// DATAMODEL FIELD-PATH AUTOCOMPLETE
+// Parses the .OL-datamodel inside the open template and populates a
+// <datalist> so the script form's "Field path" inputs offer real
+// suggestions while still allowing free typing.
+// ============================================================
+function findDatamodelPath() {
+  // Templates and datamappers can contain .OL-datamodel files. Pick the first.
+  for (const path of Object.keys(state.files)) {
+    if (/\.OL-datamodel$/i.test(path)) return path;
+  }
+  return null;
+}
+
+function parseDatamodelFields(xmlText) {
+  // Returns a flat list of { path, type } — paths use dotted notation for tables.
+  const out = [];
+  let doc;
+  try {
+    doc = new DOMParser().parseFromString(xmlText, 'application/xml');
+  } catch (_) { return out; }
+  const root = doc.documentElement;
+  if (!root || root.nodeName.toLowerCase() === 'parsererror') return out;
+
+  function walk(node, prefix) {
+    // Direct children first; then recurse into table/configs.
+    for (const child of node.children || []) {
+      const tag = child.localName || child.nodeName;
+      if (tag === 'configs') {
+        // <configs> wraps the actual fields/tables in a datamodel
+        walk(child, prefix);
+      } else if (tag === 'field') {
+        const name = child.getAttribute('name');
+        const type = child.getAttribute('type') || '';
+        const lastValue = child.getAttribute('lastValue');
+        if (name) out.push({ path: prefix + name, type, lastValue: lastValue == null ? '' : lastValue });
+      } else if (tag === 'table') {
+        const name = child.getAttribute('name');
+        if (name) {
+          // Tables are also addressable as a path (returns array)
+          out.push({ path: prefix + name, type: 'table' });
+          walk(child, prefix + name + '.');
+        }
+      } else {
+        // Unknown structural wrapper — recurse anyway in case nesting differs
+        walk(child, prefix);
+      }
+    }
+  }
+  walk(root, '');
+  return out;
+}
+
+function refreshDatamodelFields() {
+  const list = document.getElementById('datamodel-fields');
+  if (!list) return;
+  list.innerHTML = '';
+  const dmPath = findDatamodelPath();
+  if (!dmPath) {
+    scriptsState.datamodelFields = [];
+    return;
+  }
+  const text = state.monacoModels[dmPath]
+    ? state.monacoModels[dmPath].getValue()
+    : state.files[dmPath].content;
+  const fields = parseDatamodelFields(text);
+  // Sort alphabetically; tables float just before their children naturally.
+  fields.sort((a, b) => a.path.localeCompare(b.path));
+  for (const f of fields) {
+    const opt = document.createElement('option');
+    opt.value = f.path;
+    if (f.type) opt.label = f.type; // shown by some browsers as a hint
+    list.appendChild(opt);
+  }
+  scriptsState.datamodelFields = fields;
+}
+
+// PlanetPress field types map onto the form's <select> options.
+function dmTypeToFormType(dmType) {
+  const t = (dmType || '').toLowerCase();
+  if (t === 'string') return 'STRING';
+  if (t === 'boolean') return 'BOOLEAN';
+  if (t === 'integer') return 'INTEGER';
+  if (t === 'float' || t === 'number') return 'FLOAT';
+  if (t === 'currency') return 'CURRENCY';
+  if (t === 'date') return 'DATE';
+  if (t === 'datetime') return 'DATETIME';
+  if (t === 'time') return 'TIME';
+  if (t === 'html' || t === 'htmlstring') return 'HTMLSTRING';
+  if (t === 'object') return 'OBJECT';
+  return null;
+}
+
+// Helper: when a known field is picked, auto-set the matching type select.
+function bindFieldPathAutotype(pathInputId, typeSelectId) {
+  const input = document.getElementById(pathInputId);
+  const select = document.getElementById(typeSelectId);
+  if (!input || !select) return;
+  const handler = () => {
+    const fields = scriptsState.datamodelFields || [];
+    const match = fields.find(f => f.path === input.value);
+    if (match) {
+      const formType = dmTypeToFormType(match.type);
+      if (formType) setSelectValue(typeSelectId, formType);
+    }
+  };
+  input.addEventListener('change', handler);
+  input.addEventListener('input', handler);
+}
+// Wire both field-path inputs once at startup
+bindFieldPathAutotype('sf-field-path', 'sf-field-type');
+bindFieldPathAutotype('sf-cond-field', 'sf-cond-field-type');
+
+function renderScriptsList() {
+  const list = document.getElementById('scripts-list');
+  list.innerHTML = '';
+  if (!scriptsState.hostPath) {
+    list.innerHTML = '<div class="scripts-empty">Open a template (with index.xml) to list its scripts.</div>';
+    updateBulkBar([]);
+    return;
+  }
+  if (!scriptsState.list.length) {
+    list.innerHTML = '<div class="scripts-empty">No &lt;script&gt; elements found in index.xml.</div>';
+    updateBulkBar([]);
+    return;
+  }
+  const filter = (scriptsState.filter || '').toLowerCase();
+  const kindFilter = scriptsState.kindFilter || 'ALL';
+  // Group by kind so TEXT (FLD) and CONDITIONAL (IF) get their own headers
+  // — the old "Personalization" bucket lumped them together. CONTROL stays
+  // separate; OTHER is anything we couldn't classify.
+  const groups = { CONTROL: [], TEXT: [], CONDITIONAL: [], OTHER: [] };
+  const visibleScripts = []; // for the "Select all visible" affordance
+  for (const s of scriptsState.list) {
+    if (filter && !(s.name.toLowerCase().includes(filter) || (s.findText || '').toLowerCase().includes(filter))) continue;
+    if (kindFilter !== 'ALL' && s.kind !== kindFilter) continue;
+    const g = s.kind === 'CONTROL' ? 'CONTROL'
+            : s.kind === 'TEXT' ? 'TEXT'
+            : s.kind === 'CONDITIONAL' ? 'CONDITIONAL'
+            : 'OTHER';
+    groups[g].push(s);
+    visibleScripts.push(s);
+  }
+  const order = [
+    ['CONTROL', 'Control / JS'],
+    ['TEXT', 'Field text (FLD)'],
+    ['CONDITIONAL', 'Conditional (IF)'],
+    ['OTHER', 'Other'],
+  ];
+  let total = 0;
+  for (const [key, label] of order) {
+    if (!groups[key].length) continue;
+    const head = document.createElement('div');
+    head.className = 'scripts-group';
+    head.textContent = `${label}  (${groups[key].length})`;
+    list.appendChild(head);
+    for (const s of groups[key]) {
+      total++;
+      const invalid = isScriptFieldInvalid(s);
+      // Only check usages if the field path is valid — invalid path is the
+      // more critical signal, so we don't want both badges fighting for space.
+      const usageCount = invalid ? null : countScriptUsages(s);
+      const unused = usageCount === 0; // -1 means "no findText/selector to search for", treat as N/A
+      const isPicked = scriptsState.selected && scriptsState.selected.has(s.id);
+      const el = document.createElement('div');
+      el.className = 'script-item'
+        + (scriptsState.active === s.id ? ' active' : '')
+        + (s.enabled ? '' : ' disabled')
+        + (invalid ? ' invalid' : '')
+        + (unused ? ' unused' : '');
+      el.dataset.scriptId = s.id;
+      el.draggable = true;
+      const drag = `<span class="drag" title="Drag to reorder in &lt;scripts&gt;">⋮⋮</span>`;
+      const pick = `<input type="checkbox" class="pick" title="Select for bulk actions" ${isPicked ? 'checked' : ''}>`;
+      const badge = s.kind === 'CONDITIONAL' ? '<span class="badge cnd">IF</span>'
+                   : s.kind === 'TEXT' ? '<span class="badge std">FLD</span>'
+                   : s.kind === 'CONTROL' ? '<span class="badge ctl">JS</span>'
+                   : `<span class="badge">${escapeHtml(s.type || '?')}</span>`;
+      const find = s.findText ? `<span class="find">${escapeHtml(s.findText)}</span>` : '';
+      const statusBadge = invalid
+        ? '<span class="badge bad" title="Field path not in datamodel">!</span>'
+        : (unused
+            ? `<span class="badge unused" title="Click to search the template for this token (no usages found in HTML/XML files — searched findText${s.selectorText ? ' and selectorText' : ''})">?</span>`
+            : '');
+      const toggle = `<input type="checkbox" class="toggle" title="Enable / disable" ${s.enabled ? 'checked' : ''}>`;
+      el.innerHTML = `${drag}${pick}${toggle}${badge}<span class="name">${escapeHtml(s.name || '(unnamed)')}</span>${find}${statusBadge}`;
+
+      el.addEventListener('click', ev => {
+        // Clicks on interactive children handle themselves; only the row
+        // background opens the form.
+        const t = ev.target;
+        if (t.classList && (
+          t.classList.contains('toggle') ||
+          t.classList.contains('pick') ||
+          t.classList.contains('drag') ||
+          (t.classList.contains('badge') && t.classList.contains('unused'))
+        )) return;
+        openScriptForm(s.id);
+      });
+
+      const toggleEl = el.querySelector('.toggle');
+      toggleEl.addEventListener('click', ev => ev.stopPropagation());
+      toggleEl.addEventListener('change', () => toggleScriptEnabled(s.id, toggleEl.checked));
+
+      const pickEl = el.querySelector('.pick');
+      pickEl.addEventListener('click', ev => ev.stopPropagation());
+      pickEl.addEventListener('change', () => {
+        if (pickEl.checked) scriptsState.selected.add(s.id);
+        else scriptsState.selected.delete(s.id);
+        updateBulkBar(visibleScripts);
+      });
+
+      // ?-badge click → switch to Search panel with this script's findText pre-filled.
+      // Closes the loop between "this script looks dead" and "let me confirm by grepping."
+      const unusedBadge = el.querySelector('.badge.unused');
+      if (unusedBadge) {
+        unusedBadge.addEventListener('click', ev => {
+          ev.stopPropagation();
+          const needle = (s.findText || s.selectorText || '').trim();
+          if (!needle) { setStatus('No findText / selectorText to search for.', 'warn'); return; }
+          jumpToSearch(needle);
+        });
+      }
+
+      // Drag-to-reorder. Persists the new order back to <scripts> in index.xml
+      // using the same _raw / offset splice pattern the rest of the file uses.
+      el.addEventListener('dragstart', ev => {
+        scriptsDnd.from = s.id;
+        el.classList.add('dragging');
+        try { ev.dataTransfer.setData('text/plain', s.id); ev.dataTransfer.effectAllowed = 'move'; } catch (_) {}
+      });
+      el.addEventListener('dragend', () => {
+        el.classList.remove('dragging');
+        document.querySelectorAll('.script-item.drop-before, .script-item.drop-after')
+          .forEach(x => x.classList.remove('drop-before', 'drop-after'));
+        scriptsDnd.from = null;
+      });
+      el.addEventListener('dragover', ev => {
+        if (!scriptsDnd.from || scriptsDnd.from === s.id) return;
+        ev.preventDefault();
+        ev.dataTransfer.dropEffect = 'move';
+        const rect = el.getBoundingClientRect();
+        const before = (ev.clientY - rect.top) < (rect.height / 2);
+        el.classList.toggle('drop-before', before);
+        el.classList.toggle('drop-after', !before);
+      });
+      el.addEventListener('dragleave', () => {
+        el.classList.remove('drop-before', 'drop-after');
+      });
+      el.addEventListener('drop', ev => {
+        if (!scriptsDnd.from || scriptsDnd.from === s.id) return;
+        ev.preventDefault();
+        const rect = el.getBoundingClientRect();
+        const before = (ev.clientY - rect.top) < (rect.height / 2);
+        const fromId = scriptsDnd.from;
+        el.classList.remove('drop-before', 'drop-after');
+        moveScript(fromId, s.id, before ? 'before' : 'after');
+      });
+
+      list.appendChild(el);
+    }
+  }
+  if (total === 0 && (filter || kindFilter !== 'ALL')) {
+    const empty = document.createElement('div');
+    empty.className = 'scripts-empty';
+    empty.textContent = 'No scripts match the current filter.';
+    list.appendChild(empty);
+  }
+  updateBulkBar(visibleScripts);
+}
+
+// Track the in-flight drag source id. Reset in dragend.
+const scriptsDnd = { from: null };
+
+// Keep the bulk-action bar's checkbox + button states in sync with the
+// current selection. Only operates on visible (filter-passing) scripts so
+// "select all" doesn't sweep up scripts the user can't see.
+function updateBulkBar(visibleScripts) {
+  const bar = document.getElementById('scripts-bulk-bar');
+  if (!bar) return;
+  const visIds = visibleScripts.map(s => s.id);
+  const sel = scriptsState.selected || new Set();
+  // Drop selections that aren't in the current visible set so the count
+  // and button-enabled state always reflect what the user can see.
+  let visibleSelected = 0;
+  for (const id of visIds) if (sel.has(id)) visibleSelected++;
+  const allCheckbox = document.getElementById('scripts-bulk-all');
+  const countEl = document.getElementById('scripts-bulk-count');
+  if (allCheckbox) {
+    allCheckbox.checked = visIds.length > 0 && visibleSelected === visIds.length;
+    allCheckbox.indeterminate = visibleSelected > 0 && visibleSelected < visIds.length;
+    allCheckbox.disabled = visIds.length === 0;
+  }
+  if (countEl) countEl.textContent = visibleSelected ? `${visibleSelected} selected` : '0 selected';
+  for (const id of ['scripts-bulk-enable','scripts-bulk-disable','scripts-bulk-delete']) {
+    const b = document.getElementById(id);
+    if (b) b.disabled = visibleSelected === 0;
+  }
+}
+
+// Switch the sidebar to the Search panel and pre-fill the input with `needle`.
+// Used by the ?-badge click — clicking the unused badge takes the user
+// straight to a search for the script's findText so they can confirm
+// (or refute) that the script is genuinely dead.
+function jumpToSearch(needle) {
+  setSidebarMode('search');
+  const inp = document.getElementById('search-input');
+  if (!inp) return;
+  inp.value = needle;
+  // Defer focus so the panel-show CSS transition is settled first.
+  setTimeout(() => { inp.focus(); inp.select(); }, 0);
+  // Trigger the existing debounced runner.
+  if (typeof runSearch === 'function') runSearch();
+}
+
+// True if the script binds to a field path that doesn't exist in the datamodel.
+function isScriptFieldInvalid(s) {
+  const fields = scriptsState.datamodelFields;
+  if (!fields || !fields.length) return false;     // No datamodel loaded -> can't validate
+  const path = s.kind === 'TEXT' ? s.fieldPath
+             : s.kind === 'CONDITIONAL' ? s.condField
+             : null;
+  if (!path) return false;                          // Control scripts have no field
+  return !fields.some(f => f.path === path);
+}
+
+// Count how many times a script's findText / selectorText appears across
+// the template's HTML and XML files. Used to flag unused scripts in the list.
+// Result is memoised in scriptsState.usagesCache (shared makeMemoCache) so
+// renderScriptsList stays cheap.
+function countScriptUsages(s) {
+  if (!scriptsState.usagesCache || typeof scriptsState.usagesCache.getOrCompute !== 'function') {
+    scriptsState.usagesCache = makeMemoCache();
+  }
+  return scriptsState.usagesCache.getOrCompute(s.id, () => {
+    const needles = [];
+    const ft = (s.findText || '').trim();
+    const st = (s.selectorText || '').trim();
+    if (ft) needles.push(ft);
+    if (st && st !== ft) needles.push(st);
+    if (!needles.length) return -1; // -1 = "not applicable"
+    let total = 0;
+    for (const [path, f] of Object.entries(state.files)) {
+      if (!f.isText) continue;
+      if (path === scriptsState.hostPath) continue;
+      const ext = extOf(path);
+      if (!['html','htm','xml','xsl','xslt'].includes(ext)) continue;
+      const text = state.monacoModels[path] ? state.monacoModels[path].getValue() : f.content;
+      if (!text) continue;
+      for (const n of needles) {
+        let idx = 0;
+        while ((idx = text.indexOf(n, idx)) !== -1) { total++; idx += n.length; }
+      }
+    }
+    return total;
+  });
+}
+
+// Flip the <enabled> tag on a single script in index.xml without opening the form.
+function toggleScriptEnabled(id, enabled) {
+  const s = scriptsState.list.find(x => x.id === id);
+  if (!s || !scriptsState.hostPath) return;
+  const f = state.files[scriptsState.hostPath];
+  if (!f) return;
+  const model = state.monacoModels[scriptsState.hostPath];
+  const currentText = model ? model.getValue() : f.content;
+  const idx = currentText.indexOf(s._raw);
+  if (idx === -1) {
+    setStatus('Could not locate script — please re-open the template.', 'err');
+    return;
+  }
+  // Replace the *first* <enabled>...</enabled> inside this script's raw chunk
+  const newRaw = s._raw.replace(
+    /(<enabled>)[\s\S]*?(<\/enabled>)/,
+    (_m, a, c) => `${a}${enabled ? 'true' : 'false'}${c}`
+  );
+  const updated = currentText.slice(0, idx) + newRaw + currentText.slice(idx + s._raw.length);
+  if (model) {
+    const range = model.getFullModelRange();
+    model.pushEditOperations([], [{ range, text: updated }], () => null);
+  }
+  f.content = updated;
+  f.dirty = true;
+  refreshTreeDirtyMarkers();
+  refreshScriptsList();
+  setStatus(`Script "${s.name}" ${enabled ? 'enabled' : 'disabled'}. Click Review & Save to apply.`, 'ok');
+}
+
+// Duplicate an existing script — copies the entire <script>…<\/script> block
+// next to the original, suffixes its name and findText with "_copy".
+function cloneScript(id) {
+  const s = scriptsState.list.find(x => x.id === id);
+  if (!s || !scriptsState.hostPath) return;
+  const f = state.files[scriptsState.hostPath];
+  if (!f) return;
+  const model = state.monacoModels[scriptsState.hostPath];
+  const currentText = model ? model.getValue() : f.content;
+  const idx = currentText.indexOf(s._raw);
+  if (idx === -1) {
+    setStatus('Could not locate script to clone.', 'err');
+    return;
+  }
+
+  // Pick a unique name and findText
+  let nName = (s.name || 'Script') + '_copy';
+  while (scriptsState.list.some(x => x.name === nName)) nName += '_copy';
+  let nFind = s.findText;
+  if (s.findText && /^@.+@$/.test(s.findText)) {
+    nFind = '@' + nName + '@';
+  }
+
+  // Patch name + findText into the copy
+  let copy = s._raw
+    .replace(/(<name>)[\s\S]*?(<\/name>)/, (_m, a, c) => `${a}${encodeXmlText(nName)}${c}`)
+    .replace(/(<findText>)[\s\S]*?(<\/findText>)/, (_m, a, c) => `${a}${encodeXmlText(nFind)}${c}`);
+  // Empty findText is sometimes <findText/>
+  if (!/(<findText>)/.test(copy)) {
+    copy = copy.replace(/<findText\s*\/>/, `<findText>${encodeXmlText(nFind)}</findText>`);
+  }
+
+  // Insert right after the original, on its own line
+  const indent = indentAt(currentText, idx);
+  const insertOffset = idx + s._raw.length;
+  const updated = currentText.slice(0, insertOffset) + '\n' + indent + copy + currentText.slice(insertOffset);
+
+  if (model) {
+    const range = model.getFullModelRange();
+    model.pushEditOperations([], [{ range, text: updated }], () => null);
+  }
+  f.content = updated;
+  f.dirty = true;
+  refreshTreeDirtyMarkers();
+  refreshScriptsList();
+
+  // Open the duplicate in the form. Locate it by its known _start offset
+  // rather than by name — name-based lookup picked the original entry if
+  // an existing script anywhere in the file already happened to share the
+  // _copy name (e.g. from a stale external edit), and find() returns the
+  // first such entry. The new clone's <script starts exactly one newline
+  // plus the indent past insertOffset.
+  const newStart = insertOffset + 1 /* the \n */ + indent.length;
+  const created = scriptsState.list.find(x => x._start === newStart)
+              // Defensive fallback: if the parser shifted offsets for any
+              // reason, fall back to the last-occurring entry with the new
+              // name (the clone is appended after the original in source order).
+              || [...scriptsState.list].reverse().find(x => x.name === nName);
+  if (created) openScriptForm(created.id);
+  setStatus(`Cloned script as "${nName}". Click Review & Save to apply.`, 'ok');
+}
+
+document.getElementById('scripts-search').addEventListener('input', e => {
+  scriptsState.filter = e.target.value;
+  renderScriptsList();
+});
+
+// Kind-filter chips (All / FLD / IF / JS) — sit above the search box and
+// scope the visible list to one kind at a time. Uses scriptsState.kindFilter
+// so the choice survives a re-render.
+document.getElementById('scripts-kind-chips').addEventListener('click', e => {
+  const chip = e.target.closest && e.target.closest('.chip');
+  if (!chip) return;
+  const kind = chip.dataset.kind || 'ALL';
+  scriptsState.kindFilter = kind;
+  document.querySelectorAll('#scripts-kind-chips .chip').forEach(c => {
+    c.classList.toggle('active', c.dataset.kind === kind);
+  });
+  renderScriptsList();
+});
+
+// Bulk action bar — Select all visible / Enable / Disable / Delete.
+document.getElementById('scripts-bulk-all').addEventListener('change', e => {
+  // Toggle every visible (filter-passing) script. We re-derive the visible
+  // set from the renderer's logic so chip + search filters are honoured.
+  const visible = computeVisibleScripts();
+  if (e.target.checked) {
+    for (const s of visible) scriptsState.selected.add(s.id);
+  } else {
+    for (const s of visible) scriptsState.selected.delete(s.id);
+  }
+  renderScriptsList();
+});
+document.getElementById('scripts-bulk-enable').addEventListener('click', () => bulkSetEnabled(true));
+document.getElementById('scripts-bulk-disable').addEventListener('click', () => bulkSetEnabled(false));
+document.getElementById('scripts-bulk-delete').addEventListener('click', () => bulkDelete());
+
+// Mirror of the renderer's filter logic so bulk-all only acts on what's visible.
+function computeVisibleScripts() {
+  const filter = (scriptsState.filter || '').toLowerCase();
+  const kindFilter = scriptsState.kindFilter || 'ALL';
+  return scriptsState.list.filter(s => {
+    if (filter && !(s.name.toLowerCase().includes(filter) || (s.findText || '').toLowerCase().includes(filter))) return false;
+    if (kindFilter !== 'ALL' && s.kind !== kindFilter) return false;
+    return true;
+  });
+}
+
+// Apply enable/disable to every selected (and still visible) script in one
+// pass, then re-render once at the end. Each script mutation reuses the
+// same _raw + indexOf splice that toggleScriptEnabled does, but we operate
+// on a single working text and write it back at the end.
+function bulkSetEnabled(enabled) {
+  const visible = new Set(computeVisibleScripts().map(s => s.id));
+  const ids = [...scriptsState.selected].filter(id => visible.has(id));
+  if (!ids.length) return;
+  if (!scriptsState.hostPath) return;
+  const f = state.files[scriptsState.hostPath];
+  if (!f) return;
+  const model = state.monacoModels[scriptsState.hostPath];
+  let text = model ? model.getValue() : f.content;
+  let touched = 0;
+  for (const id of ids) {
+    const s = scriptsState.list.find(x => x.id === id);
+    if (!s) continue;
+    const idx = text.indexOf(s._raw);
+    if (idx === -1) continue; // stale offset; skip rather than abort
+    const newRaw = s._raw.replace(
+      /(<enabled>)[\s\S]*?(<\/enabled>)/,
+      (_m, a, c) => `${a}${enabled ? 'true' : 'false'}${c}`
+    );
+    text = text.slice(0, idx) + newRaw + text.slice(idx + s._raw.length);
+    touched++;
+  }
+  if (!touched) { setStatus('Could not locate any selected scripts in index.xml.', 'err'); return; }
+  if (model) {
+    const range = model.getFullModelRange();
+    model.pushEditOperations([], [{ range, text }], () => null);
+  }
+  f.content = text;
+  f.dirty = true;
+  refreshTreeDirtyMarkers();
+  refreshScriptsList();
+  setStatus(`${enabled ? 'Enabled' : 'Disabled'} ${touched} script${touched === 1 ? '' : 's'}. Click Review & Save to apply.`, 'ok');
+}
+
+function bulkDelete() {
+  const visible = new Set(computeVisibleScripts().map(s => s.id));
+  const ids = [...scriptsState.selected].filter(id => visible.has(id));
+  if (!ids.length) return;
+  if (!confirm(`Delete ${ids.length} script${ids.length === 1 ? '' : 's'} from index.xml?\n\nThis removes the entire <script> blocks. Click Review & Save afterwards to write to disk.`)) return;
+  if (!scriptsState.hostPath) return;
+  const f = state.files[scriptsState.hostPath];
+  if (!f) return;
+  const model = state.monacoModels[scriptsState.hostPath];
+  let text = model ? model.getValue() : f.content;
+  // Snapshot the _raw chunks before we start mutating — once we splice,
+  // subsequent ids on the same script object still hold the old _raw, but
+  // an indexOf against the working text will fail to find them, which is
+  // the desired bail-out.
+  const targets = ids.map(id => scriptsState.list.find(x => x.id === id)).filter(Boolean);
+  let touched = 0;
+  for (const s of targets) {
+    const idx = text.indexOf(s._raw);
+    if (idx === -1) continue;
+    let start = idx;
+    while (start > 0 && (text[start - 1] === ' ' || text[start - 1] === '\t')) start--;
+    if (start > 0 && text[start - 1] === '\n') start--;
+    const end = idx + s._raw.length;
+    text = text.slice(0, start) + text.slice(end);
+    touched++;
+  }
+  if (!touched) { setStatus('Could not locate any selected scripts in index.xml.', 'err'); return; }
+  if (model) {
+    const range = model.getFullModelRange();
+    model.pushEditOperations([], [{ range, text }], () => null);
+  }
+  f.content = text;
+  f.dirty = true;
+  refreshTreeDirtyMarkers();
+  // If the active script was in the bulk-deleted set, close the form.
+  if (scriptsState.active && ids.includes(scriptsState.active)) {
+    scriptsState.active = null;
+    document.getElementById('script-form-view').classList.remove('show');
+    if (state.currentPath) openFile(state.currentPath);
+  }
+  refreshScriptsList();
+  setStatus(`Deleted ${touched} script${touched === 1 ? '' : 's'}. Click Review & Save to apply.`, 'ok');
+}
+
+// Drag-to-reorder: move the script identified by `fromId` to `position`
+// ('before' | 'after') the script identified by `toId`. Persists by lifting
+// the source script's _raw chunk and re-inserting it next to the target,
+// honouring the surrounding indentation. Same drift-tolerant indexOf
+// pattern as the rest of the file.
+function moveScript(fromId, toId, position) {
+  if (!scriptsState.hostPath || fromId === toId) return;
+  const src = scriptsState.list.find(x => x.id === fromId);
+  const dst = scriptsState.list.find(x => x.id === toId);
+  if (!src || !dst) return;
+  const f = state.files[scriptsState.hostPath];
+  if (!f) return;
+  const model = state.monacoModels[scriptsState.hostPath];
+  let text = model ? model.getValue() : f.content;
+
+  const srcIdx = text.indexOf(src._raw);
+  if (srcIdx === -1) { setStatus('Could not locate the dragged script — please re-open the template.', 'err'); return; }
+
+  // Lift src out together with its leading newline + indent so the gap it
+  // leaves behind doesn't pile up blank lines.
+  let liftStart = srcIdx;
+  while (liftStart > 0 && (text[liftStart - 1] === ' ' || text[liftStart - 1] === '\t')) liftStart--;
+  if (liftStart > 0 && text[liftStart - 1] === '\n') liftStart--;
+  const liftEnd = srcIdx + src._raw.length;
+  const liftedChunk = text.slice(liftStart, liftEnd); // includes leading \n + indent
+  text = text.slice(0, liftStart) + text.slice(liftEnd);
+
+  // Re-locate the destination after the splice (its offset shifts if src
+  // sat earlier in the file).
+  const dstIdx = text.indexOf(dst._raw);
+  if (dstIdx === -1) {
+    // Drop the lift — restore original text.
+    text = text.slice(0, liftStart) + liftedChunk + text.slice(liftStart);
+    setStatus('Lost track of the drop target — reorder cancelled.', 'err');
+    return;
+  }
+  let insertAt;
+  if (position === 'before') {
+    // Insert just before dst, on its own line. Walk back to the start of
+    // dst's line so the lifted chunk's leading "\n + indent" lands cleanly.
+    insertAt = dstIdx;
+    while (insertAt > 0 && (text[insertAt - 1] === ' ' || text[insertAt - 1] === '\t')) insertAt--;
+    if (insertAt > 0 && text[insertAt - 1] === '\n') insertAt--;
+  } else {
+    insertAt = dstIdx + dst._raw.length;
+  }
+
+  // Ensure the inserted chunk's indentation matches the destination's.
+  const indent = indentAt(text, dstIdx >= 0 ? dstIdx : insertAt);
+  // liftedChunk is "\n + originalIndent + <script…<\/script>". Re-indent to dst.
+  const stripped = liftedChunk.replace(/^\n[ \t]*/, '');
+  const reindented = '\n' + indent + stripped;
+  text = text.slice(0, insertAt) + reindented + text.slice(insertAt);
+
+  if (model) {
+    const range = model.getFullModelRange();
+    model.pushEditOperations([], [{ range, text }], () => null);
+  }
+  f.content = text;
+  f.dirty = true;
+  refreshTreeDirtyMarkers();
+  refreshScriptsList();
+  setStatus(`Moved "${src.name || '(unnamed)'}" ${position} "${dst.name || '(unnamed)'}". Click Review & Save to apply.`, 'ok');
+}
+
+function openScriptForm(id) {
+  const s = scriptsState.list.find(x => x.id === id);
+  if (!s) return;
+  scriptsState.active = id;
+
+  // Hide editor & binary, show form
+  document.getElementById('editor').style.display = 'none';
+  document.getElementById('binary-view').classList.remove('show');
+  document.getElementById('script-form-view').classList.add('show');
+  // Hide preview pane — irrelevant for script form
+  document.getElementById('editor-tab').style.display = 'none';
+
+  // Highlight the row
+  document.querySelectorAll('.script-item').forEach(el => el.classList.remove('active'));
+  // (re-render to reapply active state)
+  renderScriptsList();
+
+  // Populate form
+  document.getElementById('sf-title').textContent = s.name || '(unnamed script)';
+  document.getElementById('sf-sub').textContent = `${s.type || 'SCRIPT'} — in ${scriptsState.hostPath}`;
+  document.getElementById('sf-name').value = s.name;
+  // sf-type is set once below from kindLabel — no need for a temporary value here.
+  document.getElementById('sf-find').value = s.findText;
+  document.getElementById('sf-enabled').checked = !!s.enabled;
+  document.getElementById('sf-scope').value = s.scope || 'NONE';
+  document.getElementById('sf-selector-type').value = s.selectorType || 'TEXT';
+  document.getElementById('sf-selector-text').value = s.selectorText;
+
+  const stdSection = document.getElementById('sf-standard-section');
+  const condSection = document.getElementById('sf-conditional-section');
+  if (s.kind === 'TEXT') {
+    stdSection.style.display = '';
+    condSection.style.display = 'none';
+    document.getElementById('sf-field-path').value = s.fieldPath;
+    setSelectValue('sf-field-type', s.fieldType || 'STRING');
+    setSelectValue('sf-format-type', s.formatType || 'NONE');
+    setSelectValue('sf-insert-method', s.insertMethod || 'HTML');
+    document.getElementById('sf-prefix').value = s.prefix;
+    document.getElementById('sf-suffix').value = s.suffix;
+  } else if (s.kind === 'CONDITIONAL') {
+    stdSection.style.display = 'none';
+    condSection.style.display = '';
+    document.getElementById('sf-cond-field').value = s.condField || '';
+    setSelectValue('sf-cond-field-type', s.condFieldType || 'STRING');
+    setSelectValue('sf-condition', s.condition || 'EQUAL_TO');
+    document.getElementById('sf-cond-value').value = s.condValue || '';
+    setSelectValue('sf-cond-action', s.condAction || 'SHOW');
+    document.getElementById('sf-cond-case').checked = !!s.condCaseInsensitive;
+    document.getElementById('sf-cond-toggle').checked = !!s.condToggleVisibility;
+  } else {
+    stdSection.style.display = 'none';
+    condSection.style.display = 'none';
+  }
+  // Update the type display to be more descriptive
+  const kindLabel = s.kind === 'CONDITIONAL' ? 'STANDARD (conditional)' : (s.kind === 'TEXT' ? 'STANDARD (field text)' : (s.type || ''));
+  document.getElementById('sf-type').value = kindLabel;
+
+  // Source editor (monaco) — replace the model wholesale on each open so
+  // undo history is per-script. setValue alone preserves the underlying
+  // model's undo stack, which lets a Ctrl+Z on Script B accidentally apply
+  // edits that were made while Script A was open. Disposing the old model
+  // frees the memory the previous script's history was holding.
+  ensureScriptSourceEditor();
+  if (scriptsState.sourceEditor) {
+    const oldModel = scriptsState.sourceEditor.getModel();
+    const fresh = monaco.editor.createModel(s.source || '', 'javascript');
+    scriptsState.sourceEditor.setModel(fresh);
+    if (oldModel && oldModel !== fresh) {
+      try { oldModel.dispose(); } catch (_) { /* model may have been re-used elsewhere */ }
+    }
+  }
+
+  // Populate field metadata (sample value + validation)
+  updateFieldMeta('sf-field-meta', s.fieldPath, s.kind === 'TEXT');
+  updateFieldMeta('sf-cond-field-meta', s.condField, s.kind === 'CONDITIONAL');
+
+  // Populate usages panel — search for both findText and selectorText
+  updateUsagesPanel(s.findText, s.selectorText);
+
+  // Hide save button (form has its own Apply)
+  document.getElementById('btn-save').disabled = true;
+}
+
+// Show "type · sample value" or "no such field in datamodel" beneath a field-path input.
+function updateFieldMeta(elId, fieldPath, isVisible) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  if (!isVisible || !fieldPath) {
+    el.innerHTML = '';
+    return;
+  }
+  const fields = scriptsState.datamodelFields || [];
+  const match = fields.find(f => f.path === fieldPath);
+  if (match) {
+    const sample = match.lastValue == null || match.lastValue === ''
+      ? '<span class="sample" style="font-style:italic;">(empty)</span>'
+      : `<span class="sample">${escapeHtml(String(match.lastValue))}</span>`;
+    el.innerHTML = `<span class="ok">✓ ${escapeHtml(match.type)}</span>${sample}`;
+  } else if (fields.length) {
+    el.innerHTML = `<span class="err">✗ Not found in datamodel</span>`;
+  } else {
+    el.innerHTML = `<span style="color:var(--muted);">(no datamodel loaded — can't validate)</span>`;
+  }
+}
+
+// Re-populate the field meta as the user types in the path input
+function bindFieldMetaLiveUpdate() {
+  const cfg = [
+    ['sf-field-path', 'sf-field-meta', () => {
+      const a = scriptsState.list.find(x => x.id === scriptsState.active);
+      return a && a.kind === 'TEXT';
+    }],
+    ['sf-cond-field', 'sf-cond-field-meta', () => {
+      const a = scriptsState.list.find(x => x.id === scriptsState.active);
+      return a && a.kind === 'CONDITIONAL';
+    }],
+  ];
+  for (const [pid, mid, isVis] of cfg) {
+    const inp = document.getElementById(pid);
+    if (!inp) continue;
+    const handler = () => updateFieldMeta(mid, inp.value, isVis());
+    inp.addEventListener('input', handler);
+    inp.addEventListener('change', handler);
+  }
+}
+bindFieldMetaLiveUpdate();
+
+// Find every text file in the template that contains the given findText
+// and render counts + clickable rows in the usages panel.
+function updateUsagesPanel(findText, selectorText) {
+  const el = document.getElementById('sf-usages');
+  if (!el) return;
+  // Build the list of needles to search (de-duped, non-empty).
+  const needles = [];
+  const ft = (findText || '').trim();
+  const st = (selectorText || '').trim();
+  if (ft) needles.push({ label: 'findText', text: ft });
+  if (st && st !== ft) needles.push({ label: 'selectorText', text: st });
+  if (!needles.length) {
+    el.innerHTML = '<div class="none">No findText or selectorText set on this script.</div>';
+    return;
+  }
+
+  // path -> { hitsByNeedle: { needleText: count }, total: number }
+  const byPath = new Map();
+  for (const [path, f] of Object.entries(state.files)) {
+    if (!f.isText) continue;
+    if (path === scriptsState.hostPath) continue; // skip index.xml itself
+    const ext = extOf(path);
+    if (!['html','htm','xml','xsl','xslt'].includes(ext)) continue;
+    const text = state.monacoModels[path] ? state.monacoModels[path].getValue() : f.content;
+    if (!text) continue;
+    for (const n of needles) {
+      let count = 0, idx = 0;
+      while ((idx = text.indexOf(n.text, idx)) !== -1) { count++; idx += n.text.length; }
+      if (count) {
+        if (!byPath.has(path)) byPath.set(path, { byNeedle: {}, total: 0 });
+        const e = byPath.get(path);
+        e.byNeedle[n.text] = (e.byNeedle[n.text] || 0) + count;
+        e.total += count;
+      }
+    }
+  }
+
+  if (!byPath.size) {
+    const labels = needles.map(n => `<code>${escapeHtml(n.text)}</code>`).join(' or ');
+    el.innerHTML = `<div class="none">No HTML/XML files reference ${labels}.</div>`;
+    return;
+  }
+
+  const hits = [...byPath.entries()].map(([path, e]) => ({ path, ...e }));
+  hits.sort((a, b) => b.total - a.total || a.path.localeCompare(b.path));
+
+  const totalAll = hits.reduce((n, h) => n + h.total, 0);
+  const filesAll = hits.length;
+  const head = `<div class="head">${totalAll} occurrence${totalAll === 1 ? '' : 's'} across ${filesAll} file${filesAll === 1 ? '' : 's'} — searching: ${needles.map(n => `<code>${escapeHtml(n.text)}</code>`).join(' + ')}</div>`;
+
+  el.innerHTML = head + hits.map(h => {
+    // Show per-needle breakdown if both findText and selectorText hit
+    const breakdown = needles.length > 1
+      ? Object.entries(h.byNeedle).map(([t, c]) => `${escapeHtml(t)}×${c}`).join(', ')
+      : `×${h.total}`;
+    return `<div class="row" data-path="${escapeHtml(h.path)}">${escapeHtml(h.path)}<span class="count">${breakdown}</span></div>`;
+  }).join('');
+
+  el.querySelectorAll('.row').forEach(row => {
+    row.addEventListener('click', () => {
+      const p = row.dataset.path;
+      closeScriptForm();
+      openFile(p);
+      // Jump to the first occurrence of any needle
+      setTimeout(() => {
+        if (state.editor && state.monacoModels[p]) {
+          const text = state.monacoModels[p].getValue();
+          let firstIdx = -1;
+          for (const n of needles) {
+            const i = text.indexOf(n.text);
+            if (i >= 0 && (firstIdx === -1 || i < firstIdx)) firstIdx = i;
+          }
+          if (firstIdx >= 0) {
+            const before = text.slice(0, firstIdx);
+            const line = before.split('\n').length;
+            state.editor.revealLineInCenter(line);
+            state.editor.setPosition({ lineNumber: line, column: 1 });
+            state.editor.focus();
+          }
+        }
+      }, 50);
+    });
+  });
+}
+
+function setSelectValue(id, value) {
+  const sel = document.getElementById(id);
+  if (!sel) return;
+  // Add the option if missing
+  if (!Array.from(sel.options).some(o => o.value === value)) {
+    const o = document.createElement('option');
+    o.value = value; o.textContent = value;
+    sel.appendChild(o);
+  }
+  sel.value = value;
+}
+
+function ensureScriptSourceEditor() {
+  if (scriptsState.sourceEditor || !state.monacoReady) return;
+  const host = document.getElementById('script-source-host');
+  scriptsState.sourceEditor = monaco.editor.create(host, {
+    value: '',
+    language: 'javascript',
+    theme: 'vs-dark',
+    automaticLayout: true,
+    minimap: { enabled: false },
+    wordWrap: 'on',
+    fontSize: 13,
+    scrollBeyondLastLine: false,
+  });
+  // Ctrl/Cmd+S inside the source editor → Apply (same behaviour as the
+  // surrounding form's keydown listener). Monaco swallows keystrokes when
+  // it has focus, so we need to register the binding on the editor itself
+  // — bubbling keydown won't reach the form-level handler.
+  scriptsState.sourceEditor.addCommand(
+    monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS,
+    () => { if (scriptsState.active) applyScriptForm(); }
+  );
+}
+
+document.getElementById('sf-apply').addEventListener('click', applyScriptForm);
+
+// Ctrl/Cmd+S inside the script form should behave like clicking "Apply to XML"
+// instead of triggering the browser's "Save Page As…" dialog or the global
+// commitCurrentEdit (which only flushes the hidden index.xml monaco model,
+// never the form values themselves).
+document.getElementById('script-form-view').addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 's' || e.key === 'S')) {
+    // Only intercept when the form is actually showing — defensive in case
+    // the listener fires after .show was removed but before the node is
+    // replaced.
+    const formVisible = document.getElementById('script-form-view').classList.contains('show');
+    if (!formVisible) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (scriptsState.active) applyScriptForm();
+  }
+});
+document.getElementById('sf-revert').addEventListener('click', () => {
+  if (scriptsState.active) openScriptForm(scriptsState.active);
+});
+document.getElementById('sf-close').addEventListener('click', closeScriptForm);
+document.getElementById('sf-open-raw').addEventListener('click', () => {
+  if (!scriptsState.hostPath) return;
+  closeScriptForm();
+  openFile(scriptsState.hostPath);
+  // Try to jump to the script's text in the XML
+  const s = scriptsState.list.find(x => x.id === scriptsState.active);
+  if (s && state.monacoModels[scriptsState.hostPath]) {
+    const text = state.monacoModels[scriptsState.hostPath].getValue();
+    const idx = text.indexOf(s._raw.slice(0, 60));
+    if (idx >= 0) {
+      const before = text.slice(0, idx);
+      const line = before.split('\n').length;
+      state.editor.revealLineInCenter(line);
+      state.editor.setPosition({ lineNumber: line, column: 1 });
+      state.editor.focus();
+    }
+  }
+});
+
+function closeScriptForm() {
+  document.getElementById('script-form-view').classList.remove('show');
+  scriptsState.active = null;
+  // restore editor visibility for whatever currentPath is set to
+  if (state.currentPath) {
+    openFile(state.currentPath);
+  } else {
+    document.getElementById('editor-tab').style.display = 'none';
+    document.getElementById('editor').style.display = 'none';
+    document.getElementById('binary-view').classList.remove('show');
+    document.getElementById('empty').classList.remove('hidden');
+  }
+}
+
+function applyScriptForm() {
+  const id = scriptsState.active;
+  if (!id || !scriptsState.hostPath) return;
+  const s = scriptsState.list.find(x => x.id === id);
+  if (!s) return;
+
+  // Only read inputs that are visible for this script's kind. The std-section
+  // and cond-section inputs retain values from whichever script was opened
+  // before, so reading them unconditionally lets a CONTROL script (for
+  // example) silently inherit the previous TEXT script's scope/prefix/etc.
+  // serializeScriptBack guards each block, but defending here keeps the
+  // captured form value honest in case the serializer changes later.
+  const isText = s.kind === 'TEXT';
+  const isCond = s.kind === 'CONDITIONAL';
+  const $val = id => document.getElementById(id).value;
+  const $chk = id => document.getElementById(id).checked;
+  const form = {
+    name: $val('sf-name'),
+    findText: $val('sf-find'),
+    enabled: $chk('sf-enabled'),
+    scope: $val('sf-scope'),
+    selectorType: $val('sf-selector-type'),
+    selectorText: $val('sf-selector-text'),
+    source: scriptsState.sourceEditor ? scriptsState.sourceEditor.getValue() : (s.source || ''),
+    // Std (TEXT) fields — read from the form only when that section is in use,
+    // otherwise carry the script's existing values forward unchanged.
+    fieldPath: isText ? $val('sf-field-path') : s.fieldPath,
+    fieldType: isText ? $val('sf-field-type') : s.fieldType,
+    prefix: isText ? $val('sf-prefix') : s.prefix,
+    suffix: isText ? $val('sf-suffix') : s.suffix,
+    formatType: isText ? $val('sf-format-type') : s.formatType,
+    insertMethod: isText ? $val('sf-insert-method') : s.insertMethod,
+    // Conditional fields — same rule.
+    isConditional: !!s.isConditional,
+    condField: isCond ? $val('sf-cond-field') : s.condField,
+    condFieldType: isCond ? $val('sf-cond-field-type') : s.condFieldType,
+    condValue: isCond ? $val('sf-cond-value') : s.condValue,
+    condition: isCond ? $val('sf-condition') : s.condition,
+    condAction: isCond ? $val('sf-cond-action') : s.condAction,
+    condCaseInsensitive: isCond ? $chk('sf-cond-case') : s.condCaseInsensitive,
+    condToggleVisibility: isCond ? $chk('sf-cond-toggle') : s.condToggleVisibility,
+  };
+
+  const newRaw = serializeScriptBack(s, form);
+
+  // Splice into the host file's content (in-memory; uses the live monaco model so undo works there)
+  const hostPath = scriptsState.hostPath;
+  const f = state.files[hostPath];
+  if (!f) return;
+  const model = state.monacoModels[hostPath];
+  const currentText = model ? model.getValue() : f.content;
+
+  // Find the script's existing raw text in the current text. If the offsets
+  // captured at parse time still match, use them; otherwise fall back to a
+  // direct indexOf on the captured raw chunk.
+  let start = -1, end = -1;
+  if (s._start >= 0 && currentText.slice(s._start, s._end) === s._raw) {
+    start = s._start; end = s._end;
+  } else {
+    const idx = currentText.indexOf(s._raw);
+    if (idx >= 0) { start = idx; end = idx + s._raw.length; }
+  }
+  if (start === -1) {
+    setStatus('Could not locate the script in index.xml — file may have been edited externally.', 'err');
+    return;
+  }
+  const updated = currentText.slice(0, start) + newRaw + currentText.slice(end);
+
+  if (model) {
+    // Replace via the Monaco model so undo history is preserved
+    const range = model.getFullModelRange();
+    model.pushEditOperations([], [{ range, text: updated }], () => null);
+  }
+  f.content = updated;
+  f.dirty = true;
+  refreshTreeDirtyMarkers();
+
+  setStatus(`Applied changes to "${form.name || 'script'}". Click Review & Save to write to disk.`, 'ok');
+
+  // If findText was changed and the old token has live references in the
+  // rest of the template, offer to rename every occurrence in HTML/XML
+  // files. The "rename script + don't touch HTML" path leaves the script
+  // dead, so prompting here closes the gap. The check is only useful when
+  // the old findText was a stable token (non-empty + ideally bracketed).
+  const oldFind = (s.findText || '').trim();
+  const newFind = (form.findText || '').trim();
+  if (oldFind && newFind && oldFind !== newFind) {
+    // Defer the modal so the form-state status message above is visible
+    // for a moment first.
+    setTimeout(() => offerRenameTokenAcrossFiles(oldFind, newFind), 0);
+  }
+
+  // Re-parse so future edits start from the new text
+  refreshScriptsList();
+  // The script's id may shift if order changed — try to rematch by name+findText
+  const reopen = scriptsState.list.find(x => x.name === form.name && x.findText === form.findText)
+              || scriptsState.list.find(x => x.name === form.name);
+  if (reopen) { scriptsState.active = reopen.id; openScriptForm(reopen.id); }
+}
+
+// Scan HTML/XML files for `oldToken` and (with confirmation) replace every
+// occurrence with `newToken`. Mirrors countScriptUsages's needle-search
+// shape so we get consistent semantics. Confirmation pre-tells the user
+// which files will be touched and how many hits each contains.
+function offerRenameTokenAcrossFiles(oldToken, newToken) {
+  if (!oldToken || !newToken || oldToken === newToken) return;
+  const hits = []; // [{ path, count }]
+  let total = 0;
+  for (const [path, f] of Object.entries(state.files)) {
+    if (!f.isText) continue;
+    if (path === scriptsState.hostPath) continue;
+    const ext = extOf(path);
+    if (!['html','htm','xml','xsl','xslt'].includes(ext)) continue;
+    const text = state.monacoModels[path] ? state.monacoModels[path].getValue() : f.content;
+    if (!text) continue;
+    let count = 0, idx = 0;
+    while ((idx = text.indexOf(oldToken, idx)) !== -1) { count++; idx += oldToken.length; }
+    if (count) { hits.push({ path, count }); total += count; }
+  }
+  if (!total) return; // nothing to rewrite — silently skip
+  const summary = hits.map(h => `  ${h.path} (${h.count})`).join('\n');
+  const ok = confirm(
+    `findText changed:\n  ${oldToken}  →  ${newToken}\n\n` +
+    `Found ${total} occurrence${total === 1 ? '' : 's'} of "${oldToken}" in ${hits.length} file${hits.length === 1 ? '' : 's'}:\n\n` +
+    summary +
+    `\n\nReplace every occurrence with "${newToken}"? (Click Review & Save afterwards to write to disk.)`
+  );
+  if (!ok) return;
+  let touched = 0, replaced = 0;
+  for (const h of hits) {
+    const f = state.files[h.path];
+    if (!f) continue;
+    const model = state.monacoModels[h.path];
+    const text = model ? model.getValue() : f.content;
+    // Plain split/join — oldToken is a literal string, no regex escaping needed.
+    const updated = text.split(oldToken).join(newToken);
+    if (updated === text) continue;
+    if (model) {
+      const range = model.getFullModelRange();
+      model.pushEditOperations([], [{ range, text: updated }], () => null);
+    }
+    f.content = updated;
+    f.dirty = true;
+    touched++;
+    replaced += h.count;
+  }
+  refreshTreeDirtyMarkers();
+  // The rewrite invalidates the unused-badge counts.
+  if (scriptsState.usagesCache && typeof scriptsState.usagesCache.invalidate === 'function') {
+    scriptsState.usagesCache.invalidate();
+  }
+  refreshScriptsList();
+  setStatus(`Renamed token in ${touched} file${touched === 1 ? '' : 's'} (${replaced} occurrence${replaced === 1 ? '' : 's'}). Click Review & Save to apply.`, 'ok');
+}
+
+// Wire the new "Scripts" mode button (the Files / Search buttons were wired earlier)
+document.getElementById('mode-scripts').addEventListener('click', () => setSidebarMode('scripts'));
+document.getElementById('mode-nav').addEventListener('click', () => setSidebarMode('nav'));
+
+// ============================================================
+// SECTION / MASTER / SNIPPET NAVIGATOR
+// ============================================================
+function parseNavigatorEntries() {
+  // Returns { masters, sections, snippets } each as [{ id, name, location }]
+  const out = { masters: [], sections: [], snippets: [] };
+  if (!scriptsState.hostPath) return out;
+  const text = state.monacoModels[scriptsState.hostPath]
+    ? state.monacoModels[scriptsState.hostPath].getValue()
+    : (state.files[scriptsState.hostPath] && state.files[scriptsState.hostPath].content) || '';
+  if (!text) return out;
+  function pluck(parentTag, childTag, key) {
+    const m = new RegExp(`<${parentTag}>([\\s\\S]*?)<\\/${parentTag}>`).exec(text);
+    if (!m) return;
+    const inner = m[1];
+    const re = new RegExp(`<${childTag}\\s+id="([^"]*)"[^>]*>([\\s\\S]*?)<\\/${childTag}>`, 'g');
+    let cm;
+    while ((cm = re.exec(inner)) !== null) {
+      const body = cm[2];
+      const nameM = /<name>([\s\S]*?)<\/name>/.exec(body);
+      const locM = /<location>([\s\S]*?)<\/location>/.exec(body);
+      out[key].push({
+        id: cm[1],
+        name: nameM ? decodeXmlEntities(nameM[1]) : '(unnamed)',
+        location: locM ? decodeXmlEntities(locM[1]) : '',
+      });
+    }
+  }
+  pluck('masters', 'master', 'masters');
+  pluck('sections', 'section', 'sections');
+  pluck('snippets', 'snippet', 'snippets');
+  return out;
+}
+
+function renderNavigator() {
+  const list = document.getElementById('nav-list');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!scriptsState.hostPath) {
+    list.innerHTML = '<div class="scripts-empty">Open a template (with index.xml) to see its sections.</div>';
+    return;
+  }
+  const groups = parseNavigatorEntries();
+  const total = groups.masters.length + groups.sections.length + groups.snippets.length;
+  if (!total) {
+    list.innerHTML = '<div class="scripts-empty">No sections, masters, or snippets found in index.xml.</div>';
+    return;
+  }
+  const order = [
+    ['sections', 'Sections', '📄'],
+    ['masters', 'Master pages', '📑'],
+    ['snippets', 'Snippets', '🧩'],
+  ];
+  for (const [key, label, ico] of order) {
+    const items = groups[key];
+    if (!items.length) continue;
+    const head = document.createElement('div');
+    head.className = 'nav-group';
+    head.textContent = `${label}  (${items.length})`;
+    list.appendChild(head);
+    // Sort by name
+    items.sort((a, b) => a.name.localeCompare(b.name));
+    for (const it of items) {
+      const el = document.createElement('div');
+      el.className = 'nav-item' + (state.currentPath && state.currentPath === normalizeNavPath(it.location) ? ' active' : '');
+      el.innerHTML = `<span class="ico">${ico}</span><span class="name">${escapeHtml(it.name)}</span>`;
+      el.title = it.location;
+      el.addEventListener('click', () => {
+        const p = normalizeNavPath(it.location);
+        if (state.files[p]) {
+          openFile(p);
+          // Reflect active state
+          renderNavigator();
+        } else {
+          setStatus(`Not found in package: ${p}`, 'warn');
+        }
+      });
+      list.appendChild(el);
+    }
+  }
+}
+
+// PlanetPress paths inside index.xml use forward slashes; the zip may contain
+// the same paths with backslashes. Try both.
+function normalizeNavPath(p) {
+  if (!p) return '';
+  if (state.files[p]) return p;
+  const back = p.replace(/\//g, '\\');
+  if (state.files[back]) return back;
+  const fwd = p.replace(/\\/g, '/');
+  if (state.files[fwd]) return fwd;
+  return p;
+}
+
+// ============================================================
+// RECENT TEMPLATES (IndexedDB-backed)
+// ============================================================
+// Pure persistence + formatting helpers carved out to ./recents.ts.
+// The DOM menu wiring below and openRecentItem() stay here for now;
+// they'll move once fs/tree/editor are extracted (they call into
+// loadFromHandle / scanFolderTemplates / setStatus, all still local).
+
+document.getElementById('btn-recents').addEventListener('click', async e => {
+  e.stopPropagation();
+  const menu = document.getElementById('recents-menu');
+  if (menu.classList.contains('show')) { menu.classList.remove('show'); return; }
+  const items = await recentsList();
+  menu.innerHTML = '';
+  if (!items.length) {
+    menu.innerHTML = '<div class="empty">No recent files yet — open a template and it\'ll show up here.</div>';
+  } else {
+    for (const it of items) {
+      const row = document.createElement('div');
+      row.className = 'item';
+      row.innerHTML = `<span class="name">${it.kind === 'folder' ? '📁 ' : ''}${escapeHtml(it.name)}</span><span class="when">${formatRecentTime(it.openedAt || 0)}</span>`;
+      row.addEventListener('click', async () => {
+        menu.classList.remove('show');
+        await openRecentItem(it);
+      });
+      menu.appendChild(row);
+    }
+    const clear = document.createElement('div');
+    clear.className = 'clear';
+    clear.textContent = 'Clear recent files';
+    clear.addEventListener('click', async () => {
+      menu.classList.remove('show');
+      await recentsClear();
+      setStatus('Recent files cleared.', 'ok');
+    });
+    menu.appendChild(clear);
+  }
+  // Position the menu under the button
+  const rect = e.currentTarget.getBoundingClientRect();
+  menu.style.left = rect.left + 'px';
+  menu.style.top = (rect.bottom + 4) + 'px';
+  menu.classList.add('show');
+});
+// Dismiss on outside click
+document.addEventListener('click', e => {
+  const m = document.getElementById('recents-menu');
+  if (m && m.classList.contains('show') && !m.contains(e.target) && e.target.id !== 'btn-recents') {
+    m.classList.remove('show');
+  }
+});
+
+async function openRecentItem(item) {
+  try {
+    if (item.handle.queryPermission) {
+      let perm = await item.handle.queryPermission({ mode: 'readwrite' });
+      if (perm !== 'granted') {
+        perm = await item.handle.requestPermission({ mode: 'readwrite' });
+        if (perm !== 'granted') {
+          setStatus('Permission denied.', 'err');
+          return;
+        }
+      }
+    }
+    if (item.kind === 'folder') {
+      state.dirHandle = item.handle;
+      state.dirName = item.handle.name;
+      await scanFolderTemplates(item.handle, false);
+      document.getElementById('folder-panel').style.display = '';
+      document.getElementById('tree-panel').style.display = 'none';
+      document.getElementById('folder-name').textContent = item.handle.name;
+      document.getElementById('btn-back').style.display = 'none';
+      document.getElementById('empty').classList.remove('hidden');
+      document.getElementById('editor-tab').style.display = 'none';
+      document.getElementById('editor').style.display = 'none';
+      document.getElementById('binary-view').classList.remove('show');
+      document.getElementById('btn-rezip').disabled = true;
+      document.getElementById('btn-save').disabled = true;
+      document.getElementById('filename').textContent = `Folder: ${item.handle.name}`;
+    } else {
+      state.dirHandle = null; state.folderTemplates = []; state.dirName = null;
+      document.getElementById('btn-back').style.display = 'none';
+      document.getElementById('folder-panel').style.display = 'none';
+      await loadFromHandle(item.handle);
+    }
+    await recentsAdd(item.handle, item.kind);
+  } catch (e) {
+    setStatus('Could not re-open ' + item.name + ': ' + e.message, 'err');
+    // If the file's gone or moved, drop it
+    if (e.name === 'NotFoundError') await recentsRemove(item.name);
+  }
+}
+
+// Hook into the existing open flows so newly-opened items get recorded
+const _origLoadFromHandleForRecents = loadFromHandle;
+loadFromHandle = async function (handle) {
+  await _origLoadFromHandleForRecents(handle);
+  if (handle && !state.dirHandle) recentsAdd(handle, 'file');
+};
+const _origPickAndOpenFolder = pickAndOpenFolder;
+pickAndOpenFolder = async function () {
+  await _origPickAndOpenFolder();
+  if (state.dirHandle) recentsAdd(state.dirHandle, 'folder');
+};
+
+// ============================================================
+// SCRIPT CREATE / DELETE
+// ============================================================
+function buildNewScriptXml(kind, name, indent) {
+  // indent is the leading whitespace of an existing sibling script (so we
+  // match the surrounding indentation rather than guessing).
+  const ind = indent || DEFAULT_SCRIPT_INDENT;
+  const nm = encodeXmlText(name || (kind === 'CONTROL' ? 'New Control' : 'NewField'));
+  if (kind === 'CONTROL') {
+    return [
+      `<script type="CONTROL">`,
+      `${ind}    <enabled>true</enabled>`,
+      `${ind}    <findText></findText>`,
+      `${ind}    <name>${nm}</name>`,
+      `${ind}    <origin/>`,
+      `${ind}    <scope>NONE</scope>`,
+      `${ind}    <selectorText></selectorText>`,
+      `${ind}    <selectorType>QUERY</selectorType>`,
+      `${ind}    <source>// new control script</source>`,
+      `${ind}<\/script>`,
+    ].join('\n');
+  }
+  // STANDARD
+  return [
+    `<script type="STANDARD">`,
+    `${ind}    <com.objectiflune.scripting.text.TextScriptModel schemaVersion="1.0.0.1">`,
+    `${ind}        <entry>`,
+    `${ind}            <field>`,
+    `${ind}                <path>${nm}</path>`,
+    `${ind}                <type>STRING</type>`,
+    `${ind}            </field>`,
+    `${ind}            <fieldFormatString>`,
+    `${ind}                <type>NONE</type>`,
+    `${ind}            </fieldFormatString>`,
+    `${ind}            <format type="NONE"/>`,
+    `${ind}            <prefix></prefix>`,
+    `${ind}            <suffix></suffix>`,
+    `${ind}        </entry>`,
+    `${ind}        <attribute></attribute>`,
+    `${ind}        <convertToJSON>false</convertToJSON>`,
+    `${ind}        <insertMethod>HTML</insertMethod>`,
+    `${ind}    </com.objectiflune.scripting.text.TextScriptModel>`,
+    `${ind}    <enabled>true</enabled>`,
+    `${ind}    <findText>@${nm}@</findText>`,
+    `${ind}    <name>${nm}</name>`,
+    `${ind}    <origin/>`,
+    `${ind}    <scope>RESULT_SET</scope>`,
+    `${ind}    <selectorText></selectorText>`,
+    `${ind}    <selectorType>TEXT</selectorType>`,
+    `${ind}    <source></source>`,
+    `${ind}<\/script>`,
+  ].join('\n');
+}
+
+// indentAt now lives in the shared utilities region near the top of this
+// script (search for "shared XML / text helpers"). Same behaviour, just
+// hoisted so other features (presets editor, +New file dialog, format
+// helpers) can use it without depending on the Scripts feature being loaded.
+
+// Create a new script of the given kind. We anchor the insertion next to
+// an existing sibling script of the same kind, so it lands inside the
+// correct <scripts> container with matching indentation.
+function createScript(kind) {
+  if (!scriptsState.hostPath) {
+    setStatus('Open a template first to create scripts.', 'warn');
+    return;
+  }
+  const name = prompt(
+    kind === 'CONTROL'
+      ? 'Name for the new control script:'
+      : 'Name for the new field script (this is also the @find@ token):',
+    kind === 'CONTROL' ? 'New Control' : 'NewField'
+  );
+  if (name == null) return;
+  const trimmed = name.trim();
+  if (!trimmed) { setStatus('Empty name.', 'warn'); return; }
+
+  const hostPath = scriptsState.hostPath;
+  const f = state.files[hostPath];
+  if (!f) return;
+  const model = state.monacoModels[hostPath];
+  const currentText = model ? model.getValue() : f.content;
+
+  // Find a sibling script of the same kind to use as an anchor
+  let anchor = scriptsState.list.find(s => s.type === kind);
+  if (!anchor && kind === 'STANDARD') anchor = scriptsState.list.find(s => s.type !== 'CONTROL');
+  if (!anchor && kind === 'CONTROL') anchor = scriptsState.list.find(s => s.type === 'CONTROL') || scriptsState.list[0];
+
+  let insertOffset, indent;
+  if (anchor) {
+    // Re-locate the anchor in the current text (it may have shifted after edits)
+    const idx = currentText.indexOf(anchor._raw);
+    if (idx === -1) {
+      setStatus('Couldn\'t locate a sibling script to anchor on. Edit raw index.xml manually.', 'err');
+      return;
+    }
+    insertOffset = idx + anchor._raw.length;
+    indent = indentAt(currentText, idx);
+  } else {
+    // No existing scripts: append before the first </scripts>
+    const close = currentText.indexOf('</scripts>');
+    if (close === -1) {
+      setStatus('No <scripts> container found in index.xml.', 'err');
+      return;
+    }
+    insertOffset = close;
+    indent = indentAt(currentText, close);
+  }
+
+  const newScript = buildNewScriptXml(kind, trimmed, indent);
+  const updated = currentText.slice(0, insertOffset) + '\n' + indent + newScript + currentText.slice(insertOffset);
+
+  if (model) {
+    const range = model.getFullModelRange();
+    model.pushEditOperations([], [{ range, text: updated }], () => null);
+  }
+  f.content = updated;
+  f.dirty = true;
+  refreshTreeDirtyMarkers();
+  refreshScriptsList();
+
+  // Open the newly-created script in the form
+  const created = scriptsState.list.find(s => s.name === trimmed && s.type === kind);
+  if (created) {
+    scriptsState.active = created.id;
+    openScriptForm(created.id);
+  }
+  setStatus(`Added ${kind === 'CONTROL' ? 'control' : 'field'} script "${trimmed}". Click Review & Save to write to disk.`, 'ok');
+}
+
+function deleteScript(id) {
+  const s = scriptsState.list.find(x => x.id === id);
+  if (!s) return;
+  if (!confirm(`Delete script "${s.name || '(unnamed)'}" from index.xml?\n\nThis removes the entire <script> block.`)) return;
+
+  const hostPath = scriptsState.hostPath;
+  const f = state.files[hostPath];
+  if (!f) return;
+  const model = state.monacoModels[hostPath];
+  const currentText = model ? model.getValue() : f.content;
+
+  const idx = currentText.indexOf(s._raw);
+  if (idx === -1) {
+    setStatus('Could not locate the script in index.xml — file may have changed.', 'err');
+    return;
+  }
+  // Also gobble preceding whitespace on the same line so we don't leave a blank gap
+  let start = idx;
+  while (start > 0 && (currentText[start - 1] === ' ' || currentText[start - 1] === '\t')) start--;
+  if (start > 0 && currentText[start - 1] === '\n') start--;
+  const end = idx + s._raw.length;
+
+  const updated = currentText.slice(0, start) + currentText.slice(end);
+
+  if (model) {
+    const range = model.getFullModelRange();
+    model.pushEditOperations([], [{ range, text: updated }], () => null);
+  }
+  f.content = updated;
+  f.dirty = true;
+  refreshTreeDirtyMarkers();
+  refreshScriptsList();
+
+  // Close the form if it was open on this script
+  if (scriptsState.active === id) {
+    scriptsState.active = null;
+    document.getElementById('script-form-view').classList.remove('show');
+    if (state.currentPath) openFile(state.currentPath);
+  }
+  setStatus(`Deleted script "${s.name || '(unnamed)'}". Click Review & Save to apply.`, 'ok');
+}
+
+// "+ New" button — show a small picker menu so the user explicitly chooses
+// what kind of script to create (or clicks elsewhere to dismiss).
+document.getElementById('btn-script-new').addEventListener('click', e => {
+  if (!scriptsState.hostPath) { setStatus('Open a template first.', 'warn'); return; }
+  e.stopPropagation();
+  closeCtxMenu();
+  const rect = e.currentTarget.getBoundingClientRect();
+  const menu = document.createElement('div');
+  menu.className = 'ctxmenu';
+  menu.style.left = rect.left + 'px';
+  menu.style.top = (rect.bottom + 4) + 'px';
+  menu.innerHTML = `
+    <div class="item" data-kind="STANDARD">Field text script (FLD)</div>
+    <div class="item" data-kind="CONTROL">Control / JS script (JS)</div>
+  `;
+  menu.addEventListener('click', ev => {
+    const kind = ev.target.dataset && ev.target.dataset.kind;
+    closeCtxMenu();
+    if (kind) createScript(kind);
+  });
+  document.body.appendChild(menu);
+  _ctxMenuEl = menu;
+});
+
+// Delete from the form
+document.getElementById('sf-delete').addEventListener('click', () => {
+  if (scriptsState.active) deleteScript(scriptsState.active);
+});
+// Delete button on the scripts toolbar (acts on the active script)
+document.getElementById('btn-script-delete').addEventListener('click', () => {
+  if (scriptsState.active) deleteScript(scriptsState.active);
+});
+
+// Keep the toolbar Delete button enabled state in sync
+const _origOpenScriptForm = openScriptForm;
+openScriptForm = function (id) {
+  _origOpenScriptForm(id);
+  document.getElementById('btn-script-delete').disabled = !id;
+};
+const _origCloseScriptForm = closeScriptForm;
+closeScriptForm = function () {
+  _origCloseScriptForm();
+  document.getElementById('btn-script-delete').disabled = true;
+};
+
+// Right-click on a script item -> Delete shortcut
+document.addEventListener('contextmenu', e => {
+  const item = e.target.closest && e.target.closest('.script-item');
+  if (!item) return;
+  e.preventDefault();
+  closeCtxMenu();
+  const id = item.dataset.scriptId;
+  if (!id) return;
+  const menu = document.createElement('div');
+  menu.className = 'ctxmenu';
+  menu.style.left = e.clientX + 'px';
+  menu.style.top = e.clientY + 'px';
+  menu.innerHTML = `
+    <div class="item" data-act="open">Open</div>
+    <div class="item" data-act="clone">Duplicate</div>
+    <div class="sep"></div>
+    <div class="item danger" data-act="delete">Delete script</div>
+  `;
+  menu.addEventListener('click', ev => {
+    const act = ev.target.dataset && ev.target.dataset.act;
+    closeCtxMenu();
+    if (act === 'open') openScriptForm(id);
+    else if (act === 'clone') cloneScript(id);
+    else if (act === 'delete') {
+      // Need to mark active first since deleteScript closes the active form
+      scriptsState.active = id;
+      deleteScript(id);
+    }
+  });
+  document.body.appendChild(menu);
+  _ctxMenuEl = menu;
+});
+
+// ============================================================
+// LOCKED-FOLDER UNLOCK
+// ------------------------------------------------------------
+// OL Connect Designer marks five folders inside every template as read-only:
+// snippets, translations, js, fonts, color-profiles. On disk these show up as
+// zero-byte zip entries with the folder's exact path as the entry name (in
+// PlanetPress's typical backslash form, e.g. `public\document\snippets`).
+// Removing those marker entries from the package is enough to "unlock" the
+// folders — Designer no longer enforces the read-only behaviour next time the
+// template is opened, and the editor can add files at those paths freely.
+// ============================================================
+const LOCKED_FOLDER_RELATIVE_PATHS = [
+  'public/document/snippets',
+  'public/document/translations',
+  'public/document/js',
+  'public/document/fonts',
+  'public/document/color-profiles',
+];
+const LOCKED_FOLDER_PATH_SET = new Set(LOCKED_FOLDER_RELATIVE_PATHS);
+
+function isLockedFolderMarker(rawPath, fileEntry) {
+  if (!fileEntry) return false;
+  const norm = rawPath.replace(/\\/g, '/');
+  if (!LOCKED_FOLDER_PATH_SET.has(norm)) return false;
+  // Marker entries are always zero bytes — both text decode (empty string)
+  // and binary (Uint8Array length 0) need to count as empty.
+  if (fileEntry.isText) return typeof fileEntry.content === 'string' && fileEntry.content.length === 0;
+  return !fileEntry.content || fileEntry.content.length === 0;
+}
+
+function findLockedFolderEntries() {
+  const out = [];
+  for (const [path, f] of Object.entries(state.files)) {
+    if (isLockedFolderMarker(path, f)) out.push(path);
+  }
+  return out;
+}
+
+function unlockTemplateFolders() {
+  if (!state.fileHandle || !state.zip) {
+    setStatus('Open a .OL-template first.', 'warn');
+    return 0;
+  }
+  const markers = findLockedFolderEntries();
+  if (!markers.length) {
+    setStatus('No locked folder markers detected — nothing to unlock.', 'warn');
+    return 0;
+  }
+  for (const p of markers) {
+    delete state.files[p];
+    if (state.monacoModels && state.monacoModels[p]) {
+      try { state.monacoModels[p].dispose(); } catch (_) {}
+      delete state.monacoModels[p];
+    }
+    if (state.currentPath === p) state.currentPath = null;
+  }
+  buildTree();
+  refreshTreeDirtyMarkers();
+  updateFileButtons();
+  const human = markers.map(p => p.replace(/\\/g, '/')).join(', ');
+  setStatus(
+    `Unlocked ${markers.length} folder${markers.length === 1 ? '' : 's'}: ${human}. Use + New to add files inside (e.g. public/document/snippets/MySnippet.html); click Review & Save to write the unlock to disk.`,
+    'ok'
+  );
+  return markers.length;
+}
+
+// ============================================================
+// FILE ADD / RENAME / DELETE
+// ============================================================
+document.getElementById('btn-file-new').addEventListener('click', () => promptNewFile());
+document.getElementById('btn-file-rename').addEventListener('click', () => {
+  if (state.currentPath) renameFile(state.currentPath);
+});
+document.getElementById('btn-file-delete').addEventListener('click', () => {
+  if (state.currentPath) deleteFile(state.currentPath);
+});
+document.getElementById('btn-file-unlock').addEventListener('click', () => unlockTemplateFolders());
+
+function updateFileButtons() {
+  const has = !!state.currentPath && !!state.files[state.currentPath];
+  document.getElementById('btn-file-rename').disabled = !has;
+  document.getElementById('btn-file-delete').disabled = !has;
+  // Unlock is available whenever the open template still has at least one
+  // locked-folder marker entry. Standalone files never qualify.
+  const unlockBtn = document.getElementById('btn-file-unlock');
+  if (unlockBtn) {
+    const lockedCount = (state.zip && !state.standalone) ? findLockedFolderEntries().length : 0;
+    unlockBtn.disabled = lockedCount === 0;
+    unlockBtn.title = lockedCount === 0
+      ? 'No locked folder markers in this template'
+      : `Unlock ${lockedCount} folder${lockedCount === 1 ? '' : 's'} (snippets / translations / js / fonts / color-profiles)`;
+  }
+  const ctx = document.getElementById('file-toolbar-ctx');
+  if (state.currentPath) {
+    const dir = state.currentPath.includes('/') ? state.currentPath.substring(0, state.currentPath.lastIndexOf('/') + 1) : '/';
+    ctx.textContent = 'in: ' + dir;
+    ctx.title = 'New files will be created in: ' + dir;
+  } else {
+    ctx.textContent = '';
+    ctx.title = '';
+  }
+}
+
+function promptNewFile() {
+  if (!state.fileHandle) { setStatus('Open a template first.', 'warn'); return; }
+  if (state.standalone) { setStatus('Cannot add files to a standalone file — open a .OL-template or .OL-datamapper.', 'warn'); return; }
+  // Default location: same dir as current file (handy for adding XMLs into SampleDataFiles/)
+  const baseDir = (state.currentPath && state.currentPath.includes('/'))
+    ? state.currentPath.substring(0, state.currentPath.lastIndexOf('/') + 1)
+    : '';
+
+  // Build a list of every directory currently in the template, so the user
+  // can autocomplete against real folders rather than typing them by hand.
+  // Honours both '/' and '\\' separators (PlanetPress zips use backslashes).
+  const dirSet = new Set();
+  for (const path of Object.keys(state.files)) {
+    const norm = path.replace(/\\/g, '/');
+    const i = norm.lastIndexOf('/');
+    if (i > 0) dirSet.add(norm.slice(0, i + 1));
+  }
+  const dirs = [...dirSet].sort();
+  // A few well-known target folders specific to PlanetPress templates that
+  // may not exist yet (e.g. before unlock-folders is run). Surface them
+  // anyway so the user can land in the right place.
+  const knownDirs = [
+    'public/document/snippets/',
+    'public/document/translations/',
+    'public/document/js/',
+    'public/document/fonts/',
+    'public/document/color-profiles/',
+    'SampleDataFiles/',
+  ];
+  for (const d of knownDirs) if (!dirSet.has(d)) dirs.push(d);
+
+  // Open the modal and wire the autotype-on-pick binding.
+  openNewFileModal({ baseDir, dirs }, ({ dir, name, ext }) => {
+    const cleanDir = (dir || '').replace(/^\/+/, '').replace(/\\/g, '/');
+    const cleanName = (name || '').trim().replace(/^\/+/, '');
+    if (!cleanName) { setStatus('Empty filename.', 'warn'); return; }
+    // If the user already included an extension in the name, respect it;
+    // otherwise append the picked one.
+    const hasExt = /\.[^./\\]+$/.test(cleanName);
+    const finalName = hasExt ? cleanName : (ext ? `${cleanName}.${ext}` : cleanName);
+    const path = (cleanDir ? (cleanDir.endsWith('/') ? cleanDir : cleanDir + '/') : '') + finalName;
+    if (!path) { setStatus('Empty filename.', 'warn'); return; }
+    if (state.files[path]) { setStatus('A file with that path already exists.', 'err'); return; }
+
+    const e = extOf(path);
+    let initial = '';
+    if (e === 'xml') initial = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<root>\n</root>\n';
+    else if (e === 'json') initial = '{\n}\n';
+    else if (e === 'html' || e === 'htm') initial = '<!doctype html>\n<html>\n<head><meta charset="utf-8"></head>\n<body>\n</body>\n</html>\n';
+
+    state.files[path] = { content: initial, isText: true, dirty: true, added: true };
+    buildTree();
+    refreshTreeDirtyMarkers();
+    openFile(path);
+    setStatus(`Added ${path}. Click Review & Save to write it into the template.`, 'ok');
+  });
+}
+
+// Generic autotype binding lifted from bindFieldPathAutotype: when the
+// directory <input> value matches a key in `mapping`, set the extension
+// <select> to the mapped value. Same datalist-driven pattern, used here
+// for the +New file dialog so picking "public/document/snippets/" auto-
+// fills the .html extension, "SampleDataFiles/" picks .xml, and so on.
+function bindAutotypeByMap(srcInput, dstSelect, mapping) {
+  if (!srcInput || !dstSelect) return;
+  const handler = () => {
+    const key = (srcInput.value || '').toLowerCase();
+    // Try exact match first; fall back to longest-prefix match so partial
+    // typing still hints reasonably.
+    let target = mapping[key];
+    if (!target) {
+      let bestLen = 0;
+      for (const k of Object.keys(mapping)) {
+        if (key.startsWith(k) && k.length > bestLen) { bestLen = k.length; target = mapping[k]; }
+      }
+    }
+    if (target) {
+      // Only override if the user hasn't manually picked something — ie
+      // the dropdown is still on its default. This stops the autotype from
+      // fighting an explicit choice.
+      if (!dstSelect.dataset.userTouched) dstSelect.value = target;
+    }
+  };
+  srcInput.addEventListener('change', handler);
+  srcInput.addEventListener('input', handler);
+  dstSelect.addEventListener('change', () => { dstSelect.dataset.userTouched = '1'; });
+}
+
+// Modal for the +New file dialog. Shows a directory <input>+datalist, a
+// filename input, and an extension <select>. Picking a known directory
+// auto-fills the extension via bindAutotypeByMap. Returns via callback.
+function openNewFileModal({ baseDir, dirs }, onConfirm) {
+  // Clean up any prior instance so re-opening works cleanly.
+  const existing = document.getElementById('new-file-modal');
+  if (existing) existing.remove();
+
+  const wrap = document.createElement('div');
+  wrap.id = 'new-file-modal';
+  wrap.style.cssText = `
+    position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 500;
+    display: flex; align-items: center; justify-content: center;
+  `;
+  wrap.innerHTML = `
+    <div style="background:var(--panel-2);border:1px solid var(--border);border-radius:6px;
+                padding:18px 20px;min-width:480px;max-width:90vw;color:var(--text);
+                font-family:inherit;font-size:13px;">
+      <div style="font-size:14px;font-weight:600;margin-bottom:12px;">Add a new file</div>
+      <div style="display:flex;gap:10px;margin-bottom:10px;">
+        <div style="flex:2;display:flex;flex-direction:column;gap:4px;">
+          <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;">Folder</label>
+          <input id="nf-dir" list="nf-dir-list" autocomplete="off" spellcheck="false"
+                 style="background:var(--bg);color:var(--text);border:1px solid var(--border);
+                        border-radius:3px;padding:6px 8px;font-family:monospace;font-size:12px;">
+          <datalist id="nf-dir-list"></datalist>
+        </div>
+        <div style="flex:0 0 110px;display:flex;flex-direction:column;gap:4px;">
+          <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;">Extension</label>
+          <select id="nf-ext"
+                  style="background:var(--bg);color:var(--text);border:1px solid var(--border);
+                         border-radius:3px;padding:6px 8px;font-family:monospace;font-size:12px;">
+            <option value="">(none)</option>
+            <option value="xml">xml</option>
+            <option value="html">html</option>
+            <option value="htm">htm</option>
+            <option value="json">json</option>
+            <option value="css">css</option>
+            <option value="js">js</option>
+            <option value="md">md</option>
+            <option value="txt">txt</option>
+          </select>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:14px;">
+        <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;">Filename</label>
+        <input id="nf-name" autocomplete="off" spellcheck="false"
+               style="background:var(--bg);color:var(--text);border:1px solid var(--border);
+                      border-radius:3px;padding:6px 8px;font-family:monospace;font-size:12px;">
+      </div>
+      <div style="color:var(--muted);font-size:11px;margin-bottom:12px;">
+        Pick a folder from the list (or type a new one). Picking a known folder
+        auto-fills a sensible extension.
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;">
+        <button id="nf-cancel" class="ghost" style="background:transparent;color:var(--muted);
+                border:1px solid var(--border);border-radius:3px;padding:6px 14px;cursor:pointer;">Cancel</button>
+        <button id="nf-ok" style="background:var(--accent);color:white;border:0;
+                border-radius:3px;padding:6px 16px;cursor:pointer;">Create</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+
+  // Populate the datalist with every known dir + the well-known PlanetPress paths.
+  const dl = wrap.querySelector('#nf-dir-list');
+  for (const d of dirs) {
+    const opt = document.createElement('option');
+    opt.value = d;
+    dl.appendChild(opt);
+  }
+
+  const dirInput = wrap.querySelector('#nf-dir');
+  const nameInput = wrap.querySelector('#nf-name');
+  const extSelect = wrap.querySelector('#nf-ext');
+
+  // Seed defaults from the currently-open file's directory.
+  dirInput.value = baseDir || '';
+  nameInput.value = 'new-file';
+  extSelect.value = 'xml';
+
+  // Wire the autotype: known PlanetPress folders → sensible extension.
+  bindAutotypeByMap(dirInput, extSelect, {
+    'public/document/snippets/': 'html',
+    'public/document/translations/': 'xml',
+    'public/document/js/': 'js',
+    'public/document/fonts/': '',
+    'public/document/color-profiles/': '',
+    'sampledatafiles/': 'xml',
+  });
+
+  function close() { wrap.remove(); document.removeEventListener('keydown', escClose, true); }
+  function escClose(e) { if (e.key === 'Escape') { e.preventDefault(); close(); } }
+  document.addEventListener('keydown', escClose, true);
+  wrap.querySelector('#nf-cancel').addEventListener('click', close);
+  wrap.addEventListener('click', e => { if (e.target === wrap) close(); });
+  wrap.querySelector('#nf-ok').addEventListener('click', () => {
+    const dir = dirInput.value.trim();
+    const name = nameInput.value.trim();
+    const ext = extSelect.value.trim();
+    close();
+    onConfirm({ dir, name, ext });
+  });
+  // Enter-to-submit on either input.
+  for (const inp of [dirInput, nameInput]) {
+    inp.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); wrap.querySelector('#nf-ok').click(); }
+    });
+  }
+  setTimeout(() => nameInput.focus(), 0);
+}
+
+function renameFile(oldPath) {
+  if (!state.files[oldPath]) return;
+  if (state.standalone) { setStatus('Standalone files cannot be renamed from here.', 'warn'); return; }
+  const next = prompt('New path for this file:', oldPath);
+  if (next == null) return;
+  const newPath = next.trim().replace(/^\/+/, '');
+  if (!newPath || newPath === oldPath) return;
+  if (state.files[newPath]) { setStatus('A file already exists at that path.', 'err'); return; }
+
+  const f = state.files[oldPath];
+  // Capture current edited content from monaco (so unsaved edits survive the rename)
+  if (state.monacoModels[oldPath]) f.content = state.monacoModels[oldPath].getValue();
+  state.files[newPath] = Object.assign({}, f, { dirty: true, renamedFrom: f.renamedFrom || oldPath });
+  delete state.files[oldPath];
+
+  // Move the monaco model
+  if (state.monacoModels[oldPath]) {
+    const oldModel = state.monacoModels[oldPath];
+    const newModel = monaco.editor.createModel(oldModel.getValue(), langFor(newPath));
+    newModel.onDidChangeContent(() => {
+      state.files[newPath].dirty = true;
+      refreshTreeDirtyMarkers();
+      document.getElementById('btn-save').disabled = false;
+    });
+    state.monacoModels[newPath] = newModel;
+    oldModel.dispose();
+    delete state.monacoModels[oldPath];
+  }
+  if (state.currentPath === oldPath) state.currentPath = newPath;
+  buildTree();
+  refreshTreeDirtyMarkers();
+  if (state.currentPath === newPath) openFile(newPath);
+  setStatus(`Renamed to ${newPath}.`, 'ok');
+}
+
+function deleteFile(path) {
+  if (!state.files[path]) return;
+  if (state.standalone) { setStatus('Cannot delete the standalone file (just close it).', 'warn'); return; }
+  if (!confirm(`Delete "${path}" from this template?\n\nThe file will be removed when you Review & Save.`)) return;
+  if (state.monacoModels[path]) {
+    state.monacoModels[path].dispose();
+    delete state.monacoModels[path];
+  }
+  delete state.files[path];
+
+  if (state.currentPath === path) {
+    state.currentPath = null;
+    document.getElementById('editor').style.display = 'none';
+    document.getElementById('editor-tab').style.display = 'none';
+    document.getElementById('binary-view').classList.remove('show');
+    document.getElementById('btn-save').disabled = true;
+  }
+  buildTree();
+  refreshTreeDirtyMarkers();
+  setStatus(`Removed ${path}. Click Review & Save to apply.`, 'ok');
+}
+
+// Right-click on a tree file item -> mini context menu
+let _ctxMenuEl = null;
+function closeCtxMenu() { if (_ctxMenuEl) { _ctxMenuEl.remove(); _ctxMenuEl = null; } }
+document.addEventListener('click', closeCtxMenu);
+
+// Generic context-menu builder. Items are [{ label, onClick, danger?, sep? }];
+// pass { sep: true } as a divider. Mounts at (x, y), auto-dismisses on
+// the next document click (handled by the global `click → closeCtxMenu`
+// listener above). Centralised so the Scripts / Sections / Search /
+// File-tree menus all share the same look + dismiss semantics.
+function openContextMenu(items, x, y) {
+  closeCtxMenu();
+  const menu = document.createElement('div');
+  menu.className = 'ctxmenu';
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  for (const it of items) {
+    if (it.sep) {
+      const sep = document.createElement('div');
+      sep.className = 'sep';
+      menu.appendChild(sep);
+      continue;
+    }
+    const el = document.createElement('div');
+    el.className = 'item' + (it.danger ? ' danger' : '');
+    el.textContent = it.label;
+    if (it.title) el.title = it.title;
+    el.addEventListener('click', () => {
+      closeCtxMenu();
+      try { it.onClick && it.onClick(); } catch (e) { console.error(e); }
+    });
+    menu.appendChild(el);
+  }
+  document.body.appendChild(menu);
+  _ctxMenuEl = menu;
+  return menu;
+}
+
+// Best-effort copy-to-clipboard. Falls back to a transient textarea select
+// for non-secure-context environments where navigator.clipboard isn't
+// exposed. Used by every "Copy path" menu action.
+function copyToClipboard(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).then(
+        () => setStatus(`Copied: ${text}`, 'ok'),
+        () => fallback()
+      );
+    }
+  } catch (_) {}
+  fallback();
+  function fallback() {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed'; ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); setStatus(`Copied: ${text}`, 'ok'); }
+    catch (_) { setStatus('Copy failed.', 'err'); }
+    ta.remove();
+  }
+}
+
+// Try to switch the tree to Files mode and reveal the row for `path`.
+// Defensive about whether setSidebarMode / the tree exist yet.
+function revealInTree(path) {
+  try { setSidebarMode('files'); } catch (_) {}
+  // Scroll the tree row into view if we can find it.
+  setTimeout(() => {
+    try {
+      const el = document.querySelector(`.tree-item.file[data-path="${CSS.escape(path)}"]`);
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+    } catch (_) { /* CSS.escape may not exist; ignore */ }
+  }, 30);
+}
+
+document.addEventListener('contextmenu', e => {
+  // File tree row → Open / Rename / Delete (existing behaviour, now via the
+  // shared builder).
+  const fileItem = e.target.closest && e.target.closest('.tree-item.file');
+  if (fileItem) {
+    e.preventDefault();
+    const path = fileItem.dataset.path;
+    if (!path) return;
+    openContextMenu([
+      { label: 'Open',           onClick: () => openFile(path) },
+      { label: 'Open in new tab', onClick: () => {
+          // Best-effort: emit the in-memory text into a new browser tab so
+          // the user can read/copy without leaving the editor. For binary
+          // files we fall back to a notice.
+          const f = state.files[path];
+          if (!f) return;
+          if (f.isText) {
+            const w = window.open('', '_blank');
+            if (w) {
+              w.document.title = path;
+              w.document.body.style.cssText = 'font-family:monospace;white-space:pre;padding:12px;';
+              w.document.body.textContent = (state.monacoModels[path] ? state.monacoModels[path].getValue() : f.content) || '';
+            }
+          } else {
+            setStatus('Binary file — open in new tab not supported.', 'warn');
+          }
+        }
+      },
+      { label: 'Copy path',      onClick: () => copyToClipboard(path) },
+      { sep: true },
+      { label: 'Rename…',        onClick: () => renameFile(path) },
+      { label: 'Delete',         onClick: () => deleteFile(path), danger: true },
+    ], e.clientX, e.clientY);
+    return;
+  }
+
+  // Sections / Masters / Snippets navigator → Open / Open in new tab /
+  // Copy path / Reveal in tree. Same pattern as the file tree but without
+  // rename / delete (those edit the host file rather than the named entry).
+  const navItem = e.target.closest && e.target.closest('.nav-item');
+  if (navItem) {
+    e.preventDefault();
+    const path = (navItem.title || '').trim();
+    if (!path) return;
+    const resolved = (typeof normalizeNavPath === 'function') ? normalizeNavPath(path) : path;
+    openContextMenu([
+      { label: 'Open',            onClick: () => openFile(resolved) },
+      { label: 'Open in new tab', onClick: () => {
+          const f = state.files[resolved];
+          if (f && f.isText) {
+            const w = window.open('', '_blank');
+            if (w) {
+              w.document.title = resolved;
+              w.document.body.style.cssText = 'font-family:monospace;white-space:pre;padding:12px;';
+              w.document.body.textContent = (state.monacoModels[resolved] ? state.monacoModels[resolved].getValue() : f.content) || '';
+            }
+          } else {
+            setStatus('No content for ' + resolved, 'warn');
+          }
+        }
+      },
+      { label: 'Copy path',       onClick: () => copyToClipboard(resolved) },
+      { sep: true },
+      { label: 'Reveal in tree',  onClick: () => revealInTree(resolved) },
+    ], e.clientX, e.clientY);
+    return;
+  }
+
+  // Search results — both the per-file header and individual hit rows.
+  // Replace match opens a small prompt; we look up the path from the
+  // closest .search-file header ancestor (hits don't carry the path on
+  // themselves in the existing renderer, so we walk up).
+  const searchHit = e.target.closest && e.target.closest('.search-hit');
+  const searchFile = e.target.closest && e.target.closest('.search-file');
+  if (searchHit || searchFile) {
+    e.preventDefault();
+    // Walk up the search-results container to find the most recent .search-file
+    // header above this row. The renderer appends file headers in document
+    // order followed by their hits, so the previous sibling chain works.
+    let path = '';
+    if (searchFile) {
+      const txt = searchFile.textContent || '';
+      const m = /^(.*)\s+\(\d+\)\s*$/.exec(txt);
+      path = m ? m[1] : txt.trim();
+    } else if (searchHit) {
+      let prev = searchHit.previousElementSibling;
+      while (prev && !prev.classList.contains('search-file')) prev = prev.previousElementSibling;
+      if (prev) {
+        const txt = prev.textContent || '';
+        const m = /^(.*)\s+\(\d+\)\s*$/.exec(txt);
+        path = m ? m[1] : txt.trim();
+      }
+    }
+    if (!path || !state.files[path]) return;
+    openContextMenu([
+      { label: 'Open',            onClick: () => openFile(path) },
+      { label: 'Open in new tab', onClick: () => {
+          const f = state.files[path];
+          if (f && f.isText) {
+            const w = window.open('', '_blank');
+            if (w) {
+              w.document.title = path;
+              w.document.body.style.cssText = 'font-family:monospace;white-space:pre;padding:12px;';
+              w.document.body.textContent = (state.monacoModels[path] ? state.monacoModels[path].getValue() : f.content) || '';
+            }
+          }
+        }
+      },
+      { label: 'Copy path',       onClick: () => copyToClipboard(path) },
+      { sep: true },
+      { label: 'Replace match in this file…', onClick: () => {
+          const q = (document.getElementById('search-input') || {}).value || '';
+          if (!q) { setStatus('Search query is empty.', 'warn'); return; }
+          const replacement = prompt(`Replace all "${q}" in ${path} with:`, q);
+          if (replacement == null) return;
+          const f = state.files[path];
+          if (!f) return;
+          const model = state.monacoModels[path];
+          const text = model ? model.getValue() : f.content;
+          // Honour the search panel's regex / case / word-boundary modifiers
+          // so "Replace match" matches the same hits the user sees.
+          const useRegex = (document.getElementById('search-regex') || {}).checked;
+          const caseSensitive = (document.getElementById('search-case') || {}).checked;
+          const wholeWord = (document.getElementById('search-word') || {}).checked;
+          let pattern;
+          try {
+            let src = useRegex ? q : q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            if (wholeWord) src = `\\b(?:${src})\\b`;
+            pattern = new RegExp(src, caseSensitive ? 'g' : 'gi');
+          } catch (err) { setStatus('Bad regex: ' + err.message, 'err'); return; }
+          const before = text;
+          const updated = before.replace(pattern, replacement);
+          if (updated === before) { setStatus('No matches replaced.', 'warn'); return; }
+          if (model) {
+            const range = model.getFullModelRange();
+            model.pushEditOperations([], [{ range, text: updated }], () => null);
+          }
+          f.content = updated;
+          f.dirty = true;
+          refreshTreeDirtyMarkers();
+          if (typeof runSearch === 'function') runSearch();
+          setStatus(`Replaced matches in ${path}. Click Review & Save to apply.`, 'ok');
+        }
+      },
+    ], e.clientX, e.clientY);
+    return;
+  }
+  // No matching selector — fall through. We deliberately do NOT call
+  // closeCtxMenu() here: the .script-item contextmenu handler is registered
+  // separately and runs in the same event, so closing the menu we open in
+  // that handler would be a regression. The global click listener handles
+  // dismissal.
+});
+
+// Hook openFile to update the toolbar buttons
+const _origOpenFile = openFile;
+openFile = function (path) {
+  document.getElementById('script-form-view').classList.remove('show');
+  scriptsState.active = null;
+  _origOpenFile(path);
+  updateFileButtons();
+};
+
+// Track edits to index.xml so Scripts list always reflects current text
+const _origCommit2 = commitCurrentEdit;
+commitCurrentEdit = function (showStatus) {
+  _origCommit2(showStatus);
+  if (state.currentPath && SCRIPT_HOST_CANDIDATES.includes(state.currentPath)) {
+    refreshScriptsList();
+  }
+};
+
+// ============================================================
+// REZIP — include newly-added files (the original loop only walked
+// state.zip's existing entries). Also drives "added" markers in the
+// Review modal.
+// ============================================================
+const _origRezipForAdds = rezipAndSave;
+rezipAndSave = async function () {
+  if (!state.fileHandle) return;
+  commitCurrentEdit(false);
+
+  document.getElementById('btn-rezip').disabled = true;
+  try {
+    let blob;
+    if (state.zip) {
+      setStatus('Building zip...');
+      const out = new JSZip();
+      const seen = new Set();
+      state.zip.forEach((path, entry) => {
+        if (entry.dir) return;
+        const f = state.files[path];
+        if (!f) return;
+        seen.add(path);
+        const date = entry.date || new Date();
+        if (f.isText) out.file(path, f.content, { date });
+        else out.file(path, f.content, { date, binary: true });
+      });
+      const now = new Date();
+      for (const [path, f] of Object.entries(state.files)) {
+        if (seen.has(path)) continue;
+        if (f.isText) out.file(path, f.content, { date: now });
+        else out.file(path, f.content, { date: now, binary: true });
+      }
+      blob = await out.generateAsync({
+        type: 'blob',
+        compression: 'DEFLATE',
+        compressionOptions: { level: 6 },
+      });
+    } else if (state.standalone) {
+      const f = state.files[state.fileName];
+      blob = new Blob([f.content], { type: 'text/plain' });
+    } else {
+      return;
+    }
+
+    if (state.fileHandle.queryPermission) {
+      const perm = await state.fileHandle.queryPermission({ mode: 'readwrite' });
+      if (perm !== 'granted') {
+        const req = await state.fileHandle.requestPermission({ mode: 'readwrite' });
+        if (req !== 'granted') {
+          setStatus('Write permission denied.', 'err');
+          return;
+        }
+      }
+    }
+    const writable = await state.fileHandle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+
+    for (const f of Object.values(state.files)) { f.dirty = false; f.added = false; }
+    if (state.standalone) state.standalone.dirty = false;
+    refreshTreeDirtyMarkers();
+
+    const sizeKb = (blob.size / 1024).toFixed(1);
+    setStatus(`Saved ${state.fileName} (${sizeKb} KB).`, 'ok');
+
+    if (state.zip) {
+      try {
+        const file = await state.fileHandle.getFile();
+        state.zip = await JSZip.loadAsync(file);
+      } catch (_) { /* ignore */ }
+    }
+  } catch (e) {
+    setStatus('Save failed: ' + e.message, 'err');
+    console.error(e);
+  } finally {
+    document.getElementById('btn-rezip').disabled = false;
+  }
+};
+
+// Updated review modal that handles add/delete/modify
+async function reviewAndSave() {
+  if (!state.fileHandle) return;
+  commitCurrentEdit(false);
+
+  const changes = [];
+  if (state.zip) {
+    const inZip = new Set();
+    state.zip.forEach((p, e) => { if (!e.dir) inZip.add(p); });
+    for (const path of Object.keys(state.files)) {
+      const f = state.files[path];
+      if (!inZip.has(path)) {
+        const current = f.isText ? f.content : `(${(f.content && f.content.length) || 0} bytes binary)`;
+        changes.push({ path, original: '', current, status: 'added' });
+        continue;
+      }
+      if (!f.isText) continue;
+      const original = await state.zip.file(path).async('string');
+      if (original !== f.content) {
+        changes.push({ path, original, current: f.content, status: 'modified' });
+      }
+    }
+    for (const p of inZip) {
+      if (!state.files[p]) {
+        let original = '';
+        try { original = await state.zip.file(p).async('string'); } catch (_) {}
+        changes.push({ path: p, original, current: '', status: 'removed' });
+      }
+    }
+  } else if (state.standalone) {
+    const f = state.files[state.fileName];
+    const original = state.standalone.original ?? '';
+    if (original !== f.content) changes.push({ path: state.fileName, original, current: f.content, status: 'modified' });
+  }
+
+  if (!changes.length) {
+    setStatus('No changes to save.', 'warn');
+    return;
+  }
+
+  openModal(`Review changes — ${state.fileName}`, `Save ${changes.length} file${changes.length === 1 ? '' : 's'} to disk`, async () => {
+    closeModal();
+    await rezipAndSave();
+  });
+  modalEls.status.textContent = `${changes.length} file${changes.length === 1 ? '' : 's'} changed.`;
+
+  modalEls.sidebar.innerHTML = '';
+  changes.forEach((c, i) => {
+    const el = document.createElement('div');
+    el.className = 'modal-file-item' + (i === 0 ? ' active' : '');
+    const badge = c.status === 'added' ? '<span class="badge added">ADD</span>'
+                : c.status === 'removed' ? '<span class="badge removed">DEL</span>'
+                : '<span class="badge modified">CHG</span>';
+    el.innerHTML = `${badge}<span style="overflow:hidden;text-overflow:ellipsis;">${escapeHtml(c.path)}</span>`;
+    el.addEventListener('click', () => {
+      modalEls.sidebar.querySelectorAll('.modal-file-item').forEach(x => x.classList.remove('active'));
+      el.classList.add('active');
+      renderDiff(c.original, c.current);
+    });
+    modalEls.sidebar.appendChild(el);
+  });
+  renderDiff(changes[0].original, changes[0].current);
+}
+// Re-bind the Review button to the new function
+document.getElementById('btn-rezip').replaceWith(document.getElementById('btn-rezip').cloneNode(true));
+document.getElementById('btn-rezip').addEventListener('click', () => reviewAndSave());
+document.getElementById('btn-rezip').disabled = !state.fileHandle;
+
+// Whenever a template is loaded, refresh the scripts list and toolbar
+const _origLoad3 = loadFromHandle;
+loadFromHandle = async function (handle) {
+  await _origLoad3(handle);
+  refreshScriptsList();
+  updateFileButtons();
+  // Refresh the navigator (sections/masters/snippets) for the new template
+  if (typeof renderNavigator === 'function') renderNavigator();
+  document.getElementById('btn-rezip').disabled = false;
+  // Surface locked-folder status so the user knows the 🔓 Unlock button is live
+  if (state.zip && !state.standalone) {
+    const locked = (typeof findLockedFolderEntries === 'function') ? findLockedFolderEntries() : [];
+    if (locked.length) {
+      setStatus(
+        `${locked.length} locked folder${locked.length === 1 ? '' : 's'} detected (` +
+        locked.map(p => p.replace(/\\/g, '/').replace(/^public\/document\//, '')).join(', ') +
+        `). Click 🔓 Unlock in the file toolbar to make them writable.`,
+        'warn'
+      );
+    }
+  }
+};
+
+
+// ============================================================================
+// SCENARIOS, NOTES, RECENT SCRIPTS, MONACO "GO TO SCRIPT", COVERAGE/DIFF, FORM
+// (Added: 2026-04-30 — workflow improvements for the docx -> template ->
+//  datamapper-scenarios -> render loop. See template-editor-improvement-plan.md)
+// ============================================================================
+
+// ---------- SCENARIOS ----------
+// A "scenario" is one of the SampleDataFiles/*.xml files inside an .OL-datamapper.
+// When a scenario is active, its leaf-element path -> text-content map overrides
+// the datamodel's lastValue substitution in the preview, so the same template
+// renders against many different test inputs without leaving the editor.
+const scenariosState = {
+  source: null,            // human-readable source label (e.g. 'more2life.OL-datamapper')
+  sourceHandle: null,      // FileSystemFileHandle of the loaded datamapper (for re-write of scenario XML)
+  list: [],                // [{ name, path, xmlText, valueByPath: Map }]
+  active: null,            // selected scenario name, or null
+  activeOverrides: null,   // Map<path, value> pushed into applyDatamodelPersonalization
+};
+
+// localStorage key for "remember the last picked scenario per template"
+function scnPersistKey() {
+  return 'cw_scn:' + (state.fileName || '');
+}
+
+// Walk an XML doc, build { path -> text } for every leaf element.
+// Path is the dotted concatenation of element names below the document root.
+// First occurrence wins (so multi-row tables effectively use the first row's
+// values — good enough for a static preview).
+function parseScenarioXmlToMap(xmlText) {
+  // The map stores values under MULTIPLE keys for each leaf element so the
+  // substitution layer can find them regardless of how the datamodel chose
+  // to name the corresponding field:
+  //   - the full dotted path (e.g. "ApplicantData.FullName")
+  //   - every progressively-shorter suffix (e.g. "Data.FullName", "FullName")
+  // First occurrence of a key wins, so deeply-nested values don't get
+  // overwritten by later siblings under the same leaf name.
+  const map = new Map();
+  let doc;
+  try { doc = new DOMParser().parseFromString(xmlText, 'application/xml'); }
+  catch (_) { return map; }
+  const root = doc.documentElement;
+  if (!root || root.nodeName.toLowerCase() === 'parsererror') return map;
+  function setIfAbsent(k, v) { if (k && !map.has(k)) map.set(k, v); }
+  function walk(node, ancestors) {
+    for (const child of (node.children || [])) {
+      const tag = child.localName || child.nodeName;
+      const newAncestors = ancestors.concat([tag]);
+      const hasElementChildren = child.children && child.children.length > 0;
+      if (hasElementChildren) {
+        walk(child, newAncestors);
+      } else {
+        const value = (child.textContent || '').trim();
+        // Index by every suffix of the ancestor chain so any datamodel path
+        // shape can find this leaf — flat ("LenderName"), 1-level dotted
+        // ("LenderDetails.LenderName"), or full path.
+        for (let i = 0; i < newAncestors.length; i++) {
+          setIfAbsent(newAncestors.slice(i).join('.'), value);
+        }
+      }
+    }
+  }
+  walk(root, []);
+  return map;
+}
+
+// Extract sample XMLs from a .OL-datamapper zip (already-loaded JSZip instance).
+// PlanetPress zips routinely store paths with backslashes, so we test both.
+async function readScenariosFromZip(zip, sourceLabel) {
+  const out = [];
+  const entries = [];
+  zip.forEach((path, entry) => { if (!entry.dir) entries.push({ path, entry }); });
+  for (const { path, entry } of entries) {
+    const norm = path.replace(/\\/g, '/');
+    if (!/^SampleDataFiles\//i.test(norm)) continue;
+    if (!/\.xml$/i.test(norm)) continue;
+    let text;
+    try {
+      const bytes = await entry.async('uint8array');
+      text = decodeBytes(bytes);
+    } catch (_) { continue; }
+    const valueByPath = parseScenarioXmlToMap(text);
+    out.push({
+      name: norm.split('/').pop(),
+      path: path,                  // original path (may contain backslashes)
+      xmlText: text,
+      valueByPath,
+    });
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  scenariosState.source = sourceLabel || null;
+  scenariosState.list = out;
+  return out;
+}
+
+// If the open template lives in a folder (Open Folder mode), look for an
+// .OL-datamapper sibling and auto-load its scenarios. Returns true if loaded.
+async function autoLoadScenariosFromFolder() {
+  if (!state.dirHandle) return false;
+  // Pick the first .OL-datamapper in the folder list
+  const dm = (state.folderTemplates || []).find(t => t.ext === 'ol-datamapper');
+  if (!dm) return false;
+  try {
+    const file = await dm.handle.getFile();
+    const zip = await JSZip.loadAsync(file);
+    await readScenariosFromZip(zip, dm.name);
+    scenariosState.sourceHandle = dm.handle;
+    return true;
+  } catch (e) {
+    console.warn('[scenarios] auto-load failed:', e);
+    return false;
+  }
+}
+
+// User-initiated: pick a .OL-datamapper from disk and load its scenarios.
+async function pickAndLoadScenarios() {
+  if (!window.showOpenFilePicker) {
+    alert('File picker not available — try Chrome or Edge.');
+    return;
+  }
+  let handle;
+  try { [handle] = await window.showOpenFilePicker({ multiple: false }); }
+  catch (e) { if (e.name !== 'AbortError') setStatus('Pick failed: ' + e.message, 'err'); return; }
+  try {
+    const file = await handle.getFile();
+    const zip = await JSZip.loadAsync(file);
+    await readScenariosFromZip(zip, handle.name);
+    scenariosState.sourceHandle = handle;
+    populateScenarioPicker();
+    setStatus(`Loaded ${scenariosState.list.length} scenario${scenariosState.list.length === 1 ? '' : 's'} from ${handle.name}.`, 'ok');
+  } catch (e) { setStatus('Load failed: ' + e.message, 'err'); }
+}
+
+// Reflect scenariosState.list in the <select>; show/hide the wrap based on
+// whether the open template type makes scenarios meaningful.
+function populateScenarioPicker() {
+  const wrap = document.getElementById('preview-scenario-wrap');
+  const row = document.getElementById('preview-scenario-row');
+  const sel = document.getElementById('preview-scenario');
+  const matrixBtn = document.getElementById('btn-scenario-matrix');
+  const diffBtn = document.getElementById('btn-scenario-diff');
+  const editBtn = document.getElementById('btn-scenario-edit');
+  if (!wrap || !sel) return;
+  // Only meaningful for templates (.OL-template / .OL-datamapper) — not docx, not standalone.
+  const isHostUseful = !state.isDocx;
+  wrap.style.display = isHostUseful ? '' : 'none';
+  if (row) row.style.display = isHostUseful ? '' : 'none';
+  sel.innerHTML = '';
+  const def = document.createElement('option');
+  def.value = '';
+  def.textContent = scenariosState.list.length
+    ? `(datamodel sample) — ${scenariosState.list.length} scenarios available`
+    : '(datamodel sample) — no scenarios loaded';
+  sel.appendChild(def);
+  for (const s of scenariosState.list) {
+    const opt = document.createElement('option');
+    opt.value = s.name;
+    opt.textContent = s.name + (scenariosState.source ? '  ·  ' + scenariosState.source : '');
+    sel.appendChild(opt);
+  }
+  // Restore last-picked scenario for this template
+  let restore = null;
+  try { restore = localStorage.getItem(scnPersistKey()); } catch (_) {}
+  if (restore && scenariosState.list.some(s => s.name === restore)) {
+    sel.value = restore;
+    activateScenario(restore, /*silent*/true);
+  } else {
+    sel.value = '';
+    activateScenario(null, true);
+  }
+  const anyScenarios = scenariosState.list.length > 0;
+  matrixBtn.disabled = !anyScenarios;
+  diffBtn.disabled = scenariosState.list.length < 2;
+  editBtn.disabled = !scenariosState.active;
+}
+
+function activateScenario(name, silent) {
+  if (!name) {
+    scenariosState.active = null;
+    scenariosState.activeOverrides = null;
+  } else {
+    const s = scenariosState.list.find(x => x.name === name);
+    if (!s) { scenariosState.active = null; scenariosState.activeOverrides = null; }
+    else { scenariosState.active = name; scenariosState.activeOverrides = s.valueByPath; }
+  }
+  try { localStorage.setItem(scnPersistKey(), scenariosState.active || ''); } catch (_) {}
+  document.getElementById('preview-scenario-wrap').classList.toggle('has-active', !!scenariosState.active);
+  const editBtn = document.getElementById('btn-scenario-edit');
+  if (editBtn) editBtn.disabled = !scenariosState.active;
+  if (previewState && previewState.open) refreshPreview();
+  if (!silent) {
+    setStatus(scenariosState.active
+      ? `Scenario: ${scenariosState.active}`
+      : 'Scenario cleared (using datamodel lastValue)', 'ok');
+  }
+}
+
+// Wire scenario picker UI
+(function wireScenarios() {
+  const sel = document.getElementById('preview-scenario');
+  if (sel) sel.addEventListener('change', () => activateScenario(sel.value || null, false));
+  const loadBtn = document.getElementById('btn-scenario-load');
+  if (loadBtn) loadBtn.addEventListener('click', pickAndLoadScenarios);
+  const matrixBtn = document.getElementById('btn-scenario-matrix');
+  if (matrixBtn) matrixBtn.addEventListener('click', openCoverageMatrix);
+  const diffBtn = document.getElementById('btn-scenario-diff');
+  if (diffBtn) diffBtn.addEventListener('click', openScenarioDiff);
+  const editBtn = document.getElementById('btn-scenario-edit');
+  if (editBtn) editBtn.addEventListener('click', openScenarioFormForActive);
+})();
+
+// Hook into template loading: refresh scenarios + picker when a new file opens.
+(function hookScenariosOnLoad() {
+  const _orig = loadFromHandle;
+  loadFromHandle = async function (handle) {
+    await _orig(handle);
+    try {
+      // Reset only if we changed *which* underlying source the user is editing
+      // — keep a previously-loaded datamapper available across template switches
+      // in the same folder (common workflow: same dm, multiple templates).
+      if (!scenariosState.list.length) await autoLoadScenariosFromFolder();
+      populateScenarioPicker();
+    } catch (e) { console.warn('[scenarios] hook failed:', e); }
+    // Also refresh notes for the newly-opened template
+    try { loadNotesForCurrentTemplate(); } catch (e) { console.warn('[notes]', e); }
+  };
+})();
+
+// ---------- COVERAGE MATRIX ----------
+// Modal: table with one row per scenario, one column per Section in index.xml,
+// each cell showing whether each conditional script in that section is SHOWN
+// or HIDDEN under that scenario. Click a cell to render that combination.
+function openCoverageMatrix() {
+  if (!scenariosState.list.length) { setStatus('No scenarios loaded.', 'warn'); return; }
+  // Need an HTML target. If a section is open, use it; else use the first section in index.xml.
+  const sectionPaths = collectSectionHtmlPaths();
+  if (!sectionPaths.length) { setStatus('No section HTML found in this template.', 'warn'); return; }
+
+  // Build matrix: rows = scenarios, cols = sections
+  const rows = scenariosState.list.map(s => ({ name: s.name, valueByPath: s.valueByPath }));
+  // Default scenario: undefined overrides == datamodel sample
+  rows.unshift({ name: '(datamodel sample)', valueByPath: null });
+
+  openModal('Scenario coverage matrix', 'Close', closeModal);
+  modalEls.action.textContent = 'Close';
+  modalEls.cancel.style.display = 'none';
+  modalEls.sidebar.innerHTML = '<div id="matrix-help">Click a cell to render that scenario × section into the main preview pane.</div>';
+  // Build grid
+  const main = modalEls.main;
+  main.innerHTML = '';
+  const tbl = document.createElement('table');
+  tbl.className = 'matrix-grid';
+  const thead = document.createElement('thead');
+  const trh = document.createElement('tr');
+  trh.innerHTML = '<th>Scenario</th>' + sectionPaths.map(p => `<th title="${escapeHtml(p.path)}">${escapeHtml(p.name)}</th>`).join('');
+  thead.appendChild(trh);
+  tbl.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+    const th = document.createElement('th');
+    th.textContent = r.name;
+    th.style.maxWidth = '240px';
+    th.style.overflow = 'hidden';
+    th.style.textOverflow = 'ellipsis';
+    tr.appendChild(th);
+    for (const sec of sectionPaths) {
+      const td = document.createElement('td');
+      td.className = 'matrix-cell';
+      const summary = summarizeScenarioForSection(r.valueByPath, sec.path);
+      td.innerHTML = summary.html;
+      td.title = summary.tip;
+      td.addEventListener('click', () => {
+        // Set scenario, open the section, ensure preview is open
+        const sel = document.getElementById('preview-scenario');
+        sel.value = r.valueByPath ? r.name : '';
+        activateScenario(r.valueByPath ? r.name : null, false);
+        openFile(sec.path);
+        if (!previewState.open) openPreview();
+        else refreshPreview();
+        closeModal();
+      });
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  tbl.appendChild(tbody);
+  main.appendChild(tbl);
+}
+
+// Collect section paths from index.xml's <sections> entries (friendly names).
+function collectSectionHtmlPaths() {
+  if (typeof parseNavigatorEntries !== 'function') return [];
+  const groups = parseNavigatorEntries();
+  const out = [];
+  for (const sec of groups.sections || []) {
+    const p = (typeof normalizeNavPath === 'function') ? normalizeNavPath(sec.location) : sec.location;
+    if (state.files[p]) out.push({ name: sec.name, path: p });
+  }
+  return out;
+}
+
+// Build a per-cell label: # of conditional scripts whose result changes under
+// this scenario relative to the datamodel sample, plus a #unresolved count.
+function summarizeScenarioForSection(overrides, sectionPath) {
+  const f = state.files[sectionPath];
+  if (!f || !f.isText) return { html: '<span class="badge unres">?</span>', tip: 'no file' };
+  const html = state.monacoModels[sectionPath]
+    ? state.monacoModels[sectionPath].getValue()
+    : f.content;
+  // Save current scenario, render this combination once, count states.
+  const stash = scenariosState.activeOverrides;
+  scenariosState.activeOverrides = overrides;
+  let shownCount = 0, hiddenCount = 0;
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    if (doc && doc.body && typeof applyDatamodelPersonalization === 'function') {
+      applyDatamodelPersonalization(doc);
+      // Count things that ended up display:none
+      doc.body.querySelectorAll('[style]').forEach(el => {
+        if (/display\s*:\s*none/i.test(el.getAttribute('style') || '')) hiddenCount++;
+        else shownCount++;
+      });
+    }
+  } catch (_) { /* ignore */ }
+  scenariosState.activeOverrides = stash;
+  const tip = `${shownCount} visible block(s), ${hiddenCount} hidden`;
+  return {
+    html: `<span class="badge shown">${shownCount}</span> <span class="badge hidden">${hiddenCount}</span>`,
+    tip,
+  };
+}
+
+// ---------- SCENARIO DIFF ----------
+function openScenarioDiff() {
+  if (scenariosState.list.length < 2) { setStatus('Need at least 2 scenarios.', 'warn'); return; }
+  // Need a template HTML target — use currently-open html, else the first section.
+  let target = state.currentPath && /\.html?$/i.test(state.currentPath) ? state.currentPath : null;
+  if (!target) {
+    const secs = collectSectionHtmlPaths();
+    if (secs.length) target = secs[0].path;
+  }
+  if (!target) { setStatus('Open an HTML file first.', 'warn'); return; }
+
+  openModal('Scenario diff', 'Close', closeModal);
+  modalEls.action.textContent = 'Close';
+  modalEls.cancel.style.display = 'none';
+  modalEls.sidebar.innerHTML = `<div id="matrix-help">Pick two scenarios, see the rendered output and field-level deltas.</div>`;
+  modalEls.main.innerHTML = `
+    <div id="scenario-diff-pane">
+      <div id="scenario-diff-pickers">
+        <span>Left:</span>
+        <select id="scn-diff-a"></select>
+        <span style="margin-left:18px;">Right:</span>
+        <select id="scn-diff-b"></select>
+        <span style="margin-left:18px; color:var(--muted);">Target:</span>
+        <span style="font-family:monospace;">${escapeHtml(target)}</span>
+      </div>
+      <div id="scenario-diff-frames">
+        <div class="pane">
+          <div class="pane-label" id="scn-diff-a-label">left</div>
+          <iframe id="scn-diff-a-frame" sandbox="allow-same-origin allow-scripts"></iframe>
+        </div>
+        <div class="pane">
+          <div class="pane-label" id="scn-diff-b-label">right</div>
+          <iframe id="scn-diff-b-frame" sandbox="allow-same-origin allow-scripts"></iframe>
+        </div>
+      </div>
+      <div id="scenario-diff-text"><div class="row" style="color:var(--muted); font-style:italic;">Field-level differences appear here once both sides are picked.</div></div>
+    </div>
+  `;
+  const selA = document.getElementById('scn-diff-a');
+  const selB = document.getElementById('scn-diff-b');
+  for (const s of scenariosState.list) {
+    selA.appendChild(new Option(s.name, s.name));
+    selB.appendChild(new Option(s.name, s.name));
+  }
+  selA.value = scenariosState.list[0].name;
+  selB.value = scenariosState.list[1].name;
+  function rerender() {
+    const a = scenariosState.list.find(x => x.name === selA.value);
+    const b = scenariosState.list.find(x => x.name === selB.value);
+    document.getElementById('scn-diff-a-label').textContent = a ? a.name : '—';
+    document.getElementById('scn-diff-b-label').textContent = b ? b.name : '—';
+    if (!a || !b) return;
+    const tt = state.monacoModels[target] ? state.monacoModels[target].getValue() : state.files[target].content;
+    // Render via the existing pipeline by stashing the active overrides
+    const stash = scenariosState.activeOverrides;
+    scenariosState.activeOverrides = a.valueByPath;
+    const ahtml = buildPreviewHtml(target, tt, { withData: true });
+    scenariosState.activeOverrides = b.valueByPath;
+    const bhtml = buildPreviewHtml(target, tt, { withData: true });
+    scenariosState.activeOverrides = stash;
+    document.getElementById('scn-diff-a-frame').srcdoc = ahtml;
+    document.getElementById('scn-diff-b-frame').srcdoc = bhtml;
+    // Field-level diff on the parsed maps
+    const out = document.getElementById('scenario-diff-text');
+    out.innerHTML = '';
+    const allKeys = new Set([...a.valueByPath.keys(), ...b.valueByPath.keys()]);
+    const sorted = Array.from(allKeys).sort();
+    let diffs = 0;
+    for (const k of sorted) {
+      const va = a.valueByPath.get(k) || '';
+      const vb = b.valueByPath.get(k) || '';
+      if (va === vb) continue;
+      diffs++;
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `<span class="field">${escapeHtml(k)}</span> <span class="a">${escapeHtml(va || '(empty)')}</span> → <span class="b">${escapeHtml(vb || '(empty)')}</span>`;
+      out.appendChild(row);
+    }
+    if (!diffs) out.innerHTML = '<div class="row" style="color:var(--muted); font-style:italic;">No field-level differences between these scenarios.</div>';
+  }
+  selA.addEventListener('change', rerender);
+  selB.addEventListener('change', rerender);
+  rerender();
+}
+
+// ---------- SCENARIO FORM EDITOR ----------
+// Generates a form from the open .OL-datamodel; pre-fills with the active
+// scenario's values; can apply changes back to the in-memory scenario or
+// save as a new XML in SampleDataFiles/.
+function openScenarioFormForActive() {
+  if (!scenariosState.active) { setStatus('Pick a scenario first.', 'warn'); return; }
+  const s = scenariosState.list.find(x => x.name === scenariosState.active);
+  if (!s) return;
+  openScenarioForm(s);
+}
+
+function openScenarioForm(scenario) {
+  // Hide other panes
+  document.getElementById('editor').style.display = 'none';
+  document.getElementById('binary-view').classList.remove('show');
+  document.getElementById('script-form-view').classList.remove('show');
+  const view = document.getElementById('scenario-form-view');
+  view.classList.add('show');
+  document.getElementById('editor-tab').style.display = 'none';
+
+  document.getElementById('scn-form-title').textContent = 'Scenario: ' + scenario.name;
+  document.getElementById('scn-form-sub').textContent = scenario.path + (scenariosState.source ? '  ·  in ' + scenariosState.source : '');
+
+  // Build a form grouped by the top-level path segment.
+  // Source of fields: the active datamodel (so we get types and known structure)
+  // augmented with anything present in the scenario but not in the datamodel.
+  const dmFields = (scriptsState && scriptsState.datamodelFields) || [];
+  const allPaths = new Set();
+  for (const f of dmFields) if (f.type !== 'table') allPaths.add(f.path);
+  for (const k of scenario.valueByPath.keys()) allPaths.add(k);
+  const grouped = new Map();
+  for (const p of allPaths) {
+    const parts = p.split('.');
+    const head = parts.length > 1 ? parts[0] : '(top-level)';
+    if (!grouped.has(head)) grouped.set(head, []);
+    grouped.get(head).push(p);
+  }
+  const body = document.getElementById('scn-form-body');
+  body.innerHTML = '';
+  const inputs = new Map(); // path -> input element
+  const sortedHeads = Array.from(grouped.keys()).sort();
+  for (const head of sortedHeads) {
+    const grp = document.createElement('div');
+    grp.className = 'group';
+    const gh = document.createElement('div');
+    gh.className = 'group-head';
+    gh.innerHTML = `<span class="toggle">▾</span><span>${escapeHtml(head)}</span><span style="flex:1;"></span><span style="color:var(--muted);">${grouped.get(head).length} fields</span>`;
+    gh.addEventListener('click', () => grp.classList.toggle('collapsed'));
+    grp.appendChild(gh);
+    const gb = document.createElement('div');
+    gb.className = 'group-body';
+    for (const p of grouped.get(head).sort()) {
+      const row = document.createElement('div');
+      row.className = 'field-row';
+      const lbl = document.createElement('label');
+      lbl.textContent = p;
+      row.appendChild(lbl);
+      const val = scenario.valueByPath.get(p) || '';
+      const input = (val.length > 80 || /\n/.test(val))
+        ? document.createElement('textarea')
+        : document.createElement('input');
+      if (input.tagName === 'INPUT') input.type = 'text';
+      input.value = val;
+      input.dataset.path = p;
+      row.appendChild(input);
+      inputs.set(p, input);
+      gb.appendChild(row);
+    }
+    grp.appendChild(gb);
+    body.appendChild(grp);
+  }
+
+  // Wire actions
+  document.getElementById('scn-form-revert').onclick = () => openScenarioForm(scenario);
+  document.getElementById('scn-form-close').onclick = closeScenarioForm;
+  document.getElementById('scn-form-apply').onclick = () => {
+    // Push edits into in-memory scenario (does not write to disk)
+    for (const [p, inp] of inputs.entries()) {
+      scenario.valueByPath.set(p, inp.value);
+    }
+    if (scenariosState.active === scenario.name) {
+      scenariosState.activeOverrides = scenario.valueByPath;
+    }
+    closeScenarioForm();
+    if (previewState && previewState.open) refreshPreview();
+    setStatus('Scenario edits applied (in-memory). Use "Save as new XML…" to persist.', 'ok');
+  };
+  document.getElementById('scn-form-save-as').onclick = async () => {
+    if (!state.dirHandle) { setStatus('Save-as needs a folder open (Open Folder).', 'warn'); return; }
+    const name = prompt('Save as XML filename (in the open folder):', scenario.name.replace(/\.xml$/i, '_edited.xml'));
+    if (!name) return;
+    // Snapshot edits
+    for (const [p, inp] of inputs.entries()) scenario.valueByPath.set(p, inp.value);
+    const xml = scenarioMapToXml(scenario.valueByPath);
+    try {
+      const fh = await state.dirHandle.getFileHandle(name, { create: true });
+      const w = await fh.createWritable();
+      await w.write(new Blob([xml], { type: 'application/xml' }));
+      await w.close();
+      setStatus(`Saved ${name} to folder.`, 'ok');
+    } catch (e) { setStatus('Save failed: ' + e.message, 'err'); }
+  };
+}
+
+function closeScenarioForm() {
+  document.getElementById('scenario-form-view').classList.remove('show');
+  if (state.currentPath) openFile(state.currentPath);
+}
+
+// Serialise a path -> value map back into a scenario-shaped XML.
+function scenarioMapToXml(map) {
+  // Build a tree from dotted paths
+  const root = { children: new Map(), value: null };
+  for (const [p, v] of map.entries()) {
+    const parts = p.split('.');
+    let node = root;
+    for (let i = 0; i < parts.length; i++) {
+      const seg = parts[i];
+      if (!node.children.has(seg)) node.children.set(seg, { children: new Map(), value: null });
+      node = node.children.get(seg);
+      if (i === parts.length - 1) node.value = v;
+    }
+  }
+  function serialize(node, indent) {
+    const lines = [];
+    for (const [name, child] of node.children) {
+      const safe = encodeXmlText(child.value || '');
+      if (child.children.size === 0) {
+        lines.push(indent + '<' + name + '>' + safe + '</' + name + '>');
+      } else {
+        lines.push(indent + '<' + name + '>');
+        lines.push(serialize(child, indent + '  '));
+        lines.push(indent + '</' + name + '>');
+      }
+    }
+    return lines.join('\n');
+  }
+  return '<?xml version="1.0" encoding="UTF-8"?>\n<Application>\n' + serialize(root, '  ') + '\n</Application>\n';
+}
+
+// ---------- NOTES SIDECAR ----------
+const notesState = {
+  text: '',
+  dirty: false,
+  forTemplate: null, // template fileName the loaded notes belong to
+};
+
+function notesSidecarName() {
+  if (!state.fileName) return null;
+  return state.fileName.replace(/\.[^.]+$/, '') + '.notes.md';
+}
+
+async function loadNotesForCurrentTemplate() {
+  const ta = document.getElementById('notes-textarea');
+  const name = document.getElementById('notes-filename');
+  const empty = document.getElementById('notes-empty');
+  const saveBtn = document.getElementById('btn-notes-save');
+  if (!ta || !state.fileName) {
+    if (ta) ta.value = '';
+    if (name) name.textContent = '(no template open)';
+    if (saveBtn) saveBtn.disabled = true;
+    if (empty) empty.style.display = '';
+    notesState.text = '';
+    notesState.dirty = false;
+    notesState.forTemplate = null;
+    return;
+  }
+  const sidecar = notesSidecarName();
+  notesState.forTemplate = state.fileName;
+  name.textContent = sidecar;
+  empty.style.display = 'none';
+  saveBtn.disabled = false;
+  // Try to read sidecar from the open dirHandle
+  let text = '';
+  if (state.dirHandle) {
+    try {
+      const fh = await state.dirHandle.getFileHandle(sidecar);
+      const f = await fh.getFile();
+      text = await f.text();
+    } catch (_) { text = ''; }
+  }
+  ta.value = text;
+  notesState.text = text;
+  notesState.dirty = false;
+}
+
+async function saveNotes() {
+  if (!state.dirHandle) { setStatus('Open a folder to save notes.', 'warn'); return; }
+  const sidecar = notesSidecarName();
+  if (!sidecar) return;
+  const ta = document.getElementById('notes-textarea');
+  const text = ta.value;
+  try {
+    const fh = await state.dirHandle.getFileHandle(sidecar, { create: true });
+    const w = await fh.createWritable();
+    await w.write(new Blob([text], { type: 'text/markdown' }));
+    await w.close();
+    notesState.text = text;
+    notesState.dirty = false;
+    setStatus(`Saved ${sidecar}.`, 'ok');
+  } catch (e) { setStatus('Save notes failed: ' + e.message, 'err'); }
+}
+
+(function wireNotes() {
+  const ta = document.getElementById('notes-textarea');
+  const saveBtn = document.getElementById('btn-notes-save');
+  if (ta) ta.addEventListener('input', () => {
+    notesState.dirty = ta.value !== notesState.text;
+  });
+  if (saveBtn) saveBtn.addEventListener('click', saveNotes);
+  // Ctrl+S inside the notes textarea saves the notes (instead of committing template edit)
+  if (ta) ta.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+      e.preventDefault();
+      saveNotes();
+    }
+  });
+  const modeNotesBtn = document.getElementById('mode-notes');
+  if (modeNotesBtn) modeNotesBtn.addEventListener('click', () => setSidebarMode('notes'));
+})();
+
+// Extend setSidebarMode to handle 'notes'. We do this by monkey-patching:
+// the original function only knows 'files'/'nav'/'scripts'/'theme'/'search',
+// and silently no-ops for unknown modes. We override to add 'notes' handling.
+(function patchSidebarMode() {
+  const orig = setSidebarMode;
+  setSidebarMode = function (mode) {
+    if (mode === 'notes') {
+      document.getElementById('mode-files').classList.remove('active');
+      const navBtn = document.getElementById('mode-nav'); if (navBtn) navBtn.classList.remove('active');
+      const scrBtn = document.getElementById('mode-scripts'); if (scrBtn) scrBtn.classList.remove('active');
+      const themeBtn = document.getElementById('mode-theme'); if (themeBtn) themeBtn.classList.remove('active');
+      const notesBtn = document.getElementById('mode-notes'); if (notesBtn) notesBtn.classList.add('active');
+      document.getElementById('mode-search').classList.remove('active');
+      document.getElementById('tree').style.display = 'none';
+      const ftb = document.getElementById('file-toolbar'); if (ftb) ftb.style.display = 'none';
+      const navPanel = document.getElementById('nav-panel'); if (navPanel) navPanel.classList.remove('show');
+      const scrPanel = document.getElementById('scripts-panel'); if (scrPanel) scrPanel.classList.remove('show');
+      document.getElementById('search-panel').classList.remove('show');
+      const themePanel = document.getElementById('theme-panel'); if (themePanel) themePanel.classList.remove('show');
+      const notesPanel = document.getElementById('notes-panel'); if (notesPanel) notesPanel.classList.add('show');
+      loadNotesForCurrentTemplate();
+      return;
+    }
+    // Hide notes panel for any other mode
+    const notesBtn = document.getElementById('mode-notes'); if (notesBtn) notesBtn.classList.remove('active');
+    const notesPanel = document.getElementById('notes-panel'); if (notesPanel) notesPanel.classList.remove('show');
+    return orig(mode);
+  };
+})();
+
+// ---------- RECENTLY-EDITED SCRIPTS ----------
+const recentScriptsState = {
+  list: [],   // [{ name, findText, ts }]
+  max: 8,
+};
+function recentScriptsKey() { return 'cw_recent_scripts:' + (state.fileName || ''); }
+function loadRecentScripts() {
+  try {
+    const raw = localStorage.getItem(recentScriptsKey());
+    recentScriptsState.list = raw ? JSON.parse(raw) : [];
+  } catch (_) { recentScriptsState.list = []; }
+}
+function saveRecentScripts() {
+  try { localStorage.setItem(recentScriptsKey(), JSON.stringify(recentScriptsState.list)); } catch (_) {}
+}
+function pushRecentScript(s) {
+  if (!s || !s.name) return;
+  const entry = { name: s.name, findText: s.findText || '', ts: Date.now() };
+  recentScriptsState.list = [entry, ...recentScriptsState.list.filter(x => x.name !== s.name)].slice(0, recentScriptsState.max);
+  saveRecentScripts();
+}
+
+// Hook into openScriptForm to track recents
+(function hookRecentScripts() {
+  const _orig = openScriptForm;
+  openScriptForm = function (id) {
+    _orig(id);
+    const s = scriptsState.list.find(x => x.id === id);
+    if (s) {
+      pushRecentScript(s);
+      // Re-render the list so the "Recent" group reflects the new top entry
+      try { renderScriptsList(); } catch (_) {}
+    }
+  };
+  // Reload recents whenever the template changes
+  const _origLoad = loadFromHandle;
+  loadFromHandle = async function (h) {
+    await _origLoad(h);
+    loadRecentScripts();
+    if (typeof renderScriptsList === 'function') {
+      try { renderScriptsList(); } catch (_) {}
+    }
+  };
+  loadRecentScripts();
+})();
+
+// Inject a "Recent" group at the top of the rendered scripts list. We do this
+// by wrapping renderScriptsList and prepending DOM nodes after the original
+// runs.
+(function patchRenderScriptsList() {
+  const orig = renderScriptsList;
+  renderScriptsList = function () {
+    orig.apply(this, arguments);
+    if (!recentScriptsState.list.length) return;
+    const list = document.getElementById('scripts-list');
+    if (!list) return;
+    // Avoid duplicates if the function is re-run quickly
+    const existing = list.querySelector('.scripts-group[data-recent="1"]');
+    if (existing) existing.remove();
+    list.querySelectorAll('.script-item[data-recent="1"]').forEach(el => el.remove());
+    const head = document.createElement('div');
+    head.className = 'scripts-group';
+    head.dataset.recent = '1';
+    head.textContent = `Recent  (${recentScriptsState.list.length})`;
+    list.insertBefore(head, list.firstChild);
+    // Insert items in reverse so the most recent ends up just under the header
+    let prev = head;
+    for (const r of recentScriptsState.list) {
+      const found = scriptsState.list.find(x => x.name === r.name);
+      const el = document.createElement('div');
+      el.className = 'script-item' + (found ? '' : ' disabled');
+      el.dataset.recent = '1';
+      const ago = Math.max(0, Date.now() - r.ts);
+      const mins = Math.floor(ago / 60000);
+      const when = mins < 1 ? 'just now' : (mins < 60 ? mins + 'm ago' : Math.floor(mins / 60) + 'h ago');
+      el.innerHTML = `<span class="badge">${escapeHtml(when)}</span><span class="name">${escapeHtml(r.name)}</span>${r.findText ? `<span class="find">${escapeHtml(r.findText)}</span>` : ''}`;
+      el.title = found ? 'Open this script' : 'Script no longer present in this template';
+      if (found) el.addEventListener('click', () => openScriptForm(found.id));
+      prev.parentNode.insertBefore(el, prev.nextSibling);
+      prev = el;
+    }
+  };
+})();
+
+// ---------- MONACO "GO TO SCRIPT" ----------
+// Adds an editor action so right-click on an @token@ in HTML/XML offers a
+// "Go to script" item. Falls back to "no matching script" if the cursor isn't
+// inside a token.
+(function wireMonacoGotoScript() {
+  function tryRegister() {
+    if (!state.editor || typeof monaco === 'undefined') {
+      setTimeout(tryRegister, 200);
+      return;
+    }
+    state.editor.addAction({
+      id: 'cw.goto-script-for-token',
+      label: 'Go to script for @token@',
+      contextMenuGroupId: 'navigation',
+      contextMenuOrder: 0.5,
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.KeyG],
+      run(editor) {
+        const model = editor.getModel();
+        if (!model) return;
+        const pos = editor.getPosition();
+        const line = model.getLineContent(pos.lineNumber);
+        // Find the @token@ that contains the column
+        const re = /@[A-Za-z0-9_./\-]+@/g;
+        let m, found = null;
+        while ((m = re.exec(line)) !== null) {
+          const start = m.index + 1; // 1-based column
+          const end = m.index + m[0].length + 1;
+          if (pos.column >= start && pos.column <= end) { found = m[0]; break; }
+        }
+        if (!found) {
+          setStatus('Place the cursor inside an @token@ first.', 'warn');
+          return;
+        }
+        if (typeof jumpToScriptByToken === 'function') jumpToScriptByToken(found);
+        else setStatus('Scripts panel unavailable in this template.', 'warn');
+      },
+    });
+    // Also attach to the script form's source editor so users can navigate from
+    // a token they're typing into a control script's source.
+    if (scriptsState && scriptsState.sourceEditor) {
+      scriptsState.sourceEditor.addAction({
+        id: 'cw.goto-script-for-token-form',
+        label: 'Go to script for @token@',
+        contextMenuGroupId: 'navigation',
+        contextMenuOrder: 0.5,
+        run(editor) {
+          const model = editor.getModel();
+          const pos = editor.getPosition();
+          const line = model.getLineContent(pos.lineNumber);
+          const re = /@[A-Za-z0-9_./\-]+@/g;
+          let m, found = null;
+          while ((m = re.exec(line)) !== null) {
+            const a = m.index + 1, b = m.index + m[0].length + 1;
+            if (pos.column >= a && pos.column <= b) { found = m[0]; break; }
+          }
+          if (found && typeof jumpToScriptByToken === 'function') jumpToScriptByToken(found);
+        },
+      });
+    }
+  }
+  tryRegister();
+})();
+
+
+// ---------- AUTO-OPEN SECTION 1 + PREVIEW ON TEMPLATE LOAD ----------
+// When a .OL-template loads, jump straight to the first section's HTML and
+// pop open the preview. Saves the user a couple of clicks every time they
+// switch templates from the folder list. Skips for files that don't have
+// sections (datamapper/datamodel/docx/standalone).
+(function autoOpenFirstSection() {
+  const _orig = loadFromHandle;
+  loadFromHandle = async function (handle) {
+    await _orig(handle);
+    // Skip for non-section hosts
+    if (state.isDocx) return;
+    if (state.standalone) return;
+    if (!scriptsState || !scriptsState.hostPath) return; // no index.xml -> nothing to do
+    let entries;
+    try { entries = parseNavigatorEntries(); } catch (_) { return; }
+    if (!entries || !entries.sections || !entries.sections.length) return;
+    // First section in document order (parseNavigatorEntries preserves it)
+    const first = entries.sections[0];
+    const target = (typeof normalizeNavPath === 'function')
+      ? normalizeNavPath(first.location)
+      : first.location;
+    if (!state.files[target]) return; // section file missing from package
+    try {
+      openFile(target);
+      // Open preview only if it makes sense (HTML file, not already open)
+      if (!previewState.open) openPreview();
+      else refreshPreview();
+    } catch (e) { console.warn('[auto-open] failed:', e); }
+  };
+})();
+
+// ============================================================
+// GENERIC OVERLAY-FORM HELPER + PRESET (.OL-jobpreset / .OL-outputpreset) EDITOR
+// ------------------------------------------------------------
+// Lifts the form-overlay-on-Monaco pattern out of the Scripts feature so
+// any "edit this XML file as a form" view can reuse it. Same overlay
+// container, same Apply / Revert / Open raw / Close action set.
+//
+// Concrete editor included: a basic preset editor that scans a preset
+// XML's top-level scalar children and exposes them as text inputs. The
+// surface is intentionally generic — it's a starting point for richer
+// datamodel / sections editors that should slot into the same plumbing.
+// Apply uses the standard _raw + offset splice pattern via replaceTagInner
+// so whitespace and unknown sibling tags are preserved.
+// ============================================================
+
+const overlayFormState = {
+  active: null, // { path, originalText, fields: [{ tag, value, isMultiline }] }
+};
+
+// Mount an overlay form. `cfg` shape:
+//   { path, title, subtitle, fields: [{ tag, label, value, multiline? }],
+//     onApply(formValues), onClose() }
+// Hides the editor + script/binary/scenario views while shown; restores
+// them in closeOverlayForm. The `originalText` is captured so Revert can
+// reset every input to its parsed-at-open value.
+function openOverlayForm(cfg) {
+  if (!cfg || !cfg.fields) return;
+  // Hide other "main pane" views
+  document.getElementById('editor').style.display = 'none';
+  document.getElementById('binary-view').classList.remove('show');
+  document.getElementById('script-form-view').classList.remove('show');
+  const scnView = document.getElementById('scenario-form-view');
+  if (scnView) scnView.classList.remove('show');
+  // Hide the editor tab strip — irrelevant for form view
+  document.getElementById('editor-tab').style.display = 'none';
+
+  const view = document.getElementById('overlay-form-view');
+  view.classList.add('show');
+  document.getElementById('of-title').textContent = cfg.title || 'Form view';
+  document.getElementById('of-sub').textContent = cfg.subtitle || cfg.path || '';
+
+  const fieldsHost = document.getElementById('of-fields');
+  fieldsHost.innerHTML = '';
+  if (!cfg.fields.length) {
+    fieldsHost.innerHTML = '<div class="of-empty">No editable scalar fields detected. Use "Open raw…" to edit the XML directly.</div>';
+  }
+  for (const fld of cfg.fields) {
+    const row = document.createElement('div');
+    row.className = 'field-row';
+    const lab = document.createElement('label');
+    lab.textContent = fld.label || fld.tag;
+    row.appendChild(lab);
+    let inp;
+    if (fld.multiline || (fld.value && /\n/.test(fld.value)) || (fld.value && fld.value.length > 80)) {
+      inp = document.createElement('textarea');
+      inp.rows = 3;
+    } else {
+      inp = document.createElement('input');
+      inp.type = 'text';
+    }
+    inp.value = fld.value == null ? '' : fld.value;
+    inp.dataset.tag = fld.tag;
+    row.appendChild(inp);
+    fieldsHost.appendChild(row);
+  }
+
+  overlayFormState.active = { path: cfg.path, originalText: cfg.originalText || '', fields: cfg.fields, onApply: cfg.onApply, onClose: cfg.onClose };
+
+  // Wire actions (replaceWith trick to drop any prior listeners cleanly)
+  const apply = document.getElementById('of-apply');
+  const revert = document.getElementById('of-revert');
+  const close = document.getElementById('of-close');
+  const openRaw = document.getElementById('of-open-raw');
+  apply.replaceWith(apply.cloneNode(true));
+  revert.replaceWith(revert.cloneNode(true));
+  close.replaceWith(close.cloneNode(true));
+  openRaw.replaceWith(openRaw.cloneNode(true));
+  document.getElementById('of-apply').addEventListener('click', () => {
+    if (!overlayFormState.active || !overlayFormState.active.onApply) return;
+    const out = {};
+    for (const inp of fieldsHost.querySelectorAll('input,textarea')) {
+      out[inp.dataset.tag] = inp.value;
+    }
+    overlayFormState.active.onApply(out);
+  });
+  document.getElementById('of-revert').addEventListener('click', () => {
+    if (!overlayFormState.active) return;
+    for (const fld of overlayFormState.active.fields) {
+      const inp = fieldsHost.querySelector(`[data-tag="${CSS.escape(fld.tag)}"]`);
+      if (inp) inp.value = fld.value == null ? '' : fld.value;
+    }
+  });
+  document.getElementById('of-close').addEventListener('click', closeOverlayForm);
+  document.getElementById('of-open-raw').addEventListener('click', () => {
+    const path = overlayFormState.active && overlayFormState.active.path;
+    closeOverlayForm();
+    if (path && state.files[path]) openFile(path);
+  });
+
+  // Ctrl/Cmd+S → Apply (mirrors the script form's binding)
+  view.onkeydown = function (e) {
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 's' || e.key === 'S')) {
+      if (!view.classList.contains('show')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      document.getElementById('of-apply').click();
+    }
+  };
+}
+
+function closeOverlayForm() {
+  const view = document.getElementById('overlay-form-view');
+  if (!view) return;
+  view.classList.remove('show');
+  view.onkeydown = null;
+  const wasActive = overlayFormState.active;
+  overlayFormState.active = null;
+  if (wasActive && wasActive.onClose) {
+    try { wasActive.onClose(); } catch (_) {}
+  }
+  // Restore whatever the underlying file would normally show.
+  if (state.currentPath) openFile(state.currentPath);
+}
+
+// Hide the "Open as form" banner. Idempotent.
+function hideOverlayBanner() {
+  const b = document.getElementById('overlay-form-banner');
+  if (b) b.classList.remove('show');
+}
+
+// ---------- preset editor ----------
+// Detects when a .OL-jobpreset / .OL-outputpreset is opened and shows a
+// banner offering to "Open as form". The form scans the preset XML's
+// top-level scalar children (text-only elements that aren't structural
+// containers) and surfaces each as a text/textarea input. On Apply we
+// splice each new value back into the original text using replaceTagInner
+// so unknown sibling tags + indentation are preserved.
+
+const PRESET_EXTS = new Set(['ol-jobpreset', 'ol-outputpreset']);
+
+function isPresetPath(path) {
+  return PRESET_EXTS.has(extOf(path || ''));
+}
+
+// Pull every top-level child element of `root` whose only content is text
+// (no nested element children). These are the scalar fields safe to edit
+// without re-encoding nested structure.
+function extractPresetScalarFields(xmlText) {
+  const fields = [];
+  let doc;
+  try { doc = new DOMParser().parseFromString(xmlText, 'application/xml'); }
+  catch (_) { return fields; }
+  const root = doc && doc.documentElement;
+  if (!root || root.nodeName.toLowerCase() === 'parsererror') return fields;
+  for (const child of root.children || []) {
+    // Skip elements that have child elements — those are structural and
+    // need a richer editor than this generic surface.
+    const hasChildElements = Array.from(child.children || []).length > 0;
+    if (hasChildElements) continue;
+    const tag = child.localName || child.nodeName;
+    if (!tag) continue;
+    // The decoder/encoder pair already handles entity round-tripping.
+    fields.push({
+      tag,
+      label: tag,
+      value: decodeXmlEntities(child.textContent || ''),
+      multiline: (child.textContent || '').length > 80,
+    });
+  }
+  return fields;
+}
+
+function openPresetOverlay(path) {
+  const f = state.files[path];
+  if (!f || !f.isText) return;
+  const text = state.monacoModels[path] ? state.monacoModels[path].getValue() : (f.content || '');
+  const fields = extractPresetScalarFields(text);
+  hideOverlayBanner();
+  openOverlayForm({
+    path,
+    title: 'Preset editor — ' + path,
+    subtitle: extOf(path).toUpperCase() + ' · top-level scalar fields shown below; nested elements stay untouched.',
+    originalText: text,
+    fields,
+    onApply: (formValues) => {
+      // Mutate the live text by splicing each changed scalar back in.
+      let updated = text;
+      let touched = 0;
+      for (const fld of fields) {
+        const newVal = formValues[fld.tag];
+        if (newVal == null || newVal === fld.value) continue;
+        updated = replaceTagInner(updated, fld.tag, encodeXmlText(newVal));
+        touched++;
+      }
+      if (!touched) {
+        setStatus('No changes to apply.', 'warn');
+        return;
+      }
+      const model = state.monacoModels[path];
+      if (model) {
+        const range = model.getFullModelRange();
+        model.pushEditOperations([], [{ range, text: updated }], () => null);
+      }
+      f.content = updated;
+      f.dirty = true;
+      refreshTreeDirtyMarkers();
+      setStatus(`Applied ${touched} field${touched === 1 ? '' : 's'} to ${path}. Click Review & Save to write to disk.`, 'ok');
+      // Re-render the form so subsequent changes diff against the new baseline.
+      openPresetOverlay(path);
+    },
+  });
+}
+
+// Hook openFile: when a preset file is opened, show the "Open as form"
+// banner. Banner stays out of the way for non-preset files.
+(function hookPresetBanner() {
+  const _orig = openFile;
+  openFile = function (path) {
+    _orig(path);
+    const banner = document.getElementById('overlay-form-banner');
+    if (!banner) return;
+    if (isPresetPath(path)) {
+      const ext = extOf(path).toUpperCase();
+      document.getElementById('overlay-form-banner-msg').textContent =
+        `${ext} files can be edited as a form (top-level scalar fields).`;
+      banner.classList.add('show');
+    } else {
+      banner.classList.remove('show');
+    }
+  };
+  const btn = document.getElementById('overlay-form-banner-open');
+  if (btn) {
+    btn.addEventListener('click', () => {
+      if (state.currentPath && isPresetPath(state.currentPath)) {
+        openPresetOverlay(state.currentPath);
+      }
+    });
+  }
+})();
+
+// ---------- DEFERRED: form-as-overlay editors for datamodel + sections ----------
+// The plumbing above (openOverlayForm + replaceTagInner + the banner hook)
+// is reusable. Concrete datamodel-field and sections/masters editors aren't
+// shipped yet because their schemas need bespoke parse/serialize logic — a
+// generic "scalar tags only" surface (like the preset editor) would lose
+// nested <field> attributes and isn't a real win. To add them, replicate
+// the openPresetOverlay shape: parse the file, build a fields list,
+// implement the splice in onApply. Hook into the banner via a new
+// isXxxPath() check + a clause inside hookPresetBanner.
+
+})();

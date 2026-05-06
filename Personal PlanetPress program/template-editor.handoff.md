@@ -28,6 +28,16 @@ Source: Kyle's "Do this" plan from the 2026-05-06 session. Summary:
 
 **Phase 3 — modularise (2–3 days).** Carve out modules in this order, smoke-testing against `M2L-KFI.OL-template` after each: `state.js` → `recents.js` → `monaco-host.js` → `fs.js` → `tree.js` → `editor.js` → `search.js` → `review-modal.js` → `preview.js` → `scripts-panel.js`. Hoist inline `style=""` into `styles.css` opportunistically as you touch each module — don't make it a separate phase.
 
+**Phase 3 progress (2026-05-06):**
+
+- Body markup, CSS and the full inline `<script>` from `template-editor.html` were lifted into the Vite project (`template-editor/`). CSS lives in `src/styles.css`; HTML in `index.html`; the 6k-line script became `src/legacy.ts` with `// @ts-nocheck` and the original IIFE preserved. CDN tags for jszip / jsdiff / monaco loader stayed in `index.html` so the bundled module sees the same `window` globals it always did.
+- `src/main.ts` now does `import './styles.css'; import './legacy';` and that's it.
+- `state` and `recents` are real ES modules: `src/state.ts` exports a single `state` object (loose-typed `EditorState` with index signature for additive fields); `src/recents.ts` exports the pure IndexedDB + formatting helpers (`recentsAdd`, `recentsList`, `recentsRemove`, `recentsClear`, `formatRecentTime`). Both are imported at the top of `legacy.ts`.
+- The DOM-coupled bits of recents (the menu wiring, `openRecentItem`, and the `loadFromHandle` / `pickAndOpenFolder` monkey-patches) deliberately stay in `legacy.ts` — they'll move out once `fs` and `tree` are extracted.
+- `npx tsc --noEmit` is clean. `npx vite build` produces a single-file `dist/index.html` (~189 kB / 50 kB gzip). Not yet smoke-tested by Kyle against `M2L-KFI.OL-template` — that's the gating step before any further carves.
+
+The header of `legacy.ts` lists every remaining carve target with the function/section names to lift, plus the working methodology (create module → replace block with import → typecheck + build → smoke against KFI). Monkey-patches stay in `legacy.ts` until all callers/dependents have moved out, then convert to a hook system.
+
 **Phase 4 — tests + fixture (1 day).** Synthetic `.OL-template` (one field-text script, one conditional, one control script, tiny datamodel). Playwright smoke test using a hidden `<input type=file>` (File System Access API needs a real user gesture so doesn't work in headless tests). CI runs `tsc --noEmit` + Playwright.
 
 **Phase 5 — GitHub + Pages deploy (½ day).** `git init`, public repo via `gh repo create`. Deploy workflow publishes `dist/` to `gh-pages` on push to `main`. Live URL needs HTTPS for File System Access API — Pages provides this. Add live URL to README.

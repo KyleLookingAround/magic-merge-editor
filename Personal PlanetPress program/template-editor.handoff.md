@@ -1,0 +1,68 @@
+# template-editor.html — Handoff
+
+Brief for whichever AI picks this up next. Read this before touching anything.
+
+## Where we are
+
+Source: `template-editor.html` (~7,394 lines, single-file vanilla JS app).
+Backup of pre-refactor state: `template-editor.backup-pre-refactor.html` (do not delete; restore point if anything goes wrong).
+
+**Phase 0 + Phase 1 of the refactor plan are done as of 2026-05-06:**
+
+- IIFE wrapper around the whole script (`(function () { 'use strict'; … })()`).
+- `DEFAULT_SCRIPT_INDENT = ' '.repeat(16)` constant in place; no more 16-space literals.
+- Dead code from earlier patches removed: there is no longer any `if (false)` block, no duplicate `reviewAndSave`, no broken `renameFile` fragment.
+- The previously-duplicated `reviewAndSave` is now a single `async function reviewAndSave()` declaration.
+- Three CDN deps (jszip 3.10.1, jsdiff 5.1.0, monaco-editor 0.45.0 loader) are pinned **and** carry SRI `integrity` + `crossorigin="anonymous"` attributes. Note: SRI on monaco's loader does not cover the language/editor chunks it fetches dynamically.
+- Manually smoke-tested by Kyle: open `M2L-KFI.OL-template`, edit a script, Review & Save, reopen — round-trip works.
+
+What is **not** done yet (still inside the original "Phase 1"):
+
+- **XSS sweep.** ~76 `innerHTML` assignments. Most call `escapeHtml()`. The improvement plan flagged template-literal markup at lines around 4042–4046, 4111–4122, 4764, 4810, 4957, 5351, 5428 (line numbers were stale even before the cleanup; treat as hints, not coordinates). The biggest stake is `buildPreviewHtml` and its iframe sandbox attributes.
+
+## The plan (Phases 2–6) — what comes next
+
+Source: Kyle's "Do this" plan from the 2026-05-06 session. Summary:
+
+**Phase 2 — repo + tooling scaffold (½ day).** New sibling folder `template-editor/`, Vite project, `vite-plugin-singlefile` so `dist/index.html` stays self-contained. Modules under `src/`. `.gitignore` excludes `*.OL-template`, `*.OL-datamapper`, `*.docx`, `*.backup*.html`, `/dist`, `node_modules`. Sibling `fixtures/synthetic.OL-template` (hand-built, safe to commit). Sibling `tests/smoke.spec.ts` (Playwright). `.github/workflows/ci.yml` + `deploy.yml`.
+
+**Phase 3 — modularise (2–3 days).** Carve out modules in this order, smoke-testing against `M2L-KFI.OL-template` after each: `state.js` → `recents.js` → `monaco-host.js` → `fs.js` → `tree.js` → `editor.js` → `search.js` → `review-modal.js` → `preview.js` → `scripts-panel.js`. Hoist inline `style=""` into `styles.css` opportunistically as you touch each module — don't make it a separate phase.
+
+**Phase 4 — tests + fixture (1 day).** Synthetic `.OL-template` (one field-text script, one conditional, one control script, tiny datamodel). Playwright smoke test using a hidden `<input type=file>` (File System Access API needs a real user gesture so doesn't work in headless tests). CI runs `tsc --noEmit` + Playwright.
+
+**Phase 5 — GitHub + Pages deploy (½ day).** `git init`, public repo via `gh repo create`. Deploy workflow publishes `dist/` to `gh-pages` on push to `main`. Live URL needs HTTPS for File System Access API — Pages provides this. Add live URL to README.
+
+**Phase 6 — optional follow-ups.** From the original improvement plan + the 2026-05-05 audit: native-dialog → modal replacement, ARIA pass, keyboard help dialog, `buildTree` perf, debounced preview auto-refresh, FLD/IF kind chips, drag-to-reorder, bulk operations, rename-token-everywhere, vendor CDN deps via npm.
+
+## Decisions Kyle has already made
+
+- Vite + ES modules, single-file build output (`vite-plugin-singlefile`).
+- Public GitHub repo. Source + synthetic fixture only. Real client templates (`M2L-KFI`, `M2L-POA`, `.docx` files, `more2life.OL-datamapper`) are local-only via `.gitignore`.
+- License: not yet decided — ask before committing.
+- `gh` CLI is **not installed** on the workstation. Phase 5 will need it.
+
+## Conventions and gotchas — READ THESE
+
+- **The file is `.html`, not `.js`.** Inline JS lives between `<script>` near the top and `</script>` near the end. **Any literal `</script>` in a string, comment, or regex inside that block will close the outer script tag and break everything.** Always escape as `<\/script>`.
+- **OneDrive bash mount lags behind file-tool writes.** When you `Edit` or `Write` a file in this folder, `bash` may show stale content for several minutes. Use the `Read` tool to verify edits, not `cat`.
+- **PlanetPress zips use backslashes in entry names.** `state.files` keys preserve the raw zip path. Most code now handles both separators, but if you add new code that reasons about paths, normalize with `.replace(/\\/g, '/')` first.
+- **Primary smoke target: `M2L-KFI.OL-template`** (179 scripts, no CDATA). Also `M2L-POA.OL-template` and bundled `more2life.OL-datamapper`. None of these get committed.
+- **The user is Kyle, lead engineer at Finova.** Direct/concise tone, prose over bullets, save outputs to this folder, ask before doing real work if a request is ambiguous, **never overwrite originals without confirming**.
+- **Cert revocation issue with curl on this Windows machine.** Schannel rejects HTTPS with `CRYPT_E_NO_REVOCATION_CHECK`. Use Node's `https` module for any URL fetch (e.g. recomputing SRI hashes after a CDN bump).
+
+## Key files in this folder
+
+| File | Status |
+|---|---|
+| `template-editor.html` | Live source. Edit this. |
+| `template-editor.backup-pre-refactor.html` | Pre-refactor restore point. Keep. |
+| `template-editor.backup-2026*.html` | Older interim backups (pre-unlock, pre-bugfix, pre-ux-gaps, pre-scenarios). Safe to delete once Phase 5 is live. |
+| `template-editor.md` | Feature doc. Lift relevant sections into the Vite repo's `README.md` during Phase 2. |
+| `template-editor.handoff.md` | This file. |
+| `M2L-KFI.OL-template`, `M2L-POA.OL-template`, `*.docx`, `more2life.OL-datamapper` | Client assets. Local-only — must end up in the `.gitignore`. |
+| `M2L-KFI.notes.md` | Kyle's notes. Keep, do not commit. |
+| `CLAUDE.md` | Kyle's working memory for Claude. Read at session start. |
+
+## Suggested next move
+
+Finish the Phase 1 XSS sweep as a read-only audit (no changes — report findings), or skip ahead to Phase 2 scaffold. Either is fine; Kyle's call.

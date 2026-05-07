@@ -58,6 +58,7 @@
 //   4. After each carve: `npx tsc --noEmit && npx vite build`, then
 //      smoke-test the built dist/index.html against M2L-KFI.OL-template.
 import { state } from './state';
+import { on as hookOn, emit as hookEmit, emitAsync as hookEmitAsync } from './hooks';
 import { recentsAdd, recentsList, recentsRemove, recentsClear, formatRecentTime } from './recents';
 import { bootstrapMonaco, registerFieldTokenCompletion } from './monaco-host';
 import {
@@ -137,6 +138,21 @@ document.getElementById('btn-rezip').addEventListener('click', rezipAndSave);
 document.getElementById('btn-back').addEventListener('click', backToFolderList);
 document.getElementById('btn-rescan').addEventListener('click', () => state.dirHandle && scanFolderTemplates(state.dirHandle, true));
 
+// Test-only: hidden <input type=file> that loads a template without the File
+// System Access API (which requires a real user gesture Playwright can't produce).
+(function wireTestFileInput() {
+  const inp = document.querySelector('input[type=file][data-testid="load-template"]');
+  if (!inp) return;
+  inp.addEventListener('change', () => {
+    const file = inp.files && inp.files[0];
+    if (!file) return;
+    // Wrap the plain File in a handle-shaped object so loadFromHandle works unchanged.
+    const fakeHandle = { getFile: async () => file, name: file.name };
+    inp.value = ''; // reset so the same file can be reloaded
+    loadFromHandle(fakeHandle);
+  });
+})();
+
 async function pickAndOpenFile() {
   if (!window.showOpenFilePicker) {
     alert('Your browser doesn\'t support the File System Access API. Please open this in Chrome or Edge.');
@@ -187,6 +203,7 @@ async function pickAndOpenFolder() {
   document.getElementById('btn-rezip').disabled = true;
   document.getElementById('btn-save').disabled = true;
   document.getElementById('filename').textContent = `Folder: ${dirHandle.name}`;
+  await hookEmitAsync('afterPickAndOpenFolder');
 }
 
 async function scanFolderTemplates(dirHandle, isRescan) {
@@ -386,6 +403,7 @@ async function loadFromHandle(handle) {
   const firstText = Object.entries(state.files).find(([, f]) => f.isText);
   if (firstText) openFile(firstText[0]);
 
+  await hookEmitAsync('afterLoadFromHandle', handle);
 }
 
 // ---------- file tree ----------
@@ -405,6 +423,7 @@ configureTree({
 
 // ---------- editor open / commit ----------
 function openFile(path) {
+  hookEmit('beforeOpenFile', path);
   // Commit any pending live edit on the current file's model first (handled per-model)
   state.currentPath = path;
   document.querySelectorAll('.tree-item.file').forEach(el => {
@@ -430,6 +449,7 @@ function openFile(path) {
       const tries = setInterval(() => {
         if (state.monacoReady) { clearInterval(tries); openFile(path); }
       }, 100);
+      hookEmit('afterOpenFile', path);
       return;
     }
     let model = state.monacoModels[path];
@@ -471,6 +491,7 @@ function openFile(path) {
         <div>This file isn't editable as text. It will be preserved unchanged when you rezip.</div>`;
     }
   }
+  hookEmit('afterOpenFile', path);
 }
 
 function commitCurrentEdit(showStatus) {
@@ -503,6 +524,7 @@ function commitCurrentEdit(showStatus) {
   f.dirty = true; // still dirty until rezip-save writes it to disk
   refreshTreeDirtyMarkers();
   if (showStatus) setStatus('Edit committed (not yet written to disk).', 'ok');
+  hookEmit('afterCommitCurrentEdit', showStatus);
 }
 
 // validateXml carved out to ./editor.ts.
@@ -766,11 +788,9 @@ const modalEls = getModalEls();
 
 // Track standalone original so diff works for non-zip files
 // (Consumed by the live reviewAndSave defined further below.)
-const _origLoadFromHandle = loadFromHandle;
-loadFromHandle = async function (handle) {
-  await _origLoadFromHandle(handle);
+hookOn('afterLoadFromHandle', () => {
   if (state.standalone) state.standalone.original = state.standalone.content;
-};
+});
 
 // ============================================================
 // COMPARE TWO TEMPLATES
@@ -831,14 +851,11 @@ async function compareTemplates() {
 
 // zipTextMap carved out to ./review-modal.ts.
 
-// Enable Compare button once a zip-based template is open
-const _origLoad2 = loadFromHandle;
-loadFromHandle = async function (handle) {
-  await _origLoad2(handle);
+// Enable Compare button once a zip-based template is open; reset preview
+hookOn('afterLoadFromHandle', () => {
   document.getElementById('btn-compare').disabled = !state.zip;
-  // Reset preview when switching templates
   closePreview();
-};
+});
 
 // ============================================================
 // HTML PREVIEW (split iframe)
@@ -1802,12 +1819,10 @@ function applyDatamodelPersonalization(doc) {
   return tokenToValue.size;
 }
 
-// Auto-refresh preview when committing an edit to the previewed file (or one of its referenced files)
-const _origCommit = commitCurrentEdit;
-commitCurrentEdit = function (showStatus) {
-  _origCommit(showStatus);
+// Auto-refresh preview when committing an edit to the previewed file
+hookOn('afterCommitCurrentEdit', () => {
   if (previewState.open) refreshPreview();
-};
+});
 
 // Preview pane resizer
 (function () {
@@ -2582,6 +2597,7 @@ function openScriptForm(id) {
 
   // Hide save button (form has its own Apply)
   document.getElementById('btn-save').disabled = true;
+  hookEmit('afterOpenScriptForm', id);
 }
 
 // Show "type · sample value" or "no such field in datamodel" beneath a field-path input.
@@ -2801,6 +2817,7 @@ function closeScriptForm() {
     document.getElementById('binary-view').classList.remove('show');
     document.getElementById('empty').classList.remove('hidden');
   }
+  hookEmit('afterCloseScriptForm');
 }
 
 function applyScriptForm() {
@@ -3149,16 +3166,12 @@ async function openRecentItem(item) {
 }
 
 // Hook into the existing open flows so newly-opened items get recorded
-const _origLoadFromHandleForRecents = loadFromHandle;
-loadFromHandle = async function (handle) {
-  await _origLoadFromHandleForRecents(handle);
+hookOn('afterLoadFromHandle', (handle) => {
   if (handle && !state.dirHandle) recentsAdd(handle, 'file');
-};
-const _origPickAndOpenFolder = pickAndOpenFolder;
-pickAndOpenFolder = async function () {
-  await _origPickAndOpenFolder();
+});
+hookOn('afterPickAndOpenFolder', () => {
   if (state.dirHandle) recentsAdd(state.dirHandle, 'folder');
-};
+});
 
 // ============================================================
 // SCRIPT CREATE / DELETE
@@ -3317,16 +3330,12 @@ document.getElementById('btn-script-delete').addEventListener('click', () => {
 });
 
 // Keep the toolbar Delete button enabled state in sync
-const _origOpenScriptForm = openScriptForm;
-openScriptForm = function (id) {
-  _origOpenScriptForm(id);
+hookOn('afterOpenScriptForm', (id) => {
   document.getElementById('btn-script-delete').disabled = !id;
-};
-const _origCloseScriptForm = closeScriptForm;
-closeScriptForm = function () {
-  _origCloseScriptForm();
+});
+hookOn('afterCloseScriptForm', () => {
   document.getElementById('btn-script-delete').disabled = true;
-};
+});
 
 // Right-click on a script item -> Delete shortcut
 document.addEventListener('contextmenu', e => {
@@ -3952,30 +3961,29 @@ document.addEventListener('contextmenu', e => {
   // dismissal.
 });
 
-// Hook openFile to update the toolbar buttons
-const _origOpenFile = openFile;
-openFile = function (path) {
+// Close script form and update toolbar buttons on file open
+hookOn('beforeOpenFile', () => {
   document.getElementById('script-form-view').classList.remove('show');
   scriptsState.active = null;
-  _origOpenFile(path);
+});
+hookOn('afterOpenFile', () => {
   updateFileButtons();
-};
+});
 
 // Track edits to index.xml so Scripts list always reflects current text
-const _origCommit2 = commitCurrentEdit;
-commitCurrentEdit = function (showStatus) {
-  _origCommit2(showStatus);
+hookOn('afterCommitCurrentEdit', () => {
   if (state.currentPath && SCRIPT_HOST_CANDIDATES.includes(state.currentPath)) {
     refreshScriptsList();
   }
-};
+});
 
 // ============================================================
 // REZIP — include newly-added files (the original loop only walked
 // state.zip's existing entries). Also drives "added" markers in the
 // Review modal.
 // ============================================================
-const _origRezipForAdds = rezipAndSave;
+// Full override of the simple original rezipAndSave — handles added files,
+// review modal drive, and standalone mode (original is superseded entirely).
 rezipAndSave = async function () {
   if (!state.fileHandle) return;
   commitCurrentEdit(false);
@@ -4118,12 +4126,9 @@ document.getElementById('btn-rezip').addEventListener('click', () => reviewAndSa
 document.getElementById('btn-rezip').disabled = !state.fileHandle;
 
 // Whenever a template is loaded, refresh the scripts list and toolbar
-const _origLoad3 = loadFromHandle;
-loadFromHandle = async function (handle) {
-  await _origLoad3(handle);
+hookOn('afterLoadFromHandle', () => {
   refreshScriptsList();
   updateFileButtons();
-  // Refresh the navigator (sections/masters/snippets) for the new template
   if (typeof renderNavigator === 'function') renderNavigator();
   document.getElementById('btn-rezip').disabled = false;
   // Surface locked-folder status so the user knows the 🔓 Unlock button is live
@@ -4138,7 +4143,7 @@ loadFromHandle = async function (handle) {
       );
     }
   }
-};
+});
 
 
 // ============================================================================
@@ -4351,22 +4356,14 @@ function activateScenario(name, silent) {
   if (editBtn) editBtn.addEventListener('click', openScenarioFormForActive);
 })();
 
-// Hook into template loading: refresh scenarios + picker when a new file opens.
-(function hookScenariosOnLoad() {
-  const _orig = loadFromHandle;
-  loadFromHandle = async function (handle) {
-    await _orig(handle);
-    try {
-      // Reset only if we changed *which* underlying source the user is editing
-      // — keep a previously-loaded datamapper available across template switches
-      // in the same folder (common workflow: same dm, multiple templates).
-      if (!scenariosState.list.length) await autoLoadScenariosFromFolder();
-      populateScenarioPicker();
-    } catch (e) { console.warn('[scenarios] hook failed:', e); }
-    // Also refresh notes for the newly-opened template
-    try { loadNotesForCurrentTemplate(); } catch (e) { console.warn('[notes]', e); }
-  };
-})();
+// Refresh scenarios + notes whenever a new template loads
+hookOn('afterLoadFromHandle', async () => {
+  try {
+    if (!scenariosState.list.length) await autoLoadScenariosFromFolder();
+    populateScenarioPicker();
+  } catch (e) { console.warn('[scenarios] hook failed:', e); }
+  try { loadNotesForCurrentTemplate(); } catch (e) { console.warn('[notes]', e); }
+});
 
 // ---------- COVERAGE MATRIX ----------
 // Modal: table with one row per scenario, one column per Section in index.xml,
@@ -4831,29 +4828,21 @@ function pushRecentScript(s) {
   saveRecentScripts();
 }
 
-// Hook into openScriptForm to track recents
-(function hookRecentScripts() {
-  const _orig = openScriptForm;
-  openScriptForm = function (id) {
-    _orig(id);
-    const s = scriptsState.list.find(x => x.id === id);
-    if (s) {
-      pushRecentScript(s);
-      // Re-render the list so the "Recent" group reflects the new top entry
-      try { renderScriptsList(); } catch (_) {}
-    }
-  };
-  // Reload recents whenever the template changes
-  const _origLoad = loadFromHandle;
-  loadFromHandle = async function (h) {
-    await _origLoad(h);
-    loadRecentScripts();
-    if (typeof renderScriptsList === 'function') {
-      try { renderScriptsList(); } catch (_) {}
-    }
-  };
+// Track recently-opened scripts; reload list on template change
+hookOn('afterOpenScriptForm', (id) => {
+  const s = scriptsState.list.find(x => x.id === id);
+  if (s) {
+    pushRecentScript(s);
+    try { renderScriptsList(); } catch (_) {}
+  }
+});
+hookOn('afterLoadFromHandle', () => {
   loadRecentScripts();
-})();
+  if (typeof renderScriptsList === 'function') {
+    try { renderScriptsList(); } catch (_) {}
+  }
+});
+loadRecentScripts();
 
 // Inject a "Recent" group at the top of the rendered scripts list. We do this
 // by wrapping renderScriptsList and prepending DOM nodes after the original
@@ -4959,34 +4948,25 @@ function pushRecentScript(s) {
 
 // ---------- AUTO-OPEN SECTION 1 + PREVIEW ON TEMPLATE LOAD ----------
 // When a .OL-template loads, jump straight to the first section's HTML and
-// pop open the preview. Saves the user a couple of clicks every time they
-// switch templates from the folder list. Skips for files that don't have
-// sections (datamapper/datamodel/docx/standalone).
-(function autoOpenFirstSection() {
-  const _orig = loadFromHandle;
-  loadFromHandle = async function (handle) {
-    await _orig(handle);
-    // Skip for non-section hosts
-    if (state.isDocx) return;
-    if (state.standalone) return;
-    if (!scriptsState || !scriptsState.hostPath) return; // no index.xml -> nothing to do
-    let entries;
-    try { entries = parseNavigatorEntries(); } catch (_) { return; }
-    if (!entries || !entries.sections || !entries.sections.length) return;
-    // First section in document order (parseNavigatorEntries preserves it)
-    const first = entries.sections[0];
-    const target = (typeof normalizeNavPath === 'function')
-      ? normalizeNavPath(first.location)
-      : first.location;
-    if (!state.files[target]) return; // section file missing from package
-    try {
-      openFile(target);
-      // Open preview only if it makes sense (HTML file, not already open)
-      if (!previewState.open) openPreview();
-      else refreshPreview();
-    } catch (e) { console.warn('[auto-open] failed:', e); }
-  };
-})();
+// pop open the preview. Skips for files that don't have sections.
+hookOn('afterLoadFromHandle', async () => {
+  if (state.isDocx) return;
+  if (state.standalone) return;
+  if (!scriptsState || !scriptsState.hostPath) return;
+  let entries;
+  try { entries = parseNavigatorEntries(); } catch (_) { return; }
+  if (!entries || !entries.sections || !entries.sections.length) return;
+  const first = entries.sections[0];
+  const target = (typeof normalizeNavPath === 'function')
+    ? normalizeNavPath(first.location)
+    : first.location;
+  if (!state.files[target]) return;
+  try {
+    openFile(target);
+    if (!previewState.open) openPreview();
+    else refreshPreview();
+  } catch (e) { console.warn('[auto-open] failed:', e); }
+});
 
 // ============================================================
 // GENERIC OVERLAY-FORM HELPER + PRESET (.OL-jobpreset / .OL-outputpreset) EDITOR

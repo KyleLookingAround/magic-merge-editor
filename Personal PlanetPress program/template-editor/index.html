@@ -444,6 +444,15 @@
   Note: SRI on monaco's loader.js only protects the loader itself - the
   language/editor chunks it fetches dynamically are not covered.
 -->
+<!-- Hidden file input for automated tests (bypasses the File System Access API
+     which requires a real user gesture that headless Playwright can't produce).
+     The app wires a change listener in legacy.ts and wraps the File in a
+     handle-shaped object so loadFromHandle works unchanged. -->
+<input type="file"
+       data-testid="load-template"
+       style="display:none"
+       accept=".OL-template,.OL-datamapper,.OL-datamodel,.docx">
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"
         integrity="sha384-+mbV2IY1Zk/X1p/nWllGySJSUN8uMs+gUAN10Or95UBH0fpj6GfKgPmgC5EXieXG"
         crossorigin="anonymous"></script>

@@ -59,8 +59,8 @@ test.describe('round-trip via synthetic fixture', () => {
 
     // Switch to Scripts, open CustomerName form
     await page.click('#mode-scripts');
-    await expect(page.locator('.script-item').filter({ hasText: 'CustomerName' })).toBeVisible({ timeout: 10_000 });
-    await page.click('.script-item:has-text("CustomerName")');
+    await expect(page.locator('.script-item[data-script-id]').filter({ hasText: 'CustomerName' })).toBeVisible({ timeout: 10_000 });
+    await page.click('.script-item[data-script-id]:has-text("CustomerName")');
 
     // Script form should open
     await expect(page.locator('#script-form-view')).toHaveClass(/show/, { timeout: 5_000 });
@@ -70,7 +70,7 @@ test.describe('round-trip via synthetic fixture', () => {
     await page.fill('#sf-name', 'CustomerNameEdited');
     await page.click('#sf-apply');
 
-    // The scripts list should reflect the rename
-    await expect(page.locator('.script-item').filter({ hasText: 'CustomerNameEdited' })).toBeVisible({ timeout: 5_000 });
+    // The scripts list should reflect the rename (use [data-script-id] to exclude the recent-scripts strip)
+    await expect(page.locator('.script-item[data-script-id]').filter({ hasText: 'CustomerNameEdited' })).toBeVisible({ timeout: 5_000 });
   });
 });

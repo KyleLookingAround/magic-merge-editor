@@ -28,15 +28,32 @@ Source: Kyle's "Do this" plan from the 2026-05-06 session. Summary:
 
 **Phase 3 — modularise (2–3 days).** Carve out modules in this order, smoke-testing against `M2L-KFI.OL-template` after each: `state.js` → `recents.js` → `monaco-host.js` → `fs.js` → `tree.js` → `editor.js` → `search.js` → `review-modal.js` → `preview.js` → `scripts-panel.js`. Hoist inline `style=""` into `styles.css` opportunistically as you touch each module — don't make it a separate phase.
 
-**Phase 3 progress (2026-05-06):**
+**Phase 3 status (2026-05-07): all ten modules carved, build green at 189.75 kB / 50.92 kB gzip. Smoke-tested twice by Kyle against `M2L-KFI.OL-template` (once after the initial state/recents carve, once after the full chain).**
 
-- Body markup, CSS and the full inline `<script>` from `template-editor.html` were lifted into the Vite project (`template-editor/`). CSS lives in `src/styles.css`; HTML in `index.html`; the 6k-line script became `src/legacy.ts` with `// @ts-nocheck` and the original IIFE preserved. CDN tags for jszip / jsdiff / monaco loader stayed in `index.html` so the bundled module sees the same `window` globals it always did.
-- `src/main.ts` now does `import './styles.css'; import './legacy';` and that's it.
-- `state` and `recents` are real ES modules: `src/state.ts` exports a single `state` object (loose-typed `EditorState` with index signature for additive fields); `src/recents.ts` exports the pure IndexedDB + formatting helpers (`recentsAdd`, `recentsList`, `recentsRemove`, `recentsClear`, `formatRecentTime`). Both are imported at the top of `legacy.ts`.
-- The DOM-coupled bits of recents (the menu wiring, `openRecentItem`, and the `loadFromHandle` / `pickAndOpenFolder` monkey-patches) deliberately stay in `legacy.ts` — they'll move out once `fs` and `tree` are extracted.
-- `npx tsc --noEmit` is clean. `npx vite build` produces a single-file `dist/index.html` (~189 kB / 50 kB gzip). Not yet smoke-tested by Kyle against `M2L-KFI.OL-template` — that's the gating step before any further carves.
+The Vite project at `template-editor/` is now the source of truth. `template-editor.html` is reference-only — keep it for diffing against the modules until Phase 4 is in.
 
-The header of `legacy.ts` lists every remaining carve target with the function/section names to lift, plus the working methodology (create module → replace block with import → typecheck + build → smoke against KFI). Monkey-patches stay in `legacy.ts` until all callers/dependents have moved out, then convert to a hook system.
+Layout:
+
+- `index.html` — head + body + the three CDN script tags (jszip / jsdiff / monaco loader) + `<script type="module" src="/src/main.ts">`. CDN tags stay so the bundled JS sees the same `window` globals the original did.
+- `src/styles.css` — CSS lifted from the original verbatim.
+- `src/main.ts` — `import './styles.css'; import './legacy';`.
+- `src/legacy.ts` — `// @ts-nocheck` carve residue. The original IIFE is preserved; what's left is DOM event wiring, the heavy DOM-mutating flows, and the cross-section monkey-patches. Header comment lists every module + why each orchestrator stayed. **Edit logic here only as a last resort — prefer landing changes in the relevant module.**
+- `src/state.ts` — `EditorState` interface + the shared mutable `state` object.
+- `src/recents.ts` — pure IndexedDB + formatting helpers. The menu wiring, `openRecentItem`, and the `loadFromHandle` / `pickAndOpenFolder` monkey-patches are still in `legacy.ts`.
+- `src/monaco-host.ts` — `bootstrapMonaco({ onSave, onReady })` and `registerFieldTokenCompletion(langs, getFields)`. Callers pass deps in; the module imports nothing from `legacy.ts`.
+- `src/fs.ts` — extension tables (`TEXT_EXTS`, `LANG_BY_EXT`, `IMAGE_EXTS`, `ZIP_EXTS`), predicates (`extOf` / `langFor` / `isTextPath` / `isImagePath` / `isZipExt`), XML entity codecs, `indentAt`, `replaceTagInner`, `makeMemoCache`, `looksLikeText`, `decodeBytes`. Pure helpers only — handle-driven flows (`pickAndOpenFile`, `loadFromHandle`, `rezipAndSave`) stay in `legacy.ts` because they're wrapped by multiple monkey-patches.
+- `src/tree.ts` — `buildTree`, `renderNode`, `refreshTreeDirtyMarkers`, `escapeHtml`. Wires legacy callbacks via `configureTree({ isLockedFolderMarker, openFile })`.
+- `src/editor.ts` — `validateXml` + `formatXml`. The dead `_formatXmlOldRestore` placeholder that lived alongside `formatXml` is dropped — it was unreachable and referenced never-defined names.
+- `src/search.ts` — `appendSearchFile` + `renderSnippet`. Wires legacy callback via `configureSearch({ openFile })`. The driver (`runSearch`), the sidebar toggle (`setSidebarMode`) and the script-panel jump (`jumpToSearch`) stay in `legacy.ts`.
+- `src/review-modal.ts` — `openModal` / `closeModal` / `renderDiff` (lazy-cached `modalEls` + dismiss handlers wired on first call), plus the pure JSZip helper `zipTextMap`. `compareTemplates` and `reviewAndSave` stay in `legacy.ts` (both reach into `commitCurrentEdit` / `loadFromHandle` / monkey-patches).
+- `src/preview.ts` — `ZOOM_STEPS` and `collectUnresolvedTokens` (pure DOM walker). The orchestrators (`togglePreview` / `openPreview` / `closePreview` / `refreshPreview` / `buildPreviewHtml` / `parseDocxTheme` / `renderThemePanel` / `buildThemeCss` / `applyDatamodelPersonalization` / `renderTokensStrip` / `renderCssView` / `attachTokenJumpHandlers`) all stay in `legacy.ts` — they depend on legacy-resident state shells (`scriptsState`, `scenariosState`, `themeState`) and the blob-URL cache.
+- `src/scripts-panel.ts` — `parseScriptsFromXml`, `serializeScriptBack`, `buildNewScriptXml`, `stripCdataKeepingOffsets`, `parseDatamodelFields`, `dmTypeToFormType`, `SCRIPT_HOST_CANDIDATES`. Typed: `ParsedScript`, `ScriptForm`, `DatamodelField`, `ScriptKind`. Note: literal `</script>` strings inside this module are escaped as `<\/script>` to survive Vite's HTML inlining (CLAUDE.md gotcha).
+
+Phase 4 starting points:
+
+1. Move `scriptsState` / `scenariosState` / `themeState` shells into `scripts-panel.ts` (and a future `scenarios.ts` / a section inside `preview.ts`). That unlocks the preview orchestrators and the script panel renderers.
+2. Replace the cross-section monkey-patches around `loadFromHandle`, `commitCurrentEdit`, `openFile`, `pickAndOpenFolder` with a small hook registry (e.g. `hooks.afterLoadFromHandle.add(fn)`). Then the orchestrators can move into modules wholesale.
+3. The Phase 1 XSS sweep is still pending — the DOM-rendering modules (`tree`, `search`, `review-modal`, `preview` orchestrators left in legacy) all use `innerHTML` with template literals; audit each one and prefer DOM APIs for any user-controlled content.
 
 **Phase 4 — tests + fixture (1 day).** Synthetic `.OL-template` (one field-text script, one conditional, one control script, tiny datamodel). Playwright smoke test using a hidden `<input type=file>` (File System Access API needs a real user gesture so doesn't work in headless tests). CI runs `tsc --noEmit` + Playwright.
 

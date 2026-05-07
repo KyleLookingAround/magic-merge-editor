@@ -1,50 +1,60 @@
 // @ts-nocheck
-// Phase 3 baseline: lightly-modified copy of the inline <script> from
-// template-editor.html (lines 1394-7387). Do NOT edit logic here -
-// modifications belong in extracted ES modules.
+// Phase 3 carve residue. The original inline <script> from
+// template-editor.html (lines 1394-7387) lived here verbatim at the
+// start of Phase 3; the pure helpers have since been extracted into
+// the ES modules imported below. What remains is the orchestration
+// glue: DOM event wiring, the heavy DOM-mutating flows (openFile,
+// commitCurrentEdit, rezipAndSave, refreshScriptsList, openScriptForm,
+// the preview pipeline, scenarios, notes, navigator, locked-folder
+// unlock, file add/rename/delete, preset overlay), and the
+// cross-section monkey-patches that stitch them together.
 //
-// Already carved (real ES modules, imported below):
-//   state    -> ./state.ts
-//   recents  -> ./recents.ts (pure DB + format helpers; menu wiring still here)
+// All ten Phase 3 carve targets now have real modules:
+//   state         -> ./state.ts
+//   recents       -> ./recents.ts (pure DB + format helpers; menu
+//                    wiring + openRecentItem stay here for now)
+//   monaco-host   -> ./monaco-host.ts (bootstrap + completion provider)
+//   fs            -> ./fs.ts (ext tables, predicates, XML codecs,
+//                    decodeBytes / looksLikeText / makeMemoCache)
+//   tree          -> ./tree.ts (buildTree + renderNode +
+//                    refreshTreeDirtyMarkers + escapeHtml)
+//   editor        -> ./editor.ts (validateXml + formatXml)
+//   search        -> ./search.ts (appendSearchFile + renderSnippet)
+//   review-modal  -> ./review-modal.ts (openModal/closeModal/renderDiff
+//                    + zipTextMap)
+//   preview       -> ./preview.ts (ZOOM_STEPS + collectUnresolvedTokens)
+//   scripts-panel -> ./scripts-panel.ts (parseScriptsFromXml +
+//                    serializeScriptBack + buildNewScriptXml +
+//                    parseDatamodelFields + dmTypeToFormType +
+//                    stripCdataKeepingOffsets + SCRIPT_HOST_CANDIDATES)
 //
-// Still to carve (search this file for "CARVE:" anchors):
-//   monaco-host    - require.config + monaco bootstrap (~line 22)
-//                    + registerFieldTokenCompletion
-//   fs             - pickAndOpenFile / pickAndOpenFolder / scanFolderTemplates
-//                    / loadFromHandle / rezipAndSave / decodeBytes / decodeXmlEntities
-//                    / encodeXmlText / encodeXmlAttr / TEXT_EXTS / LANG_BY_EXT / extOf
-//   tree           - buildTree / renderNode / refreshTreeDirtyMarkers / revealInTree
-//                    / file add-rename-delete (promptNewFile / renameFile / deleteFile
-//                    / openNewFileModal / openContextMenu) + locked-folder unlock
-//   editor         - openFile / commitCurrentEdit / validateXml / formatCurrent
-//                    / formatXml + Monaco model management
-//   search         - setSidebarMode / runSearch / appendSearchFile / renderSnippet
-//                    / jumpToSearch
-//   review-modal   - openModal / closeModal / renderDiff / reviewAndSave
-//                    / compareTemplates / zipTextMap
-//   preview        - togglePreview / openPreview / closePreview / refreshPreview
-//                    / buildPreviewHtml + zoom controls + token-jump handlers
-//                    + DOCX theme extractor (parseDocxTheme / renderThemePanel
-//                    / buildThemeCss) + applyDatamodelPersonalization
-//                    + collectUnresolvedTokens + renderTokensStrip + renderCssView
-//   scripts-panel  - parseScriptsFromXml / serializeScriptBack / refreshScriptsList
-//                    / renderScriptsList / openScriptForm / closeScriptForm
-//                    / applyScriptForm / createScript / deleteScript / cloneScript
-//                    / toggleScriptEnabled / moveScript / bulk* / scenario* / notes*
-//                    / recentScripts* / openCoverageMatrix / openScenarioDiff
-//                    / openOverlayForm / openPresetOverlay / parseDatamodelFields
-//                    / renderNavigator
+// What's still here (and why) - the pieces above were the pure-leaning
+// cuts. The DOM-coupled orchestrators stayed for these reasons:
+//   - openFile / commitCurrentEdit / loadFromHandle / pickAndOpenFile /
+//     rezipAndSave are wrapped by 12+ cross-section monkey-patches.
+//     They have to move together with their patch chains - phase 4
+//     work, ideally as a real hook system.
+//   - setSidebarMode / refreshScriptsList / openScriptForm /
+//     applyScriptForm / createScript / cloneScript / moveScript /
+//     bulk* lean on the legacy-resident scriptsState / scenariosState
+//     / themeState shells. Move those state shells into ./scripts-panel.ts
+//     before pulling the orchestrators out.
+//   - parseDocxTheme / buildThemeCss / renderThemePanel / refreshPreview
+//     / buildPreviewHtml depend on themeState + the blob-URL cache.
+//   - File add/rename/delete dialogs (promptNewFile / renameFile /
+//     deleteFile / openNewFileModal / openContextMenu) and
+//     revealInTree call into commitCurrentEdit + setStatus + openFile.
 //
 // External globals (JSZip, Diff, monaco loader) are still loaded
 // from CDN <script> tags in index.html and remain on window.
 //
-// Carve methodology that worked for state/recents:
+// Carve methodology (worked for all ten):
 //   1. Create src/<name>.ts exporting the pure functions/types.
-//   2. Replace the in-place block here with a "CARVE:" comment + import
-//      added at the top of this file.
+//   2. Replace the in-place block here with a one-line carve marker
+//      and add the import at the top of this file.
 //   3. For monkey-patches (`const _orig = X; X = async function ...`),
-//      keep both the original and the patch in legacy.ts until ALL
-//      callers/dependents have moved out, then convert to a hook system.
+//      keep both the original and the patch here until ALL
+//      callers/dependents have moved out.
 //   4. After each carve: `npx tsc --noEmit && npx vite build`, then
 //      smoke-test the built dist/index.html against M2L-KFI.OL-template.
 import { state } from './state';
@@ -59,6 +69,17 @@ import {
 import { buildTree, refreshTreeDirtyMarkers, escapeHtml, configureTree } from './tree';
 import { validateXml, formatXml } from './editor';
 import { appendSearchFile, renderSnippet, configureSearch } from './search';
+import { openModal, closeModal, renderDiff, zipTextMap, getModalEls } from './review-modal';
+import { ZOOM_STEPS, collectUnresolvedTokens } from './preview';
+import {
+  SCRIPT_HOST_CANDIDATES,
+  stripCdataKeepingOffsets,
+  parseScriptsFromXml,
+  serializeScriptBack,
+  buildNewScriptXml,
+  parseDatamodelFields,
+  dmTypeToFormType,
+} from './scripts-panel';
 
 (function () {
 'use strict';
@@ -737,66 +758,11 @@ configureSearch({ openFile: path => openFile(path) });
 // ============================================================
 // MODAL helpers
 // ============================================================
-const modalEls = {
-  backdrop: document.getElementById('modal-backdrop'),
-  title: document.getElementById('modal-title'),
-  sidebar: document.getElementById('modal-sidebar'),
-  main: document.getElementById('modal-main'),
-  status: document.getElementById('modal-status'),
-  cancel: document.getElementById('modal-cancel'),
-  action: document.getElementById('modal-action'),
-  close: document.getElementById('modal-close'),
-};
-modalEls.close.addEventListener('click', closeModal);
-modalEls.cancel.addEventListener('click', closeModal);
-modalEls.backdrop.addEventListener('click', e => { if (e.target === modalEls.backdrop) closeModal(); });
-document.addEventListener('keydown', e => { if (e.key === 'Escape' && modalEls.backdrop.classList.contains('show')) closeModal(); });
-
-function openModal(title, actionLabel, onAction) {
-  modalEls.title.textContent = title;
-  modalEls.action.textContent = actionLabel;
-  modalEls.action.onclick = onAction;
-  modalEls.backdrop.classList.add('show');
-}
-function closeModal() {
-  modalEls.backdrop.classList.remove('show');
-  modalEls.sidebar.innerHTML = '';
-  modalEls.main.innerHTML = '<div class="diff-empty">Pick a file on the left.</div>';
-  modalEls.status.textContent = '';
-  modalEls.action.onclick = null;
-}
-
-function renderDiff(originalText, currentText) {
-  const main = modalEls.main;
-  if (!window.Diff) { main.innerHTML = '<div class="diff-empty">diff library failed to load.</div>'; return; }
-  if (originalText === currentText) {
-    main.innerHTML = '<div class="diff-empty">No changes.</div>';
-    return;
-  }
-  const patch = Diff.structuredPatch('original', 'current', originalText || '', currentText || '', '', '', { context: 3 });
-  const frag = document.createDocumentFragment();
-  if (!patch.hunks.length) {
-    main.innerHTML = '<div class="diff-empty">No textual differences.</div>';
-    return;
-  }
-  for (const hunk of patch.hunks) {
-    const h = document.createElement('div');
-    h.className = 'diff-hunk-header';
-    h.textContent = `@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@`;
-    frag.appendChild(h);
-    for (const ln of hunk.lines) {
-      const el = document.createElement('div');
-      el.className = 'diff-line ' + (ln[0] === '+' ? 'add' : ln[0] === '-' ? 'del' : 'ctx');
-      el.textContent = ln.slice(1);
-      frag.appendChild(el);
-    }
-  }
-  const wrap = document.createElement('div');
-  wrap.className = 'diff-pane';
-  wrap.appendChild(frag);
-  main.innerHTML = '';
-  main.appendChild(wrap);
-}
+// modalEls / openModal / closeModal / renderDiff carved out to
+// ./review-modal.ts. Legacy code that still pokes the modal sidebar
+// / main / status directly (compareTemplates, reviewAndSave) goes
+// through getModalEls() to grab the cached element references.
+const modalEls = getModalEls();
 
 // Track standalone original so diff works for non-zip files
 // (Consumed by the live reviewAndSave defined further below.)
@@ -863,18 +829,7 @@ async function compareTemplates() {
   setStatus('', '');
 }
 
-async function zipTextMap(zip) {
-  const out = {};
-  const paths = [];
-  zip.forEach((p, e) => { if (!e.dir) paths.push(p); });
-  for (const p of paths) {
-    const bytes = await zip.file(p).async('uint8array');
-    if (isTextPath(p) || (!isImagePath(p) && looksLikeText(bytes))) {
-      try { out[p] = decodeBytes(bytes); } catch (_) { /* skip */ }
-    }
-  }
-  return out;
-}
+// zipTextMap carved out to ./review-modal.ts.
 
 // Enable Compare button once a zip-based template is open
 const _origLoad2 = loadFromHandle;
@@ -901,7 +856,7 @@ const previewState = {
   unresolved: [], // distinct @tokens@ the last render couldn't resolve
   tokensDismissed: false, // user clicked × on the strip — re-show on refresh
 };
-const ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];
+// ZOOM_STEPS carved out to ./preview.ts.
 
 document.getElementById('btn-preview').addEventListener('click', togglePreview);
 document.getElementById('btn-preview-refresh').addEventListener('click', refreshPreview);
@@ -1744,36 +1699,7 @@ function buildPreviewHtml(htmlPath, htmlText, opts) {
 // Walk the body and surface every @token@-shaped string that's still present
 // after substitution (or the full set, in raw mode). Returns a sorted, deduped
 // array of token strings, e.g. ['@LenderName@', '@MissingField@'].
-function collectUnresolvedTokens(doc) {
-  if (!doc || !doc.body) return [];
-  const re = /@[A-Za-z0-9_./\-]+@/g;
-  const found = new Set();
-  // Text nodes (skip script/style — those aren't user-visible content)
-  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
-    acceptNode(n) {
-      if (n.parentNode && /^(SCRIPT|STYLE)$/i.test(n.parentNode.nodeName)) return NodeFilter.FILTER_REJECT;
-      return NodeFilter.FILTER_ACCEPT;
-    },
-  });
-  let n;
-  while ((n = walker.nextNode())) {
-    const v = n.nodeValue;
-    if (!v) continue;
-    let m; re.lastIndex = 0;
-    while ((m = re.exec(v)) !== null) found.add(m[0]);
-  }
-  // Token-bearing attributes
-  doc.body.querySelectorAll('[alt],[title],[href],[src],[value]').forEach(el => {
-    ['alt','title','href','src','value'].forEach(attr => {
-      if (!el.hasAttribute(attr)) return;
-      const v = el.getAttribute(attr);
-      if (!v) return;
-      let m; re.lastIndex = 0;
-      while ((m = re.exec(v)) !== null) found.add(m[0]);
-    });
-  });
-  return Array.from(found).sort();
-}
+// collectUnresolvedTokens carved out to ./preview.ts.
 
 // Substitute @field@ placeholders and apply conditional show/hide rules from
 // the script blocks in index.xml. Returns how many distinct fields resolved.
@@ -1919,7 +1845,7 @@ const scriptsState = {
   usagesCache: makeMemoCache(),
 };
 
-const SCRIPT_HOST_CANDIDATES = ['index.xml'];
+// SCRIPT_HOST_CANDIDATES carved out to ./scripts-panel.ts.
 
 // Strip CDATA sections by replacing each one with same-length whitespace.
 // We need length parity so that match offsets we pull off `safe` are still
@@ -1927,137 +1853,13 @@ const SCRIPT_HOST_CANDIDATES = ['index.xml'];
 // captured for splice-back later. Inside `inner`, content that originally
 // lived inside CDATA is now blanked out (so a literal "<script>" or
 // "<\/script>" hiding inside JS source no longer fools the outer regex).
-function stripCdataKeepingOffsets(text) {
-  return text.replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, m => ' '.repeat(m.length));
-}
+// stripCdataKeepingOffsets carved out to ./scripts-panel.ts.
 
 // Parse all <script>…<\/script> blocks from a chunk of XML text.
 // We use a regex on the raw text (rather than DOMParser) so we can
 // later splice the edited XML back into the file at the same location
 // without disturbing whitespace, comments or namespaces around it.
-function parseScriptsFromXml(xmlText) {
-  const scripts = [];
-  // Run the script-block regex against a CDATA-stripped working copy so a
-  // literal end-script tag buried inside CDATA can't terminate a real block
-  // early. Same-length blanking keeps every match offset valid against
-  // `xmlText` for downstream slicing/splicing.
-  const safe = stripCdataKeepingOffsets(xmlText);
-  // Match <script type="...">...<\/script>. type may be missing (rare).
-  const re = /<script(\s[^>]*)?>([\s\S]*?)<\/script>/g;
-  let m, idx = 0;
-  while ((m = re.exec(safe)) !== null) {
-    const fullStart = m.index;
-    const fullEnd = re.lastIndex;
-    const attrs = m[1] || '';
-    // Use the ORIGINAL text for inner so CDATA contents are preserved when
-    // we hand them to the form (a control script's source lives in CDATA).
-    // Recompute the inner span by stripping the opening/closing tags from
-    // the captured raw chunk.
-    const rawChunk = xmlText.slice(fullStart, fullEnd);
-    const openMatch = /^<script(\s[^>]*)?>/.exec(rawChunk);
-    const inner = openMatch
-      ? rawChunk.slice(openMatch[0].length, rawChunk.length - '<\/script>'.length)
-      : m[2];
-    const typeMatch = /\btype\s*=\s*"([^"]*)"/.exec(attrs);
-    const type = typeMatch ? typeMatch[1] : '';
-    // Pluck simple top-level fields (only first occurrence, top-level — these are inside <script>)
-    function pluck(tag) {
-      const r = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`);
-      const mm = r.exec(inner);
-      return mm ? mm[1] : null;
-    }
-    function pluckEmpty(tag) {
-      // also handle <tag/> empty-element form
-      if (new RegExp(`<${tag}\\s*/>`).test(inner)) return '';
-      return pluck(tag);
-    }
-    const name = pluckEmpty('name') ?? '';
-    const findText = pluckEmpty('findText') ?? '';
-    const enabled = (pluckEmpty('enabled') || '').trim() !== 'false';
-    const scope = (pluckEmpty('scope') || 'NONE').trim();
-    const selectorText = pluckEmpty('selectorText') ?? '';
-    const selectorType = (pluckEmpty('selectorType') || 'TEXT').trim();
-    const source = pluckEmpty('source') ?? '';
-
-    // STANDARD scripts have a TextScriptModel block
-    let fieldPath = '', fieldType = '', prefix = '', suffix = '', formatType = 'NONE', insertMethod = 'HTML';
-    const tsm = /<com\.objectiflune\.scripting\.text\.TextScriptModel[^>]*>([\s\S]*?)<\/com\.objectiflune\.scripting\.text\.TextScriptModel>/.exec(inner);
-    if (tsm) {
-      const tsmInner = tsm[1];
-      const fp = /<path>([\s\S]*?)<\/path>/.exec(tsmInner);
-      if (fp) fieldPath = fp[1];
-      const ft = /<entry>[\s\S]*?<field>[\s\S]*?<type>([\s\S]*?)<\/type>/.exec(tsmInner);
-      if (ft) fieldType = ft[1].trim();
-      const pf = /<prefix>([\s\S]*?)<\/prefix>/.exec(tsmInner);
-      if (pf) prefix = pf[1];
-      const sf = /<suffix>([\s\S]*?)<\/suffix>/.exec(tsmInner);
-      if (sf) suffix = sf[1];
-      const fmt = /<format(?:\s+type="([^"]*)")?\s*\/?>/.exec(tsmInner);
-      if (fmt && fmt[1]) formatType = fmt[1];
-      const im = /<insertMethod>([\s\S]*?)<\/insertMethod>/.exec(tsmInner);
-      if (im) insertMethod = im[1].trim();
-      // Empty-element prefix/suffix
-      if (prefix === null && /<prefix\s*\/>/.test(tsmInner)) prefix = '';
-      if (suffix === null && /<suffix\s*\/>/.test(tsmInner)) suffix = '';
-    }
-
-    // CONDITIONAL scripts have a ConditionalScriptModel block — show/hide based on a field+value comparison
-    let isConditional = false, condField = '', condFieldType = '', condValue = '', condition = 'EQUAL_TO', condAction = 'SHOW', condCaseInsensitive = false, condToggleVisibility = true;
-    const csm = /<com\.objectiflune\.scripting\.conditional\.ConditionalScriptModel[^>]*>([\s\S]*?)<\/com\.objectiflune\.scripting\.conditional\.ConditionalScriptModel>/.exec(inner);
-    if (csm) {
-      isConditional = true;
-      const ci = csm[1];
-      const cf = /<field>[\s\S]*?<path>([\s\S]*?)<\/path>/.exec(ci);
-      if (cf) condField = cf[1];
-      const cft = /<field>[\s\S]*?<type>([\s\S]*?)<\/type>/.exec(ci);
-      if (cft) condFieldType = cft[1].trim();
-      const cv = /<value>([\s\S]*?)<\/value>/.exec(ci);
-      if (cv) condValue = cv[1];
-      const cc = /<condition>([\s\S]*?)<\/condition>/.exec(ci);
-      if (cc) condition = cc[1].trim();
-      const ca = /<action>([\s\S]*?)<\/action>/.exec(ci);
-      if (ca) condAction = ca[1].trim();
-      const cci = /<caseInsensitive>([\s\S]*?)<\/caseInsensitive>/.exec(ci);
-      if (cci) condCaseInsensitive = cci[1].trim() === 'true';
-      const ctv = /<toggleVisibility>([\s\S]*?)<\/toggleVisibility>/.exec(ci);
-      if (ctv) condToggleVisibility = ctv[1].trim() === 'true';
-    }
-
-    scripts.push({
-      id: 'sc' + (idx++),
-      name: decodeXmlEntities(name || ''),
-      type,
-      kind: isConditional ? 'CONDITIONAL' : (tsm ? 'TEXT' : (type === 'CONTROL' ? 'CONTROL' : 'OTHER')),
-      findText: decodeXmlEntities(findText || ''),
-      enabled,
-      scope,
-      selectorText: decodeXmlEntities(selectorText || ''),
-      selectorType,
-      source: decodeXmlEntities(source || ''),
-      fieldPath,
-      fieldType,
-      prefix: decodeXmlEntities(prefix || ''),
-      suffix: decodeXmlEntities(suffix || ''),
-      formatType,
-      insertMethod,
-      // Conditional script fields
-      isConditional,
-      condField: decodeXmlEntities(condField || ''),
-      condFieldType,
-      condValue: decodeXmlEntities(condValue || ''),
-      condition,
-      condAction,
-      condCaseInsensitive,
-      condToggleVisibility,
-      _start: fullStart,
-      _end: fullEnd,
-      // Use the original text for _raw — m[0] would be the CDATA-blanked
-      // working copy, and we splice _raw back into the file later.
-      _raw: rawChunk,
-    });
-  }
-  return scripts;
-}
+// parseScriptsFromXml carved out to ./scripts-panel.ts.
 
 // decodeXmlEntities / encodeXmlText / encodeXmlAttr now live in the shared
 // utilities region near the top of this script (search for "shared XML / text
@@ -2070,54 +1872,7 @@ function parseScriptsFromXml(xmlText) {
 
 // Build the new <script>…<\/script> XML using the form values, then splice it
 // back into the index.xml content at the same byte offsets it came from.
-function serializeScriptBack(orig, form) {
-  let raw = orig._raw;
-
-  // simple text fields
-  raw = replaceTagInner(raw, 'name', encodeXmlText(form.name));
-  raw = replaceTagInner(raw, 'findText', encodeXmlText(form.findText));
-  raw = replaceTagInner(raw, 'enabled', form.enabled ? 'true' : 'false');
-  raw = replaceTagInner(raw, 'scope', encodeXmlText(form.scope));
-  raw = replaceTagInner(raw, 'selectorType', encodeXmlText(form.selectorType));
-  raw = replaceTagInner(raw, 'selectorText', encodeXmlText(form.selectorText));
-  raw = replaceTagInner(raw, 'source', encodeXmlText(form.source));
-
-  // TEXT script block (TextScriptModel)
-  if (/TextScriptModel/.test(raw)) {
-    raw = raw.replace(/(<field>\s*<path>)([\s\S]*?)(<\/path>)/, (_m, a, _b, c) => `${a}${encodeXmlText(form.fieldPath)}${c}`);
-    raw = raw.replace(/(<field>[\s\S]*?<type>)([\s\S]*?)(<\/type>)/, (_m, a, _b, c) => `${a}${encodeXmlText(form.fieldType)}${c}`);
-    raw = raw.replace(/<prefix\s*\/>/, '<prefix></prefix>');
-    raw = raw.replace(/(<prefix>)([\s\S]*?)(<\/prefix>)/, (_m, a, _b, c) => `${a}${encodeXmlText(form.prefix)}${c}`);
-    raw = raw.replace(/<suffix\s*\/>/, '<suffix></suffix>');
-    raw = raw.replace(/(<suffix>)([\s\S]*?)(<\/suffix>)/, (_m, a, _b, c) => `${a}${encodeXmlText(form.suffix)}${c}`);
-    raw = raw.replace(/<format(\s+type="[^"]*")?\s*\/>/, `<format type="${encodeXmlAttr(form.formatType || 'NONE')}"/>`);
-    raw = raw.replace(/(<insertMethod>)([\s\S]*?)(<\/insertMethod>)/, (_m, a, _b, c) => `${a}${encodeXmlText(form.insertMethod)}${c}`);
-  }
-
-  // CONDITIONAL script block (ConditionalScriptModel)
-  if (/ConditionalScriptModel/.test(raw) && form.isConditional) {
-    // Field path (inside ConditionalScriptModel only — first <path> within that block)
-    // Use a single regex that matches inside the conditional block
-    raw = raw.replace(
-      /(<com\.objectiflune\.scripting\.conditional\.ConditionalScriptModel[^>]*>[\s\S]*?<field>[\s\S]*?<path>)([\s\S]*?)(<\/path>)/,
-      (_m, a, _b, c) => `${a}${encodeXmlText(form.condField)}${c}`
-    );
-    raw = raw.replace(
-      /(<com\.objectiflune\.scripting\.conditional\.ConditionalScriptModel[^>]*>[\s\S]*?<field>[\s\S]*?<type>)([\s\S]*?)(<\/type>)/,
-      (_m, a, _b, c) => `${a}${encodeXmlText(form.condFieldType)}${c}`
-    );
-    raw = raw.replace(/(<condition>)([\s\S]*?)(<\/condition>)/, (_m, a, _b, c) => `${a}${encodeXmlText(form.condition)}${c}`);
-    raw = raw.replace(
-      /(<com\.objectiflune\.scripting\.conditional\.ConditionalScriptModel[^>]*>[\s\S]*?<value>)([\s\S]*?)(<\/value>)/,
-      (_m, a, _b, c) => `${a}${encodeXmlText(form.condValue)}${c}`
-    );
-    raw = raw.replace(/(<action>)([\s\S]*?)(<\/action>)/, (_m, a, _b, c) => `${a}${encodeXmlText(form.condAction)}${c}`);
-    raw = raw.replace(/(<caseInsensitive>)([\s\S]*?)(<\/caseInsensitive>)/, (_m, a, _b, c) => `${a}${form.condCaseInsensitive ? 'true' : 'false'}${c}`);
-    raw = raw.replace(/(<toggleVisibility>)([\s\S]*?)(<\/toggleVisibility>)/, (_m, a, _b, c) => `${a}${form.condToggleVisibility ? 'true' : 'false'}${c}`);
-  }
-
-  return raw;
-}
+// serializeScriptBack carved out to ./scripts-panel.ts.
 
 // Find a host file (index.xml) and reload the scripts list from its current text.
 function refreshScriptsList() {
@@ -2167,44 +1922,7 @@ function findDatamodelPath() {
   return null;
 }
 
-function parseDatamodelFields(xmlText) {
-  // Returns a flat list of { path, type } — paths use dotted notation for tables.
-  const out = [];
-  let doc;
-  try {
-    doc = new DOMParser().parseFromString(xmlText, 'application/xml');
-  } catch (_) { return out; }
-  const root = doc.documentElement;
-  if (!root || root.nodeName.toLowerCase() === 'parsererror') return out;
-
-  function walk(node, prefix) {
-    // Direct children first; then recurse into table/configs.
-    for (const child of node.children || []) {
-      const tag = child.localName || child.nodeName;
-      if (tag === 'configs') {
-        // <configs> wraps the actual fields/tables in a datamodel
-        walk(child, prefix);
-      } else if (tag === 'field') {
-        const name = child.getAttribute('name');
-        const type = child.getAttribute('type') || '';
-        const lastValue = child.getAttribute('lastValue');
-        if (name) out.push({ path: prefix + name, type, lastValue: lastValue == null ? '' : lastValue });
-      } else if (tag === 'table') {
-        const name = child.getAttribute('name');
-        if (name) {
-          // Tables are also addressable as a path (returns array)
-          out.push({ path: prefix + name, type: 'table' });
-          walk(child, prefix + name + '.');
-        }
-      } else {
-        // Unknown structural wrapper — recurse anyway in case nesting differs
-        walk(child, prefix);
-      }
-    }
-  }
-  walk(root, '');
-  return out;
-}
+// parseDatamodelFields carved out to ./scripts-panel.ts.
 
 function refreshDatamodelFields() {
   const list = document.getElementById('datamodel-fields');
@@ -2231,20 +1949,7 @@ function refreshDatamodelFields() {
 }
 
 // PlanetPress field types map onto the form's <select> options.
-function dmTypeToFormType(dmType) {
-  const t = (dmType || '').toLowerCase();
-  if (t === 'string') return 'STRING';
-  if (t === 'boolean') return 'BOOLEAN';
-  if (t === 'integer') return 'INTEGER';
-  if (t === 'float' || t === 'number') return 'FLOAT';
-  if (t === 'currency') return 'CURRENCY';
-  if (t === 'date') return 'DATE';
-  if (t === 'datetime') return 'DATETIME';
-  if (t === 'time') return 'TIME';
-  if (t === 'html' || t === 'htmlstring') return 'HTMLSTRING';
-  if (t === 'object') return 'OBJECT';
-  return null;
-}
+// dmTypeToFormType carved out to ./scripts-panel.ts.
 
 // Helper: when a known field is picked, auto-set the matching type select.
 function bindFieldPathAutotype(pathInputId, typeSelectId) {
@@ -3458,56 +3163,7 @@ pickAndOpenFolder = async function () {
 // ============================================================
 // SCRIPT CREATE / DELETE
 // ============================================================
-function buildNewScriptXml(kind, name, indent) {
-  // indent is the leading whitespace of an existing sibling script (so we
-  // match the surrounding indentation rather than guessing).
-  const ind = indent || DEFAULT_SCRIPT_INDENT;
-  const nm = encodeXmlText(name || (kind === 'CONTROL' ? 'New Control' : 'NewField'));
-  if (kind === 'CONTROL') {
-    return [
-      `<script type="CONTROL">`,
-      `${ind}    <enabled>true</enabled>`,
-      `${ind}    <findText></findText>`,
-      `${ind}    <name>${nm}</name>`,
-      `${ind}    <origin/>`,
-      `${ind}    <scope>NONE</scope>`,
-      `${ind}    <selectorText></selectorText>`,
-      `${ind}    <selectorType>QUERY</selectorType>`,
-      `${ind}    <source>// new control script</source>`,
-      `${ind}<\/script>`,
-    ].join('\n');
-  }
-  // STANDARD
-  return [
-    `<script type="STANDARD">`,
-    `${ind}    <com.objectiflune.scripting.text.TextScriptModel schemaVersion="1.0.0.1">`,
-    `${ind}        <entry>`,
-    `${ind}            <field>`,
-    `${ind}                <path>${nm}</path>`,
-    `${ind}                <type>STRING</type>`,
-    `${ind}            </field>`,
-    `${ind}            <fieldFormatString>`,
-    `${ind}                <type>NONE</type>`,
-    `${ind}            </fieldFormatString>`,
-    `${ind}            <format type="NONE"/>`,
-    `${ind}            <prefix></prefix>`,
-    `${ind}            <suffix></suffix>`,
-    `${ind}        </entry>`,
-    `${ind}        <attribute></attribute>`,
-    `${ind}        <convertToJSON>false</convertToJSON>`,
-    `${ind}        <insertMethod>HTML</insertMethod>`,
-    `${ind}    </com.objectiflune.scripting.text.TextScriptModel>`,
-    `${ind}    <enabled>true</enabled>`,
-    `${ind}    <findText>@${nm}@</findText>`,
-    `${ind}    <name>${nm}</name>`,
-    `${ind}    <origin/>`,
-    `${ind}    <scope>RESULT_SET</scope>`,
-    `${ind}    <selectorText></selectorText>`,
-    `${ind}    <selectorType>TEXT</selectorType>`,
-    `${ind}    <source></source>`,
-    `${ind}<\/script>`,
-  ].join('\n');
-}
+// buildNewScriptXml carved out to ./scripts-panel.ts.
 
 // indentAt now lives in the shared utilities region near the top of this
 // script (search for "shared XML / text helpers"). Same behaviour, just

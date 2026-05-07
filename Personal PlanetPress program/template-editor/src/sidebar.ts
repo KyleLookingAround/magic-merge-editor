@@ -2,17 +2,14 @@
 // Handles all sidebar panel modes: files, nav, scripts, search, theme, notes.
 // Replaces both the original setSidebarMode function and the patchSidebarMode
 // IIFE that bolted on 'notes' mode support via monkey-patching.
+//
+// Phase 9: notes loader is now imported directly from ./notes (matching the
+// pattern used for refreshScriptsList / renderNavigator / renderThemePanel),
+// dropping the old configureSidebar({ onNotes }) dependency-injection seam.
 import { refreshScriptsList } from './scripts-panel';
 import { renderNavigator } from './navigator';
 import { renderThemePanel } from './preview';
-
-export interface SidebarDeps {
-  onNotes?: () => void;
-}
-
-let sidebarDeps: SidebarDeps = {};
-
-export function configureSidebar(d: SidebarDeps): void { sidebarDeps = d; }
+import { loadNotesForCurrentTemplate } from './notes';
 
 export function setSidebarMode(mode: string): void {
   const isFiles   = mode === 'files';
@@ -54,5 +51,5 @@ export function setSidebarMode(mode: string): void {
   }
   if (isNav) renderNavigator();
   if (isTheme) renderThemePanel();
-  if (isNotes) sidebarDeps.onNotes?.();
+  if (isNotes) loadNotesForCurrentTemplate();
 }

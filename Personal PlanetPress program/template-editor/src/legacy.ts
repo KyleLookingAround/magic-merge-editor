@@ -85,7 +85,8 @@ import {
   togglePreview, openPreview, closePreview, refreshPreview,
   buildPreviewHtml, applyDatamodelPersonalization,
 } from './preview';
-import { setSidebarMode, configureSidebar } from './sidebar';
+import { setSidebarMode } from './sidebar';
+import { loadNotesForCurrentTemplate, configureNotes } from './notes';
 import {
   scenariosState, scnPersistKey, parseScenarioXmlToMap,
   readScenariosFromZip, autoLoadScenariosFromFolder,
@@ -761,9 +762,9 @@ configurePreviewHelpers({
   setStatus: (msg, kind) => setStatus(msg, kind),
 });
 
-// Wire sidebar configure (Phase 8 carve).
-configureSidebar({
-  onNotes: () => loadNotesForCurrentTemplate(),
+// Wire notes configure (Phase 9 carve). sidebar.ts imports loadNotesForCurrentTemplate directly.
+configureNotes({
+  setStatus: (msg, kind) => setStatus(msg, kind),
 });
 
 // Wire review-modal configure (Phase 8 carve).
@@ -2177,88 +2178,12 @@ function scenarioMapToXml(map) {
   return '<?xml version="1.0" encoding="UTF-8"?>\n<Application>\n' + serialize(root, '  ') + '\n</Application>\n';
 }
 
-// ---------- NOTES SIDECAR ----------
-const notesState = {
-  text: '',
-  dirty: false,
-  forTemplate: null, // template fileName the loaded notes belong to
-};
-
-function notesSidecarName() {
-  if (!state.fileName) return null;
-  return state.fileName.replace(/\.[^.]+$/, '') + '.notes.md';
-}
-
-async function loadNotesForCurrentTemplate() {
-  const ta = document.getElementById('notes-textarea');
-  const name = document.getElementById('notes-filename');
-  const empty = document.getElementById('notes-empty');
-  const saveBtn = document.getElementById('btn-notes-save');
-  if (!ta || !state.fileName) {
-    if (ta) ta.value = '';
-    if (name) name.textContent = '(no template open)';
-    if (saveBtn) saveBtn.disabled = true;
-    if (empty) empty.style.display = '';
-    notesState.text = '';
-    notesState.dirty = false;
-    notesState.forTemplate = null;
-    return;
-  }
-  const sidecar = notesSidecarName();
-  notesState.forTemplate = state.fileName;
-  name.textContent = sidecar;
-  empty.style.display = 'none';
-  saveBtn.disabled = false;
-  // Try to read sidecar from the open dirHandle
-  let text = '';
-  if (state.dirHandle) {
-    try {
-      const fh = await state.dirHandle.getFileHandle(sidecar);
-      const f = await fh.getFile();
-      text = await f.text();
-    } catch (_) { text = ''; }
-  }
-  ta.value = text;
-  notesState.text = text;
-  notesState.dirty = false;
-}
-
-async function saveNotes() {
-  if (!state.dirHandle) { setStatus('Open a folder to save notes.', 'warn'); return; }
-  const sidecar = notesSidecarName();
-  if (!sidecar) return;
-  const ta = document.getElementById('notes-textarea');
-  const text = ta.value;
-  try {
-    const fh = await state.dirHandle.getFileHandle(sidecar, { create: true });
-    const w = await fh.createWritable();
-    await w.write(new Blob([text], { type: 'text/markdown' }));
-    await w.close();
-    notesState.text = text;
-    notesState.dirty = false;
-    setStatus(`Saved ${sidecar}.`, 'ok');
-  } catch (e) { setStatus('Save notes failed: ' + e.message, 'err'); }
-}
-
-(function wireNotes() {
-  const ta = document.getElementById('notes-textarea');
-  const saveBtn = document.getElementById('btn-notes-save');
-  if (ta) ta.addEventListener('input', () => {
-    notesState.dirty = ta.value !== notesState.text;
-  });
-  if (saveBtn) saveBtn.addEventListener('click', saveNotes);
-  // Ctrl+S inside the notes textarea saves the notes (instead of committing template edit)
-  if (ta) ta.addEventListener('keydown', e => {
-    if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
-      e.preventDefault();
-      saveNotes();
-    }
-  });
-  const modeNotesBtn = document.getElementById('mode-notes');
-  if (modeNotesBtn) modeNotesBtn.addEventListener('click', () => setSidebarMode('notes'));
-})();
-
-// patchSidebarMode IIFE removed — sidebar.ts now handles all modes including 'notes' natively.
+// Notes sidecar carved out to ./notes.ts (Phase 9). State, load/save, Ctrl+S
+// handler, and mode-notes click wiring all live there. This file only triggers
+// loadNotesForCurrentTemplate via the afterLoadFromHandle hook below.
+// patchSidebarMode IIFE removed in Phase 8 — sidebar.ts now handles all modes
+// including 'notes' natively (importing loadNotesForCurrentTemplate directly
+// since Phase 9).
 
 // ---------- RECENTLY-EDITED SCRIPTS ----------
 const recentScriptsState = {

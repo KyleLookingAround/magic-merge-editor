@@ -47,7 +47,8 @@ The editor used to be a single ~7,394-line `template-editor.html`. It now lives 
 - `src/scenarios.ts` — `scenariosState` + `ScenariosState` interface + `Scenario` type (Phase 5), `scnPersistKey` + `parseScenarioXmlToMap` (Phase 6 wave 1), and the full scenario orchestrators (Phase 6 wave 2): `readScenariosFromZip`, `autoLoadScenariosFromFolder`, `pickAndLoadScenarios`, `populateScenarioPicker`, `activateScenario`, `configureScenarios`. Note: `activateScenario` checks if the preview is open via DOM (`preview-pane.classList.contains('show')`) rather than importing `previewState` from `preview.ts`, to avoid a circular import.
 - `src/scripts-panel.ts` — `parseScriptsFromXml`, `serializeScriptBack`, `buildNewScriptXml`, `stripCdataKeepingOffsets`, `parseDatamodelFields`, `dmTypeToFormType`, `SCRIPT_HOST_CANDIDATES`, `scriptsState` (Phase 5), `findDatamodelPath`, `isScriptFieldInvalid`, `countScriptUsages`, `refreshDatamodelFields`, `refreshScriptsList` (Phase 6 wave 1), and the full scripts-list UI (Phase 6 wave 2): `renderScriptsList`, `updateBulkBar`, `computeVisibleScripts`, `configureScriptsList`. `refreshScriptsList` emits `'afterReparseScripts'`; legacy.ts registers `hookOn('afterReparseScripts', renderScriptsList)` as the first handler. The recent-scripts injection is a second `hookOn('afterReparseScripts', ...)` handler that runs after the first. Typed: `ParsedScript`, `ScriptForm`, `DatamodelField`, `ScriptKind`. Note: literal `</script>` strings are escaped as `<\/script>` to survive Vite's HTML inlining.
 - `src/navigator.ts` (new — Phase 6 wave 2) — `parseNavigatorEntries`, `normalizeNavPath`, `renderNavigator`, `configureNavigator`. Reads `scriptsState.hostPath` (from `scripts-panel.ts`) to locate `index.xml`.
-- `src/legacy.ts` — `// @ts-nocheck` carve residue. What's left: DOM event wiring, `openFile`, `commitCurrentEdit`, `rezipAndSave`, `openScriptForm`/`applyScriptForm`/`closeScriptForm` + form helpers, `createScript`/`deleteScript`/`cloneScript`/`moveScript`/bulk ops, `togglePreview`/`openPreview`/`closePreview`/`refreshPreview`/`buildPreviewHtml`/`applyDatamodelPersonalization`, notes, locked-folder unlock, file add/rename/delete, preset overlay, and `hookOn(...)` registrations. **No more `_orig*` monkey-patch variables.** **Edit logic here only as a last resort — prefer landing changes in the relevant module.**
+- `src/script-form.ts` (new — Phase 7) — full script form UI and CRUD: `openScriptForm`, `closeScriptForm`, `applyScriptForm`, `toggleScriptEnabled`, `cloneScript`, `moveScript`, `createScript`, `deleteScript`, and all private helpers (`setSelectValue`, `ensureScriptSourceEditor`, `updateFieldMeta`, `updateUsagesPanel`, `bindFieldPathAutotype`, `bindFieldMetaLiveUpdate`, `offerRenameTokenAcrossFiles`, `bulkSetEnabled`, `bulkDelete`). All script-panel controls, form buttons, mode-scripts/mode-nav, and right-click context menu wired via `configureScriptForm({ openFile, setStatus, setSidebarMode, showCtxMenu, closeCtxMenu })`. Imports from `scripts-panel.ts`; no circular imports.
+- `src/legacy.ts` — `// @ts-nocheck` carve residue. What's left: DOM event wiring, `openFile`, `commitCurrentEdit`, `rezipAndSave`, `togglePreview`/`openPreview`/`closePreview`/`refreshPreview`/`buildPreviewHtml`/`applyDatamodelPersonalization`, `setSidebarMode`, `compareTemplates`/`reviewAndSave`, notes, locked-folder unlock, file add/rename/delete, preset overlay, and `hookOn(...)` registrations. **No more `_orig*` monkey-patch variables.** **Edit logic here only as a last resort — prefer landing changes in the relevant module.**
 
 ## Build / dev / test
 
@@ -106,6 +107,15 @@ Note: the CI workflow (`ci.yml`) runs `npm test` which runs the Playwright smoke
 
 *Optional follow-ups:* native-dialog → modal replacement, ARIA pass, keyboard help dialog, `buildTree` perf, debounced preview auto-refresh, FLD/IF kind chips, drag-to-reorder, rename-token-everywhere, vendor CDN deps via npm.
 
+## Phase 7 (completed 2026-05-07) — script form + CRUD carve
+
+New file `src/script-form.ts` (~500 lines typed TypeScript). All script form and CRUD orchestrators moved out of `legacy.ts`:
+- **Form UI**: `openScriptForm`, `closeScriptForm`, `applyScriptForm`, `setSelectValue`, `ensureScriptSourceEditor`, `updateFieldMeta`, `updateUsagesPanel`, `bindFieldPathAutotype`, `bindFieldMetaLiveUpdate`, `offerRenameTokenAcrossFiles`.
+- **CRUD**: `toggleScriptEnabled`, `cloneScript`, `moveScript`, `bulkSetEnabled`, `bulkDelete`, `createScript`, `deleteScript`.
+- **Event wiring**: scripts-search/kind-filter/bulk-bar inputs, sf-apply/sf-revert/sf-close/sf-open-raw/sf-delete buttons, btn-script-new picker, btn-script-delete toolbar button, mode-scripts/mode-nav sidebar tabs, right-click contextmenu on script items — all consolidated in `configureScriptForm({ openFile, setStatus, setSidebarMode, showCtxMenu, closeCtxMenu })`. Called from legacy.ts alongside the other `configure*` calls.
+- **legacy.ts**: removed ~950 lines, now 3,395 lines (was 4,345). `hookOn` registrations for `afterOpenScriptForm`/`afterCloseScriptForm` toolbar-button sync moved to `configureScriptForm`.
+- Build: 192.50 kB / 52.01 kB gzip. `tsc --noEmit` clean.
+
 ## Decisions Kyle has already made
 
 - Vite + ES modules, single-file build output (`vite-plugin-singlefile`).
@@ -138,10 +148,10 @@ Note: the CI workflow (`ci.yml`) runs `npm test` which runs the Playwright smoke
 
 ## Suggested next move
 
-Phase 6 (both waves) is complete. Build green at 193.05 kB, `tsc --noEmit` clean. Next priorities:
+Phase 7 is complete. Build green at 192.50 kB, `tsc --noEmit` clean. Next priorities:
 
-- **Manual smoke test.** Open `dist/index.html` in Chrome/Edge, load `M2L-KFI.OL-template`, edit a script, *Review & Save*, reopen, verify round-trip. Confirm scenario picker, navigator, theme panel, search, and token strip all work.
-- **GitHub Pages deploy.** Merge the Phase 5/6 branch to `main` and verify the Pages deploy completes. Add the live URL to the README.
-- **Phase 7 (optional).** Next-biggest carves: `openScriptForm`/form helpers, `buildPreviewHtml`/`applyDatamodelPersonalization`, `setSidebarMode`. Tackle script-form first — it's self-contained and makes the remaining `legacy.ts` much smaller.
+- **Manual smoke test.** Open `dist/index.html` in Chrome/Edge, load `M2L-KFI.OL-template`, edit a script (including applying changes and verifying the round-trip), create/clone/delete a script, drag-reorder, and try the right-click context menu. Confirm scenario picker, navigator, theme panel, search, and token strip all work.
+- **GitHub Pages deploy.** Merge to `main` and verify the Pages deploy completes. Add the live URL to the README.
+- **Phase 8 (optional).** Next-biggest carves from `legacy.ts` (~3,400 lines remaining): `togglePreview`/`openPreview`/`closePreview`/`refreshPreview`/`buildPreviewHtml`/`applyDatamodelPersonalization` → extend `preview.ts`; `setSidebarMode` → new `src/sidebar.ts`; `compareTemplates`/`reviewAndSave` → `review-modal.ts`. Tackle preview pipeline first — it's the largest remaining block.
 
 Smoke target after any edit: `npm run build` → open `dist/index.html` in Chrome/Edge → load `M2L-KFI.OL-template` → edit a script → *Review & Save* → reopen → verify round-trip.

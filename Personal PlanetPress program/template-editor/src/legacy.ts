@@ -49,6 +49,16 @@
 //      smoke-test the built dist/index.html against M2L-KFI.OL-template.
 import { state } from './state';
 import { recentsAdd, recentsList, recentsRemove, recentsClear, formatRecentTime } from './recents';
+import { bootstrapMonaco, registerFieldTokenCompletion } from './monaco-host';
+import {
+  TEXT_EXTS, LANG_BY_EXT, IMAGE_EXTS, ZIP_EXTS,
+  extOf, langFor, isTextPath, isImagePath, isZipExt,
+  decodeXmlEntities, encodeXmlText, encodeXmlAttr,
+  indentAt, replaceTagInner, makeMemoCache, looksLikeText, decodeBytes,
+} from './fs';
+import { buildTree, refreshTreeDirtyMarkers, escapeHtml, configureTree } from './tree';
+import { validateXml, formatXml } from './editor';
+import { appendSearchFile, renderSnippet, configureSearch } from './search';
 
 (function () {
 'use strict';
@@ -61,230 +71,31 @@ const DEFAULT_SCRIPT_INDENT = ' '.repeat(16);
 // Carved out to ./state.ts. Imported above; same object identity, same keys.
 
 // ---------- monaco bootstrap ----------
-require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } });
-require(['vs/editor/editor.main'], () => {
-  state.editor = monaco.editor.create(document.getElementById('editor'), {
-    value: '',
-    theme: 'vs-dark',
-    automaticLayout: true,
-    minimap: { enabled: false },
-    wordWrap: 'on',
-    fontSize: 13,
-    scrollBeyondLastLine: false,
-  });
-  state.editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => commitCurrentEdit(true));
-  state.monacoReady = true;
-  document.getElementById('btn-save').disabled = !state.currentPath;
-
-  // Register @field@ token autocomplete for HTML files. Reads from
-  // scriptsState.datamodelFields (populated when a template with a
-  // datamodel is opened) so the suggestion list always reflects the
-  // current template's data shape.
-  registerFieldTokenCompletion(['html']);
+// Carved out to ./monaco-host.ts. Dependencies are passed in:
+//   - onSave: invokes commitCurrentEdit on Ctrl+S (still legacy-resident)
+//   - getFields thunk: reads scriptsState.datamodelFields lazily so the
+//     completion provider always sees the latest list
+bootstrapMonaco({
+  onSave: () => commitCurrentEdit(true),
+  onReady: () => {
+    // Register @field@ token autocomplete for HTML files. Reads from
+    // scriptsState.datamodelFields (populated when a template with a
+    // datamodel is opened) so the suggestion list always reflects the
+    // current template's data shape.
+    registerFieldTokenCompletion(
+      ['html'],
+      () => (typeof scriptsState !== 'undefined' && scriptsState.datamodelFields) || [],
+    );
+  },
 });
 
-// Provides autocomplete for `@field@` placeholders inside template HTML.
-// Triggers on `@`, also fires while typing more characters after it.
-// Selection inserts `path@` so the closing delimiter is added automatically;
-// if a closing `@` already follows the cursor, the existing one is consumed
-// instead. Skips occurrences where the `@` is preceded by a word char (that
-// `@` is almost certainly the closing delimiter of an already-typed token).
-function registerFieldTokenCompletion(languages) {
-  if (typeof monaco === 'undefined') return;
-  const TOKEN_RE = /@([A-Za-z0-9_./\-]*)$/;
-  const provider = {
-    triggerCharacters: ['@'],
-    provideCompletionItems(model, position) {
-      const fields = (typeof scriptsState !== 'undefined' && scriptsState.datamodelFields) || [];
-      // Drop table-typed entries — those aren't directly substitutable as a token.
-      const candidates = fields.filter(f => f && f.type !== 'table');
-      if (!candidates.length) return { suggestions: [] };
-
-      const lineText = model.getLineContent(position.lineNumber);
-      const before = lineText.slice(0, position.column - 1);
-      const m = TOKEN_RE.exec(before);
-      if (!m) return { suggestions: [] };
-      const word = m[1];
-      const atIdx = before.length - word.length - 1; // 0-based line index of `@`
-      const prevChar = atIdx > 0 ? lineText.charAt(atIdx - 1) : '';
-      if (/[A-Za-z0-9_./\-]/.test(prevChar)) return { suggestions: [] };
-
-      // After-cursor: if there's already a closing `@` immediately following
-      // (with optional word chars in between), include those chars in the
-      // replace range and skip the auto-added closing `@`.
-      const after = lineText.slice(position.column - 1);
-      const afterMatch = /^[A-Za-z0-9_./\-]*@/.exec(after);
-
-      const range = {
-        startLineNumber: position.lineNumber,
-        endLineNumber: position.lineNumber,
-        startColumn: atIdx + 2, // 1-based column right after the `@`
-        endColumn: position.column + (afterMatch ? afterMatch[0].length : 0),
-      };
-
-      const truncate = (s, n) => (s && s.length > n) ? s.slice(0, n) + '…' : (s || '');
-      const suggestions = candidates.map(f => {
-        const tail = afterMatch ? '' : '@';
-        const sample = f.lastValue ? '  =  ' + truncate(String(f.lastValue), 60) : '';
-        return {
-          label: '@' + f.path + '@',
-          insertText: f.path + tail,
-          range,
-          filterText: f.path,
-          sortText: f.path,
-          kind: monaco.languages.CompletionItemKind.Variable,
-          detail: (f.type || 'STRING') + sample,
-          documentation: f.lastValue
-            ? { value: '**Sample value**\n\n```\n' + String(f.lastValue) + '\n```' }
-            : undefined,
-        };
-      });
-      return { suggestions };
-    },
-  };
-  for (const lang of languages) {
-    monaco.languages.registerCompletionItemProvider(lang, provider);
-  }
-}
-
 // ---------- helpers ----------
-const TEXT_EXTS = new Set([
-  'xml','html','htm','js','mjs','css','json','txt','md','svg','xsl','xslt',
-  'csv','tsv','yml','yaml','config','log','properties','ini',
-  // PlanetPress / Connect XML formats
-  'ol-datamodel','ol-jobpreset','ol-outputpreset','ol-script','ol-config',
-]);
-const LANG_BY_EXT = {
-  xml: 'xml', xsl: 'xml', xslt: 'xml', svg: 'xml', config: 'xml',
-  html: 'html', htm: 'html',
-  js: 'javascript', mjs: 'javascript',
-  css: 'css',
-  json: 'json',
-  md: 'markdown',
-  yml: 'yaml', yaml: 'yaml',
-  'ol-datamodel': 'xml', 'ol-jobpreset': 'xml', 'ol-outputpreset': 'xml',
-  'ol-script': 'xml', 'ol-config': 'xml',
-};
-const IMAGE_EXTS = new Set(['png','jpg','jpeg','gif','bmp','webp','ico']);
-// Top-level container files we treat as zip archives to unpack.
-const ZIP_EXTS = new Set(['ol-template','ol-datamapper','zip']);
-
-function extOf(path) {
-  const m = /\.([^.\/]+)$/.exec(path);
-  return m ? m[1].toLowerCase() : '';
-}
-function langFor(path) { return LANG_BY_EXT[extOf(path)] || 'plaintext'; }
-function isTextPath(path) { return TEXT_EXTS.has(extOf(path)); }
-function isImagePath(path) { return IMAGE_EXTS.has(extOf(path)); }
-function isZipExt(path) { return ZIP_EXTS.has(extOf(path)); }
-
-// ---------- shared XML / text helpers ----------
-// These were originally defined deep inside the Scripts feature. They're
-// hoisted up so anything in the file (preview tokens, navigator, search,
-// new-file dialog, presets editor) can reuse the same encode/decode rules
-// rather than re-implementing them implicitly. Round-trip safe: the encoder
-// escapes the same five entities the decoder recognises (& < > " ').
-
-function decodeXmlEntities(s) {
-  if (s == null) return '';
-  return String(s)
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, '&');
-}
-function encodeXmlText(s) {
-  return String(s == null ? '' : s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
-}
-function encodeXmlAttr(s) {
-  // encodeXmlText already escapes both quotes, so attr context is just text.
-  return encodeXmlText(s);
-}
-
-// Find the indentation prefix on the line that contains a given absolute
-// offset. Used by anything that splices text into another text and wants
-// the new content to honour the surrounding indentation (clone/create/
-// delete script, +New file dialog, format helpers).
-function indentAt(text, offset) {
-  let i = offset;
-  while (i > 0 && text[i - 1] !== '\n') i--;
-  let j = i;
-  while (j < text.length && (text[j] === ' ' || text[j] === '\t')) j++;
-  return text.slice(i, j);
-}
-
-// Replace the inner text of a single top-level child tag inside a chunk.
-// Preserves indentation; supports empty-element <tag/> by expanding it.
-// Hoisted up so the preset overlay form can splice fields back the same
-// way serializeScriptBack does — this is the standard "_raw + offset
-// splice" pattern that the rest of the file uses for XML mutations.
-function replaceTagInner(chunk, tag, newInner) {
-  const reFull = new RegExp(`(<${tag}(?:\\s[^>]*)?)>([\\s\\S]*?)(<\\/${tag}>)`);
-  if (reFull.test(chunk)) {
-    return chunk.replace(reFull, (_m, open, _old, close) => `${open}>${newInner}${close}`);
-  }
-  // self-closing: <tag/> -> <tag>X</tag>
-  const reSelf = new RegExp(`<${tag}(\\s[^>]*)?\\s*/>`);
-  if (reSelf.test(chunk)) {
-    return chunk.replace(reSelf, (_m, attrs) => `<${tag}${attrs || ''}>${newInner}</${tag}>`);
-  }
-  return chunk; // tag absent — leave as-is
-}
-
-// ---------- generic memoise-by-key cache ----------
-// Lifted from scriptsState.usagesCache so the same one-shot-cache pattern
-// can be reused elsewhere (preview unresolved tokens, search results,
-// compare-templates modal). Each cache holds plain values keyed by string.
-// Call .invalidate() whenever underlying state changes (file mutations,
-// host-file switch, etc.) — there's no auto-invalidation.
-function makeMemoCache() {
-  const store = Object.create(null);
-  return {
-    get(key) { return store[key]; },
-    has(key) { return Object.prototype.hasOwnProperty.call(store, key); },
-    set(key, value) { store[key] = value; return value; },
-    getOrCompute(key, compute) {
-      if (Object.prototype.hasOwnProperty.call(store, key)) return store[key];
-      const v = compute();
-      store[key] = v;
-      return v;
-    },
-    invalidate(key) {
-      if (key == null) {
-        for (const k of Object.keys(store)) delete store[k];
-      } else {
-        delete store[key];
-      }
-    },
-  };
-}
-
-// Sniff whether bytes look like text. Used as fallback for unknown extensions.
-function looksLikeText(bytes) {
-  if (!bytes || bytes.length === 0) return true;
-  // ZIP / common binary magic
-  if (bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4B) return false; // PK
-  if (bytes.length >= 4 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46) return false; // %PDF
-  if (bytes.length >= 4 && bytes[0] === 0x89 && bytes[1] === 0x50) return false; // PNG
-  const limit = Math.min(bytes.length, 4096);
-  let nulls = 0;
-  for (let i = 0; i < limit; i++) {
-    if (bytes[i] === 0) { nulls++; if (nulls > 1) return false; }
-  }
-  try {
-    new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice(0, limit));
-    return true;
-  } catch (_) {
-    // Treat as text anyway if mostly printable — falls back to latin1 decode at load
-    return true;
-  }
-}
+// Pure helpers carved out to ./fs.ts:
+//   TEXT_EXTS, LANG_BY_EXT, IMAGE_EXTS, ZIP_EXTS,
+//   extOf, langFor, isTextPath, isImagePath, isZipExt,
+//   decodeXmlEntities, encodeXmlText, encodeXmlAttr,
+//   indentAt, replaceTagInner, makeMemoCache, looksLikeText, decodeBytes
+// Imported at the top of this file. Names below are unchanged.
 
 function setStatus(msg, kind) {
   const el = document.getElementById('status');
@@ -295,15 +106,7 @@ function setStatus(msg, kind) {
   }
 }
 
-function decodeBytes(bytes) {
-  // Try UTF-8 first; fall back to latin1.
-  try {
-    const txt = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-    return txt;
-  } catch (e) {
-    return new TextDecoder('latin1').decode(bytes);
-  }
-}
+// decodeBytes carved out to ./fs.ts.
 
 // ---------- open / load ----------
 document.getElementById('btn-open').addEventListener('click', () => pickAndOpenFile());
@@ -571,89 +374,13 @@ async function loadFromHandle(handle) {
 // Also: zero-byte entries whose path matches one of OL Connect's reserved
 // "locked" folders (snippets / translations / js / fonts / color-profiles)
 // are folder markers, not files — render them as empty folders with a 🔒.
-function buildTree() {
-  const root = { name: '', children: {}, files: [] };
-  for (const path of Object.keys(state.files).sort()) {
-    const parts = path.split(/[/\\]/);
-    let node = root;
-    for (let i = 0; i < parts.length - 1; i++) {
-      const seg = parts[i];
-      node.children[seg] = node.children[seg] || { name: seg, children: {}, files: [] };
-      node = node.children[seg];
-    }
-    const leaf = parts[parts.length - 1];
-    // Folder-marker entry: zero bytes + matches a known locked folder name.
-    // Promote to a child folder rather than listing as a file.
-    if (isLockedFolderMarker(path, state.files[path])) {
-      node.children[leaf] = node.children[leaf] || { name: leaf, children: {}, files: [], lockedMarker: path };
-      continue;
-    }
-    node.files.push({ name: leaf, path });
-  }
-  const treeEl = document.getElementById('tree');
-  treeEl.innerHTML = '';
-  treeEl.appendChild(renderNode(root, ''));
-}
-
-function renderNode(node, prefix) {
-  const frag = document.createDocumentFragment();
-  // Directories first (alphabetical)
-  const dirNames = Object.keys(node.children).sort();
-  for (const dirName of dirNames) {
-    const child = node.children[dirName];
-    const dirEl = document.createElement('div');
-    dirEl.className = 'tree-item dir';
-    const header = document.createElement('div');
-    header.className = 'tree-item';
-    const lockBadge = child.lockedMarker
-      ? ' <span class="badge" style="background:#5a4a1a;color:#f0c674;font-size:9px;margin-left:4px;padding:0 4px;border-radius:2px;" title="Locked by OL Connect — click 🔓 Unlock in the toolbar">LOCKED</span>'
-      : '';
-    header.innerHTML = `<span class="icon">▸</span><span class="name">${escapeHtml(dirName)}</span>${lockBadge}`;
-    header.style.padding = '0';
-    const wrap = document.createElement('div');
-    wrap.className = 'children';
-    wrap.appendChild(renderNode(node.children[dirName], prefix + dirName + '/'));
-    let collapsed = false;
-    header.addEventListener('click', () => {
-      collapsed = !collapsed;
-      wrap.style.display = collapsed ? 'none' : '';
-      header.querySelector('.icon').textContent = collapsed ? '▸' : '▾';
-    });
-    // expand by default
-    header.querySelector('.icon').textContent = '▾';
-    const block = document.createElement('div');
-    block.appendChild(header);
-    block.appendChild(wrap);
-    frag.appendChild(block);
-  }
-  // Files
-  const sortedFiles = node.files.slice().sort((a, b) => a.name.localeCompare(b.name));
-  for (const f of sortedFiles) {
-    const item = document.createElement('div');
-    item.className = 'tree-item file';
-    item.dataset.path = f.path;
-    const icon = isTextPath(f.path) ? '📄' : (isImagePath(f.path) ? '🖼️' : '🔒');
-    item.innerHTML = `<span class="icon">${icon}</span><span class="name">${escapeHtml(f.name)}</span>`;
-    if (state.files[f.path] && state.files[f.path].dirty) item.classList.add('dirty');
-    item.addEventListener('click', () => openFile(f.path));
-    frag.appendChild(item);
-  }
-  return frag;
-}
-
-function refreshTreeDirtyMarkers() {
-  document.querySelectorAll('.tree-item.file').forEach(el => {
-    const p = el.dataset.path;
-    if (state.files[p] && state.files[p].dirty) el.classList.add('dirty');
-    else el.classList.remove('dirty');
-  });
-  const anyDirty = Object.values(state.files).some(f => f.dirty);
-  document.getElementById('filename').classList.toggle('dirty', anyDirty);
-}
-
-function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
+// buildTree / renderNode / refreshTreeDirtyMarkers / escapeHtml carved
+// out to ./tree.ts. configureTree below wires the legacy-resident
+// callbacks (isLockedFolderMarker, openFile) into the new module.
+configureTree({
+  isLockedFolderMarker: (path, fe) => isLockedFolderMarker(path, fe),
+  openFile: path => openFile(path),
+});
 
 // ---------- editor open / commit ----------
 function openFile(path) {
@@ -757,22 +484,7 @@ function commitCurrentEdit(showStatus) {
   if (showStatus) setStatus('Edit committed (not yet written to disk).', 'ok');
 }
 
-function validateXml(text, asHtml) {
-  try {
-    const parser = new DOMParser();
-    const mime = asHtml ? 'text/html' : 'application/xml';
-    const doc = parser.parseFromString(text, mime);
-    const errEl = doc.getElementsByTagName('parsererror')[0];
-    if (errEl) {
-      // Take a one-line summary
-      const msg = errEl.textContent.replace(/\s+/g, ' ').trim().slice(0, 240);
-      return { ok: false, error: msg };
-    }
-    return { ok: true };
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
-}
+// validateXml carved out to ./editor.ts.
 
 // ---------- save (rezip if zip, plain write if standalone) ----------
 async function rezipAndSave() {
@@ -889,42 +601,9 @@ function formatCurrent() {
   setStatus(`Formatted as ${label}.`, 'ok');
 }
 
-function formatXml(xml) {
-  // Protect CDATA, comments, processing instructions
-  const stash = [];
-  const protect = (re) => {
-    xml = xml.replace(re, m => { stash.push(m); return 'STASH' + (stash.length - 1) + 'HSATS'; }); //`${stash.length - 1}`; });
-  };
-  protect(/<!\[CDATA\[[\s\S]*?\]\]>/g);
-  protect(/<!--[\s\S]*?-->/g);
-  protect(/<\?[\s\S]*?\?>/g);
-
-  // Insert breaks between tags but keep text content tied to its tags
-  xml = xml.replace(/>\s+</g, '><');
-  xml = xml.replace(/></g, '>\n<');
-
-  const lines = xml.split('\n');
-  let indent = 0;
-  const indentStr = '  ';
-  const out = [];
-  for (let raw of lines) {
-    const line = raw.trim();
-    if (!line) continue;
-    const isClose = /^<\/[^>]+>$/.test(line);
-    const isSelfClose = /<[^>]+\/>$/.test(line) || /^<[?!]/.test(line);
-    const isInlineFull = /^<([^\s\/>]+)[^>]*>[\s\S]*<\/\1>$/.test(line); // <a>x</a>
-    if (isClose) indent = Math.max(0, indent - 1);
-    out.push(indentStr.repeat(indent) + line);
-    if (!isClose && !isSelfClose && !isInlineFull && /^<[^\/!?]/.test(line)) indent++;
-  }
-  let result = out.join('\n');
-  result = result.replace(/STASH(\d+)HSATS/g, (_, i) => stash[+i]);
-  return result;
-}
-function _formatXmlOldRestore() { /* placeholder to keep file readable */
-  result = result.replace(/(\d+)/g, (_, i) => stash[+i]);
-  return result;
-}
+// formatXml carved out to ./editor.ts. The dead `_formatXmlOldRestore`
+// placeholder that lived alongside it was unreachable and referenced
+// undefined names - dropped.
 
 // ============================================================
 // SIDEBAR MODE TOGGLE (Files / Search)
@@ -1051,51 +730,9 @@ function runSearch() {
   summary.textContent = totalHits ? `${totalHits} match${totalHits === 1 ? '' : 'es'} in ${filesHit} file${filesHit === 1 ? '' : 's'}` : 'No matches';
 }
 
-function appendSearchFile(container, path, hits, pattern) {
-  const head = document.createElement('div');
-  head.className = 'search-file';
-  head.textContent = `${path}  (${hits.length})`;
-  head.style.cursor = 'pointer';
-  head.addEventListener('click', () => openFile(path));
-  container.appendChild(head);
-  for (const hit of hits) {
-    const el = document.createElement('div');
-    el.className = 'search-hit';
-    el.title = hit.lineText.trim();
-    const lineno = `<span class="lineno">${hit.lineNo}:</span>`;
-    // Build snippet with mark
-    const snippet = renderSnippet(hit.lineText, pattern);
-    el.innerHTML = lineno + snippet;
-    el.addEventListener('click', () => {
-      openFile(path);
-      // After Monaco loads/sets the model, position the cursor
-      setTimeout(() => {
-        if (state.editor && state.monacoModels[path]) {
-          state.editor.revealLineInCenter(hit.lineNo);
-          state.editor.setPosition({ lineNumber: hit.lineNo, column: hit.col + 1 });
-          state.editor.focus();
-        }
-      }, 50);
-    });
-    container.appendChild(el);
-  }
-}
-
-function renderSnippet(line, pattern) {
-  // Trim very long lines around the first match
-  let trimmed = line;
-  pattern.lastIndex = 0;
-  const m = pattern.exec(line);
-  let prefix = '';
-  if (line.length > 200 && m) {
-    const start = Math.max(0, m.index - 30);
-    if (start > 0) prefix = '…';
-    trimmed = line.slice(start, start + 200);
-  }
-  pattern.lastIndex = 0;
-  const escaped = escapeHtml(trimmed).replace(new RegExp(pattern.source, pattern.flags), m => `<mark>${escapeHtml(m)}</mark>`);
-  return prefix + escaped;
-}
+// appendSearchFile / renderSnippet carved out to ./search.ts.
+// configureSearch wires the legacy-resident openFile callback in.
+configureSearch({ openFile: path => openFile(path) });
 
 // ============================================================
 // MODAL helpers

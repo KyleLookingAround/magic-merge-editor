@@ -89,6 +89,7 @@ import { setSidebarMode } from './sidebar';
 import { loadNotesForCurrentTemplate, configureNotes } from './notes';
 import { configureRecentScripts } from './recent-scripts';
 import { openContextMenu, closeCtxMenu } from './context-menu';
+import { configurePresetOverlay } from './preset-overlay';
 import {
   scenariosState, scnPersistKey, parseScenarioXmlToMap,
   readScenariosFromZip, autoLoadScenariosFromFolder,
@@ -773,6 +774,13 @@ configureNotes({
 // afterLoadFromHandle / afterReparseScripts hook handlers and seeds the
 // initial list from localStorage.
 configureRecentScripts();
+
+// Wire preset overlay (Phase 11 carve). Registers the afterOpenFile hook
+// that toggles the "Open as form" banner and wires the banner button.
+configurePresetOverlay({
+  openFile: (path) => openFile(path),
+  setStatus: (msg, kind) => setStatus(msg, kind),
+});
 
 // Wire review-modal configure (Phase 8 carve).
 configureReviewModal({
@@ -2222,245 +2230,12 @@ hookOn('afterLoadFromHandle', async () => {
   } catch (e) { console.warn('[auto-open] failed:', e); }
 });
 
-// ============================================================
-// GENERIC OVERLAY-FORM HELPER + PRESET (.OL-jobpreset / .OL-outputpreset) EDITOR
-// ------------------------------------------------------------
-// Lifts the form-overlay-on-Monaco pattern out of the Scripts feature so
-// any "edit this XML file as a form" view can reuse it. Same overlay
-// container, same Apply / Revert / Open raw / Close action set.
-//
-// Concrete editor included: a basic preset editor that scans a preset
-// XML's top-level scalar children and exposes them as text inputs. The
-// surface is intentionally generic — it's a starting point for richer
-// datamodel / sections editors that should slot into the same plumbing.
-// Apply uses the standard _raw + offset splice pattern via replaceTagInner
-// so whitespace and unknown sibling tags are preserved.
-// ============================================================
-
-const overlayFormState = {
-  active: null, // { path, originalText, fields: [{ tag, value, isMultiline }] }
-};
-
-// Mount an overlay form. `cfg` shape:
-//   { path, title, subtitle, fields: [{ tag, label, value, multiline? }],
-//     onApply(formValues), onClose() }
-// Hides the editor + script/binary/scenario views while shown; restores
-// them in closeOverlayForm. The `originalText` is captured so Revert can
-// reset every input to its parsed-at-open value.
-function openOverlayForm(cfg) {
-  if (!cfg || !cfg.fields) return;
-  // Hide other "main pane" views
-  document.getElementById('editor').style.display = 'none';
-  document.getElementById('binary-view').classList.remove('show');
-  document.getElementById('script-form-view').classList.remove('show');
-  const scnView = document.getElementById('scenario-form-view');
-  if (scnView) scnView.classList.remove('show');
-  // Hide the editor tab strip — irrelevant for form view
-  document.getElementById('editor-tab').style.display = 'none';
-
-  const view = document.getElementById('overlay-form-view');
-  view.classList.add('show');
-  document.getElementById('of-title').textContent = cfg.title || 'Form view';
-  document.getElementById('of-sub').textContent = cfg.subtitle || cfg.path || '';
-
-  const fieldsHost = document.getElementById('of-fields');
-  fieldsHost.innerHTML = '';
-  if (!cfg.fields.length) {
-    fieldsHost.innerHTML = '<div class="of-empty">No editable scalar fields detected. Use "Open raw…" to edit the XML directly.</div>';
-  }
-  for (const fld of cfg.fields) {
-    const row = document.createElement('div');
-    row.className = 'field-row';
-    const lab = document.createElement('label');
-    lab.textContent = fld.label || fld.tag;
-    row.appendChild(lab);
-    let inp;
-    if (fld.multiline || (fld.value && /\n/.test(fld.value)) || (fld.value && fld.value.length > 80)) {
-      inp = document.createElement('textarea');
-      inp.rows = 3;
-    } else {
-      inp = document.createElement('input');
-      inp.type = 'text';
-    }
-    inp.value = fld.value == null ? '' : fld.value;
-    inp.dataset.tag = fld.tag;
-    row.appendChild(inp);
-    fieldsHost.appendChild(row);
-  }
-
-  overlayFormState.active = { path: cfg.path, originalText: cfg.originalText || '', fields: cfg.fields, onApply: cfg.onApply, onClose: cfg.onClose };
-
-  // Wire actions (replaceWith trick to drop any prior listeners cleanly)
-  const apply = document.getElementById('of-apply');
-  const revert = document.getElementById('of-revert');
-  const close = document.getElementById('of-close');
-  const openRaw = document.getElementById('of-open-raw');
-  apply.replaceWith(apply.cloneNode(true));
-  revert.replaceWith(revert.cloneNode(true));
-  close.replaceWith(close.cloneNode(true));
-  openRaw.replaceWith(openRaw.cloneNode(true));
-  document.getElementById('of-apply').addEventListener('click', () => {
-    if (!overlayFormState.active || !overlayFormState.active.onApply) return;
-    const out = {};
-    for (const inp of fieldsHost.querySelectorAll('input,textarea')) {
-      out[inp.dataset.tag] = inp.value;
-    }
-    overlayFormState.active.onApply(out);
-  });
-  document.getElementById('of-revert').addEventListener('click', () => {
-    if (!overlayFormState.active) return;
-    for (const fld of overlayFormState.active.fields) {
-      const inp = fieldsHost.querySelector(`[data-tag="${CSS.escape(fld.tag)}"]`);
-      if (inp) inp.value = fld.value == null ? '' : fld.value;
-    }
-  });
-  document.getElementById('of-close').addEventListener('click', closeOverlayForm);
-  document.getElementById('of-open-raw').addEventListener('click', () => {
-    const path = overlayFormState.active && overlayFormState.active.path;
-    closeOverlayForm();
-    if (path && state.files[path]) openFile(path);
-  });
-
-  // Ctrl/Cmd+S → Apply (mirrors the script form's binding)
-  view.onkeydown = function (e) {
-    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 's' || e.key === 'S')) {
-      if (!view.classList.contains('show')) return;
-      e.preventDefault();
-      e.stopPropagation();
-      document.getElementById('of-apply').click();
-    }
-  };
-}
-
-function closeOverlayForm() {
-  const view = document.getElementById('overlay-form-view');
-  if (!view) return;
-  view.classList.remove('show');
-  view.onkeydown = null;
-  const wasActive = overlayFormState.active;
-  overlayFormState.active = null;
-  if (wasActive && wasActive.onClose) {
-    try { wasActive.onClose(); } catch (_) {}
-  }
-  // Restore whatever the underlying file would normally show.
-  if (state.currentPath) openFile(state.currentPath);
-}
-
-// Hide the "Open as form" banner. Idempotent.
-function hideOverlayBanner() {
-  const b = document.getElementById('overlay-form-banner');
-  if (b) b.classList.remove('show');
-}
-
-// ---------- preset editor ----------
-// Detects when a .OL-jobpreset / .OL-outputpreset is opened and shows a
-// banner offering to "Open as form". The form scans the preset XML's
-// top-level scalar children (text-only elements that aren't structural
-// containers) and surfaces each as a text/textarea input. On Apply we
-// splice each new value back into the original text using replaceTagInner
-// so unknown sibling tags + indentation are preserved.
-
-const PRESET_EXTS = new Set(['ol-jobpreset', 'ol-outputpreset']);
-
-function isPresetPath(path) {
-  return PRESET_EXTS.has(extOf(path || ''));
-}
-
-// Pull every top-level child element of `root` whose only content is text
-// (no nested element children). These are the scalar fields safe to edit
-// without re-encoding nested structure.
-function extractPresetScalarFields(xmlText) {
-  const fields = [];
-  let doc;
-  try { doc = new DOMParser().parseFromString(xmlText, 'application/xml'); }
-  catch (_) { return fields; }
-  const root = doc && doc.documentElement;
-  if (!root || root.nodeName.toLowerCase() === 'parsererror') return fields;
-  for (const child of root.children || []) {
-    // Skip elements that have child elements — those are structural and
-    // need a richer editor than this generic surface.
-    const hasChildElements = Array.from(child.children || []).length > 0;
-    if (hasChildElements) continue;
-    const tag = child.localName || child.nodeName;
-    if (!tag) continue;
-    // The decoder/encoder pair already handles entity round-tripping.
-    fields.push({
-      tag,
-      label: tag,
-      value: decodeXmlEntities(child.textContent || ''),
-      multiline: (child.textContent || '').length > 80,
-    });
-  }
-  return fields;
-}
-
-function openPresetOverlay(path) {
-  const f = state.files[path];
-  if (!f || !f.isText) return;
-  const text = state.monacoModels[path] ? state.monacoModels[path].getValue() : (f.content || '');
-  const fields = extractPresetScalarFields(text);
-  hideOverlayBanner();
-  openOverlayForm({
-    path,
-    title: 'Preset editor — ' + path,
-    subtitle: extOf(path).toUpperCase() + ' · top-level scalar fields shown below; nested elements stay untouched.',
-    originalText: text,
-    fields,
-    onApply: (formValues) => {
-      // Mutate the live text by splicing each changed scalar back in.
-      let updated = text;
-      let touched = 0;
-      for (const fld of fields) {
-        const newVal = formValues[fld.tag];
-        if (newVal == null || newVal === fld.value) continue;
-        updated = replaceTagInner(updated, fld.tag, encodeXmlText(newVal));
-        touched++;
-      }
-      if (!touched) {
-        setStatus('No changes to apply.', 'warn');
-        return;
-      }
-      const model = state.monacoModels[path];
-      if (model) {
-        const range = model.getFullModelRange();
-        model.pushEditOperations([], [{ range, text: updated }], () => null);
-      }
-      f.content = updated;
-      f.dirty = true;
-      refreshTreeDirtyMarkers();
-      setStatus(`Applied ${touched} field${touched === 1 ? '' : 's'} to ${path}. Click Review & Save to write to disk.`, 'ok');
-      // Re-render the form so subsequent changes diff against the new baseline.
-      openPresetOverlay(path);
-    },
-  });
-}
-
-// Hook openFile: when a preset file is opened, show the "Open as form"
-// banner. Banner stays out of the way for non-preset files.
-(function hookPresetBanner() {
-  const _orig = openFile;
-  openFile = function (path) {
-    _orig(path);
-    const banner = document.getElementById('overlay-form-banner');
-    if (!banner) return;
-    if (isPresetPath(path)) {
-      const ext = extOf(path).toUpperCase();
-      document.getElementById('overlay-form-banner-msg').textContent =
-        `${ext} files can be edited as a form (top-level scalar fields).`;
-      banner.classList.add('show');
-    } else {
-      banner.classList.remove('show');
-    }
-  };
-  const btn = document.getElementById('overlay-form-banner-open');
-  if (btn) {
-    btn.addEventListener('click', () => {
-      if (state.currentPath && isPresetPath(state.currentPath)) {
-        openPresetOverlay(state.currentPath);
-      }
-    });
-  }
-})();
+// Generic overlay-form helper + preset (.OL-jobpreset / .OL-outputpreset)
+// editor carved out to ./preset-overlay.ts (Phase 11). State, openOverlayForm
+// / closeOverlayForm, isPresetPath / extractPresetScalarFields /
+// openPresetOverlay, and the preset banner toggle (now a hookOn-
+// 'afterOpenFile' registration instead of an `_orig = openFile` monkey-patch)
+// all live in the module. configurePresetOverlay() is called above.
 
 // ---------- DEFERRED: form-as-overlay editors for datamodel + sections ----------
 // The plumbing above (openOverlayForm + replaceTagInner + the banner hook)

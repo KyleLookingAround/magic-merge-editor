@@ -12,7 +12,9 @@
 // state / DOM / setStatus, and most are wrapped by monkey-patches
 // that span sections.
 
-import { encodeXmlText, encodeXmlAttr, replaceTagInner, decodeXmlEntities, makeMemoCache, MemoCache } from './fs';
+import { encodeXmlText, encodeXmlAttr, replaceTagInner, decodeXmlEntities, makeMemoCache, MemoCache, extOf } from './fs';
+import { state } from './state';
+import { emit as hookEmit } from './hooks';
 
 /** Filenames inside a template that may host the <script> blocks. */
 export const SCRIPT_HOST_CANDIDATES: readonly string[] = ['index.xml'];
@@ -367,7 +369,7 @@ export interface ScriptsState {
   kindFilter: 'ALL' | ScriptKind;
   selected: Set<string>;
   datamodelFields?: DatamodelField[];
-  usagesCache: MemoCache;
+  usagesCache: MemoCache<number>;
 }
 
 export const scriptsState: ScriptsState = {
@@ -396,4 +398,117 @@ export function dmTypeToFormType(dmType: string | null | undefined): string | nu
   if (t === 'html' || t === 'htmlstring') return 'HTMLSTRING';
   if (t === 'object') return 'OBJECT';
   return null;
+}
+
+// ============================================================
+// SCRIPTS-PANEL ORCHESTRATORS (carved from legacy.ts in Phase 6)
+// ============================================================
+
+/** Return the path of the first .OL-datamodel file found in the open template. */
+export function findDatamodelPath(): string | null {
+  for (const path of Object.keys(state.files)) {
+    if (/\.OL-datamodel$/i.test(path)) return path;
+  }
+  return null;
+}
+
+/** Return true when a script references a field path that isn't present in the
+ *  loaded datamodel. Returns false when no datamodel is loaded (can't validate). */
+export function isScriptFieldInvalid(s: ParsedScript): boolean {
+  const fields = scriptsState.datamodelFields;
+  if (!fields || !fields.length) return false;
+  const path = s.kind === 'TEXT' ? s.fieldPath
+             : s.kind === 'CONDITIONAL' ? s.condField
+             : null;
+  if (!path) return false;
+  return !fields.some(f => f.path === path);
+}
+
+/** Count how many times a script's findText / selectorText appears across the
+ *  template's HTML and XML files. Result is memoised in scriptsState.usagesCache
+ *  so renderScriptsList stays cheap. Returns -1 when not applicable. */
+export function countScriptUsages(s: ParsedScript): number {
+  if (!scriptsState.usagesCache || typeof scriptsState.usagesCache.getOrCompute !== 'function') {
+    scriptsState.usagesCache = makeMemoCache();
+  }
+  return scriptsState.usagesCache.getOrCompute(s.id, () => {
+    const needles: string[] = [];
+    const ft = (s.findText || '').trim();
+    const st = (s.selectorText || '').trim();
+    if (ft) needles.push(ft);
+    if (st && st !== ft) needles.push(st);
+    if (!needles.length) return -1;
+    let total = 0;
+    for (const [path, f] of Object.entries(state.files)) {
+      if (!(f as { isText?: boolean }).isText) continue;
+      if (path === scriptsState.hostPath) continue;
+      const ext = extOf(path);
+      if (!['html', 'htm', 'xml', 'xsl', 'xslt'].includes(ext)) continue;
+      const text = (state.monacoModels as Record<string, { getValue(): string }>)[path]
+        ? (state.monacoModels as Record<string, { getValue(): string }>)[path].getValue()
+        : (f as { content: string }).content;
+      if (!text) continue;
+      for (const n of needles) {
+        let idx = 0;
+        while ((idx = text.indexOf(n, idx)) !== -1) { total++; idx += n.length; }
+      }
+    }
+    return total;
+  });
+}
+
+/** Populate the #datamodel-fields <datalist> from the .OL-datamodel in the open
+ *  template and store the parsed fields in scriptsState.datamodelFields. */
+export function refreshDatamodelFields(): void {
+  const list = document.getElementById('datamodel-fields');
+  if (!list) return;
+  list.innerHTML = '';
+  const dmPath = findDatamodelPath();
+  if (!dmPath) {
+    scriptsState.datamodelFields = [];
+    return;
+  }
+  const text = (state.monacoModels as Record<string, { getValue(): string }>)[dmPath]
+    ? (state.monacoModels as Record<string, { getValue(): string }>)[dmPath].getValue()
+    : (state.files[dmPath] as { content: string }).content;
+  const fields = parseDatamodelFields(text);
+  fields.sort((a, b) => a.path.localeCompare(b.path));
+  for (const f of fields) {
+    const opt = document.createElement('option');
+    opt.value = f.path;
+    if (f.type) opt.label = f.type;
+    list.appendChild(opt);
+  }
+  scriptsState.datamodelFields = fields;
+}
+
+/** Re-parse index.xml, rebuild the in-memory script list, then emit
+ *  'afterReparseScripts' so legacy.ts can call renderScriptsList(). */
+export function refreshScriptsList(): void {
+  scriptsState.list = [];
+  scriptsState.hostPath = null;
+  if (scriptsState.usagesCache && typeof scriptsState.usagesCache.invalidate === 'function') {
+    scriptsState.usagesCache.invalidate();
+  } else {
+    scriptsState.usagesCache = makeMemoCache();
+  }
+  if (scriptsState.selected) scriptsState.selected.clear();
+  for (const cand of SCRIPT_HOST_CANDIDATES) {
+    const f = state.files[cand] as { isText?: boolean } | undefined;
+    if (f && f.isText) {
+      scriptsState.hostPath = cand;
+      break;
+    }
+  }
+  if (!scriptsState.hostPath) {
+    hookEmit('afterReparseScripts');
+    refreshDatamodelFields();
+    return;
+  }
+  const text = (state.monacoModels as Record<string, { getValue(): string }>)[scriptsState.hostPath]
+    ? (state.monacoModels as Record<string, { getValue(): string }>)[scriptsState.hostPath].getValue()
+    : (state.files[scriptsState.hostPath] as { content: string }).content;
+  scriptsState.list = parseScriptsFromXml(text);
+  hookEmit('afterReparseScripts');
+  refreshDatamodelFields();
 }

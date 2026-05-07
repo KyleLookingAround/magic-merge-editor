@@ -43,9 +43,9 @@ The editor used to be a single ~7,394-line `template-editor.html`. It now lives 
 - `src/editor.ts` — `validateXml` + `formatXml`. The dead `_formatXmlOldRestore` placeholder that lived alongside `formatXml` was dropped — unreachable, referenced never-defined names.
 - `src/search.ts` — `appendSearchFile` + `renderSnippet`. Wires legacy callback via `configureSearch({ openFile })`. The driver (`runSearch`), the sidebar toggle (`setSidebarMode`) and the script-panel jump (`jumpToSearch`) stay in `legacy.ts`.
 - `src/review-modal.ts` — `openModal` / `closeModal` / `renderDiff` (lazy-cached `modalEls` + dismiss handlers wired on first call), plus the pure JSZip helper `zipTextMap`. `compareTemplates` and `reviewAndSave` stay in `legacy.ts` (both reach into `commitCurrentEdit` / `loadFromHandle` / monkey-patches).
-- `src/preview.ts` — `ZOOM_STEPS`, `collectUnresolvedTokens` (pure DOM walker), and `themeState` (`ThemeState` interface + `ThemePaletteEntry` / `ThemeFontSlot` / `ThemeNamedStyle` — migrated Phase 5). The orchestrators (`togglePreview` / `openPreview` / `closePreview` / `refreshPreview` / `buildPreviewHtml` / `parseDocxTheme` / `renderThemePanel` / `buildThemeCss` / `applyDatamodelPersonalization` / `renderTokensStrip` / `renderCssView` / `attachTokenJumpHandlers`) stay in `legacy.ts` — they depend on the blob-URL cache.
-- `src/scenarios.ts` — `scenariosState` + `ScenariosState` interface + `Scenario` type (migrated Phase 5). All scenario orchestrators (`loadScenarios`, `renderScenarioPicker`, `activateScenario`, `openScenarioDiff`, etc.) still live in `legacy.ts`.
-- `src/scripts-panel.ts` — `parseScriptsFromXml`, `serializeScriptBack`, `buildNewScriptXml`, `stripCdataKeepingOffsets`, `parseDatamodelFields`, `dmTypeToFormType`, `SCRIPT_HOST_CANDIDATES`, and `scriptsState` (`ScriptsState` interface — migrated Phase 5). Typed: `ParsedScript`, `ScriptForm`, `DatamodelField`, `ScriptKind`. Note: literal `</script>` strings inside this module are escaped as `<\/script>` to survive Vite's HTML inlining.
+- `src/preview.ts` — `ZOOM_STEPS`, `collectUnresolvedTokens` (pure DOM walker), `themeState` (`ThemeState` + `ThemePaletteEntry` / `ThemeFontSlot` / `ThemeNamedStyle` — Phase 5), and the four theme orchestrators: `getZipText`, `parseDocxTheme`, `renderThemePanel`, `buildThemeCss` (Phase 6). The heavy preview orchestrators (`togglePreview` / `openPreview` / `closePreview` / `refreshPreview` / `buildPreviewHtml` / `applyDatamodelPersonalization` / `renderTokensStrip` / `renderCssView` / `attachTokenJumpHandlers`) stay in `legacy.ts` — they depend on `previewState` (the blob-URL cache + open/mode/zoom shell) which hasn't been carved yet.
+- `src/scenarios.ts` — `scenariosState` + `ScenariosState` interface + `Scenario` type (Phase 5), `scnPersistKey` + `parseScenarioXmlToMap` (Phase 6). All scenario orchestrators (`loadScenarios`, `renderScenarioPicker`, `activateScenario`, `openScenarioDiff`, etc.) still live in `legacy.ts`.
+- `src/scripts-panel.ts` — `parseScriptsFromXml`, `serializeScriptBack`, `buildNewScriptXml`, `stripCdataKeepingOffsets`, `parseDatamodelFields`, `dmTypeToFormType`, `SCRIPT_HOST_CANDIDATES`, `scriptsState` (`ScriptsState` interface — Phase 5), `findDatamodelPath`, `isScriptFieldInvalid`, `countScriptUsages`, `refreshDatamodelFields`, `refreshScriptsList` (Phase 6). `refreshScriptsList` emits `'afterReparseScripts'`; legacy.ts registers `hookOn('afterReparseScripts', renderScriptsList)`. Typed: `ParsedScript`, `ScriptForm`, `DatamodelField`, `ScriptKind`. Note: literal `</script>` strings inside this module are escaped as `<\/script>` to survive Vite's HTML inlining.
 - `src/legacy.ts` — `// @ts-nocheck` carve residue. The original IIFE is preserved; what's left is DOM event wiring, the heavy DOM-mutating flows (`openFile`, `commitCurrentEdit`, `rezipAndSave`, `refreshScriptsList`, `openScriptForm`, the preview pipeline, scenarios, notes, navigator, locked-folder unlock, file add/rename/delete, preset overlay), and `hookOn(...)` registrations that stitch sections together. **No more `_orig*` monkey-patch variables.** The header comment lists every module + why each remaining orchestrator stayed. **Edit logic here only as a last resort — prefer landing changes in the relevant module.**
 
 ## Build / dev / test
@@ -85,9 +85,18 @@ Two parallel tracks.
 
 Note: the CI workflow (`ci.yml`) runs `npm test` which runs the Playwright smoke suite against `npm run preview`. The `app boots` test runs unconditionally; the two round-trip tests require `fixtures/synthetic.OL-template` to be present (it is, it's committed).
 
-## Phase 6 (planned) — optional follow-ups
+## Phase 6 (in progress) — orchestrator extraction
 
-From the original improvement plan + the 2026-05-05 audit: native-dialog → modal replacement, ARIA pass, keyboard help dialog, `buildTree` perf, debounced preview auto-refresh, FLD/IF kind chips, drag-to-reorder, bulk operations, rename-token-everywhere, vendor CDN deps via npm.
+*First wave (completed 2026-05-07).* Pure-ish helpers and the four theme orchestrators moved out of `legacy.ts`:
+
+- **`src/preview.ts`** gained: `getZipText`, `parseDocxTheme`, `renderThemePanel`, `buildThemeCss` (+ their imports from `state`, `tree`, `fs`). `legacy.ts` imports all four; original bodies replaced with carve markers.
+- **`src/scripts-panel.ts`** gained: `findDatamodelPath`, `isScriptFieldInvalid`, `countScriptUsages`, `refreshDatamodelFields`, `refreshScriptsList` (+ imports of `state`, `extOf`, `emit as hookEmit`). `refreshScriptsList` emits `'afterReparseScripts'` instead of calling `renderScriptsList()` directly. `legacy.ts` registers `hookOn('afterReparseScripts', () => renderScriptsList())`. `usagesCache` typed as `MemoCache<number>`.
+- **`src/scenarios.ts`** gained: `scnPersistKey`, `parseScenarioXmlToMap` (+ `import { state }`). `legacy.ts` imports both; original bodies replaced with carve markers.
+- Build: 190.95 kB / 51.45 kB gzip (unchanged from Phase 5 baseline). `tsc --noEmit` clean.
+
+*Still in `legacy.ts`:* `renderScriptsList` (needs `configureScriptsList({openScriptForm, toggleScriptEnabled, jumpToSearch, moveScript, setStatus})`), `openScriptForm`, `applyScriptForm`, `createScript`, `deleteScript`, `cloneScript`, `moveScript`, bulk ops, `loadScenarios`, `renderScenarioPicker`, `activateScenario`, `openScenarioDiff`, notes, navigator, locked-folder unlock, preset overlay.
+
+*Optional follow-ups:* native-dialog → modal replacement, ARIA pass, keyboard help dialog, `buildTree` perf, debounced preview auto-refresh, FLD/IF kind chips, drag-to-reorder, bulk operations, rename-token-everywhere, vendor CDN deps via npm.
 
 ## Decisions Kyle has already made
 
@@ -121,10 +130,10 @@ From the original improvement plan + the 2026-05-05 audit: native-dialog → mod
 
 ## Suggested next move
 
-Phase 5 is complete. The three state shells are exported from their modules and the XSS sweep is done. Next priorities:
+Phase 6 first wave is complete. Build green, `tsc --noEmit` clean. Next priorities:
 
-- **Vite project layout: add `src/scenarios.ts` to the module table** (see below in the "Vite project layout" section — not yet updated here, do it as you work through Phase 6).
-- **Move orchestrators into their modules.** Now that `scriptsState` lives in `scripts-panel.ts`, `scenariosState` in `scenarios.ts`, and `themeState` in `preview.ts`, the orchestrators that mutate them (`refreshScriptsList`, `renderScriptsList`, `openScriptForm`, etc.) can move out of `legacy.ts` one at a time. Each move should be followed by a build + smoke test.
-- **GitHub Pages deploy.** Push the Phase 5 branch, merge to main, and verify the Pages deploy completes. Add the live URL to the README.
+- **Manual smoke test.** Open `dist/index.html` in Chrome/Edge, load `M2L-KFI.OL-template`, edit a script, *Review & Save*, reopen, verify round-trip. Confirm the Theme panel still renders for a `.docx`.
+- **`renderScriptsList` carve (second wave).** It's the biggest remaining orchestrator in `legacy.ts` that belongs in `scripts-panel.ts`. Needs `configureScriptsList({ openScriptForm, toggleScriptEnabled, jumpToSearch, moveScript, setStatus })` deps injection — straightforward once you're comfortable with the pattern.
+- **GitHub Pages deploy.** Merge the Phase 5/6 branch to main and verify Pages deploy completes. Add the live URL to the README.
 
 Smoke target after any edit: `npm run build` → open `dist/index.html` in Chrome/Edge → load `M2L-KFI.OL-template` → edit a script → *Review & Save* → reopen → verify round-trip.

@@ -8,7 +8,7 @@ const fixturePath = resolve(here, '../fixtures/synthetic.OL-template');
 
 test('app boots', async ({ page }) => {
   await page.goto('/');
-  await expect(page.locator('#app')).toContainText('PlanetPress Template Editor');
+  await expect(page.locator('header h1')).toHaveText('PlanetPress Template Editor');
 });
 
 test.describe('round-trip via synthetic fixture', () => {

@@ -3,15 +3,17 @@
 //
 // Phase 6 second pass: previewState, revokePreviewBlobs, renderTokensStrip,
 // scriptByToken, jumpToScriptByToken, attachTokenJumpHandlers, renderCssView,
-// openPreviewNewTab migrated here. The remaining orchestrators (togglePreview,
-// openPreview, closePreview, refreshPreview, setPreviewMode, zoom controls,
-// buildPreviewHtml, applyDatamodelPersonalization) still live in legacy.ts —
-// they depend on the full preview open/close/refresh pipeline.
+// openPreviewNewTab migrated here.
+//
+// Phase 8: full preview pipeline migrated here — setPreviewMode, zoom
+// controls, togglePreview, openPreview, closePreview, refreshPreview,
+// buildPreviewHtml, applyDatamodelPersonalization.
 //
 import { state } from './state';
 import { escapeHtml } from './tree';
-import { decodeBytes } from './fs';
+import { extOf, decodeBytes } from './fs';
 import { scriptsState } from './scripts-panel';
+import { scenariosState } from './scenarios';
 
 export interface ThemePaletteEntry { key: string; name: string; hex: string; }
 export interface ThemeFontSlot { latin: string; ea: string; cs: string; }
@@ -331,14 +333,12 @@ export interface PreviewHelperDeps {
   setSidebarMode: (mode: string) => void;
   openScriptForm: (id: string) => void;
   setStatus: (msg: string, kind?: string) => void;
-  buildPreviewHtml: (htmlPath: string, htmlText: string, opts?: { withData?: boolean }) => string;
 }
 
 let helperDeps: PreviewHelperDeps = {
   setSidebarMode: () => {},
   openScriptForm: () => {},
   setStatus: () => {},
-  buildPreviewHtml: () => '',
 };
 
 export function configurePreviewHelpers(d: PreviewHelperDeps): void { helperDeps = d; }
@@ -453,9 +453,491 @@ export function openPreviewNewTab(): void {
     ? (state.monacoModels as Record<string, { getValue(): string }>)[state.currentPath].getValue()
     : (state.files[state.currentPath] as { content?: string }).content ?? '';
   const withData = previewState.mode !== 'raw';
-  const built = helperDeps.buildPreviewHtml(state.currentPath, text, { withData });
+  const built = buildPreviewHtml(state.currentPath, text, { withData });
   const blob = new Blob([built], { type: 'text/html' });
   const url = URL.createObjectURL(blob);
   window.open(url, '_blank');
   setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+// ============================================================
+// PREVIEW PIPELINE (carved from legacy.ts in Phase 8)
+// ============================================================
+
+export function setPreviewMode(mode: string): void {
+  if (!['data', 'raw', 'split', 'css'].includes(mode)) return;
+  previewState.mode = mode;
+  previewState.tokensDismissed = false;
+
+  document.getElementById('btn-pv-tab-data')!.classList.toggle('active', mode === 'data');
+  document.getElementById('btn-pv-tab-raw')!.classList.toggle('active', mode === 'raw');
+  document.getElementById('btn-pv-tab-split')!.classList.toggle('active', mode === 'split');
+  document.getElementById('btn-pv-tab-css')!.classList.toggle('active', mode === 'css');
+  const zoomCluster = document.querySelector('#preview-header .zoom-cluster') as HTMLElement | null;
+  if (zoomCluster) zoomCluster.style.visibility = (mode === 'css') ? 'hidden' : 'visible';
+  const frame = document.getElementById('preview-frame')!;
+  const split = document.getElementById('preview-split')!;
+  const cssView = document.getElementById('preview-css-view')!;
+  frame.classList.toggle('hidden', mode !== 'data' && mode !== 'raw' && mode !== 'doc');
+  split.classList.toggle('show', mode === 'split');
+  cssView.classList.toggle('show', mode === 'css');
+  if (previewState.open) refreshPreview();
+}
+
+export function stepZoom(dir: number): void {
+  const cur = previewState.zoom;
+  let idx = ZOOM_STEPS.findIndex(z => Math.abs(z - cur) < 0.001);
+  if (idx === -1) {
+    idx = ZOOM_STEPS.reduce((best, z, i) =>
+      Math.abs(z - cur) < Math.abs(ZOOM_STEPS[best] - cur) ? i : best, 0);
+  }
+  idx = Math.max(0, Math.min(ZOOM_STEPS.length - 1, idx + dir));
+  setZoom(ZOOM_STEPS[idx]);
+}
+
+export function setZoom(z: number): void {
+  previewState.zoom = z;
+  (document.getElementById('preview-zoom-level') as HTMLElement).textContent = Math.round(z * 100) + '%';
+  (document.getElementById('btn-preview-zoom-out') as HTMLButtonElement).disabled = z <= ZOOM_STEPS[0];
+  (document.getElementById('btn-preview-zoom-in') as HTMLButtonElement).disabled = z >= ZOOM_STEPS[ZOOM_STEPS.length - 1];
+  applyZoomToFrame();
+}
+
+export function applyZoomToFrame(): void {
+  applyZoomToFrameEl(document.getElementById('preview-frame') as HTMLIFrameElement | null);
+  if (previewState.mode === 'split') {
+    applyZoomToFrameEl(document.getElementById('preview-frame-data') as HTMLIFrameElement | null);
+    applyZoomToFrameEl(document.getElementById('preview-frame-raw') as HTMLIFrameElement | null);
+  }
+}
+
+export function applyZoomToFrameEl(frame: HTMLElement | null): void {
+  if (!frame) return;
+  const iframeEl = frame as HTMLIFrameElement;
+  let doc: Document | null;
+  try { doc = iframeEl.contentDocument; } catch (_) { doc = null; }
+  if (!doc || !doc.documentElement) return;
+  let style = doc.getElementById('__cw_zoom__') as HTMLStyleElement | null;
+  if (!style) {
+    style = doc.createElement('style') as HTMLStyleElement;
+    style.id = '__cw_zoom__';
+    (doc.head || doc.documentElement).appendChild(style);
+  }
+  style.textContent = 'html { zoom: ' + previewState.zoom + '; }';
+}
+
+export function togglePreview(): void {
+  if (previewState.open) closePreview();
+  else openPreview();
+}
+
+export function openPreview(): void {
+  if (!state.currentPath) return;
+  const ext = extOf(state.currentPath);
+  if (!['html', 'htm'].includes(ext)) {
+    helperDeps.setStatus('Preview only supports HTML files.', 'warn');
+    return;
+  }
+  previewState.open = true;
+  document.getElementById('preview-pane')!.classList.add('show');
+  (document.getElementById('preview-resizer') as HTMLElement).style.display = '';
+  document.getElementById('btn-preview')!.classList.add('active');
+  const restored = previewState.modeByPath[state.currentPath] || previewState.mode || 'data';
+  setPreviewMode(restored);
+}
+
+export function closePreview(): void {
+  previewState.open = false;
+  document.getElementById('preview-pane')!.classList.remove('show');
+  (document.getElementById('preview-resizer') as HTMLElement).style.display = 'none';
+  document.getElementById('btn-preview')!.classList.remove('active');
+  revokePreviewBlobs();
+}
+
+export function refreshPreview(): void {
+  if (!previewState.open) return;
+  if (previewState.mode === 'doc') {
+    const frame = document.getElementById('preview-frame') as HTMLIFrameElement | null;
+    if (frame) frame.srcdoc = '<div style="font:13px sans-serif;color:#888;padding:16px;line-height:1.5">Document preview was removed (mammoth.js was unreliable on these templates).<br><br>Use the <strong>Theme</strong> sidebar for colours, fonts, and styles, or open the .docx in Word directly.</div>';
+    return;
+  }
+  let target: string | null = null;
+  if (state.currentPath && ['html', 'htm'].includes(extOf(state.currentPath))) {
+    target = state.currentPath;
+  } else if (previewState.htmlPath && state.files[previewState.htmlPath]) {
+    target = previewState.htmlPath;
+  }
+  if (!target) return;
+  const text: string = state.monacoModels[target]
+    ? state.monacoModels[target].getValue()
+    : state.files[target].content;
+
+  previewState.htmlPath = target;
+  (document.getElementById('preview-title') as HTMLElement).textContent = target;
+  previewState.modeByPath[target] = previewState.mode;
+
+  const mode = previewState.mode;
+  if (mode === 'css') {
+    buildPreviewHtml(target, text, { withData: true });
+    renderCssView();
+    renderTokensStrip();
+    return;
+  }
+
+  if (mode === 'split') {
+    const builtData = buildPreviewHtml(target, text, { withData: true });
+    const unresolvedFromData = previewState.unresolved.slice();
+    const builtRaw = buildPreviewHtml(target, text, { withData: false });
+    previewState.unresolved = unresolvedFromData;
+    const fData = document.getElementById('preview-frame-data') as HTMLIFrameElement;
+    const fRaw  = document.getElementById('preview-frame-raw') as HTMLIFrameElement;
+    fData.onload = () => { applyZoomToFrameEl(fData); attachTokenJumpHandlers(fData); };
+    fRaw.onload  = () => { applyZoomToFrameEl(fRaw);  attachTokenJumpHandlers(fRaw);  };
+    fData.srcdoc = builtData;
+    fRaw.srcdoc  = builtRaw;
+    renderTokensStrip();
+    return;
+  }
+
+  const withData = mode === 'data';
+  const built = buildPreviewHtml(target, text, { withData });
+  const frame = document.getElementById('preview-frame') as HTMLIFrameElement;
+  frame.onload = () => { applyZoomToFrame(); attachTokenJumpHandlers(frame); };
+  frame.srcdoc = built;
+  renderTokensStrip();
+}
+
+/** Build a self-contained HTML string for the preview iframe from a zip entry.
+ *  Rewrites asset references (CSS, images, scripts, fonts) to blob URLs so
+ *  the sandboxed iframe can render them without file-system access. */
+export function buildPreviewHtml(htmlPath: string, htmlText: string, opts?: { withData?: boolean }): string {
+  const withData = opts?.withData !== false;
+  revokePreviewBlobs();
+
+  const htmlPathFwd = htmlPath.replace(/\\/g, '/');
+  const baseDir = htmlPathFwd.includes('/')
+    ? htmlPathFwd.substring(0, htmlPathFwd.lastIndexOf('/') + 1)
+    : '';
+
+  function normalizePath(p: string): string {
+    const parts = p.replace(/\\/g, '/').split('/');
+    const out: string[] = [];
+    for (const part of parts) {
+      if (part === '..') out.pop();
+      else if (part !== '.' && part !== '') out.push(part);
+    }
+    return out.join('/');
+  }
+
+  function lookupZipKey(norm: string): string | null {
+    if (state.files[norm]) return norm;
+    const back = norm.replace(/\//g, '\\');
+    if (state.files[back]) return back;
+    return null;
+  }
+
+  function resolveZipPath(rel: string | null): string | null {
+    if (!rel) return null;
+    rel = rel.trim();
+    if (/^(?:https?:|data:|blob:|mailto:|tel:|javascript:|#|\/\/)/i.test(rel)) return null;
+    rel = rel.split('?')[0].split('#')[0];
+    if (!rel) return null;
+    rel = rel.replace(/\\/g, '/');
+    if (rel.startsWith('/')) rel = rel.substring(1);
+    else rel = baseDir + rel;
+    return lookupZipKey(normalizePath(rel));
+  }
+
+  const mimeFor = (path: string): string => {
+    const e = extOf(path);
+    return ({
+      css: 'text/css', js: 'text/javascript', mjs: 'text/javascript',
+      json: 'application/json', html: 'text/html', htm: 'text/html',
+      svg: 'image/svg+xml', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+      gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', ico: 'image/x-icon',
+      woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', otf: 'font/otf',
+      eot: 'application/vnd.ms-fontobject',
+    } as Record<string, string>)[e] || 'application/octet-stream';
+  };
+
+  const blobCache = new Map<string, string>();
+  function blobUrlFor(zipPath: string): string | null {
+    if (blobCache.has(zipPath)) return blobCache.get(zipPath)!;
+    const f = state.files[zipPath];
+    if (!f) return null;
+    const blob = new Blob([f.content], { type: mimeFor(zipPath) });
+    const url = URL.createObjectURL(blob);
+    blobCache.set(zipPath, url);
+    previewState.blobUrls.push(url);
+    return url;
+  }
+
+  function rewriteCss(css: string, cssDir: string): string {
+    function resolveRelToCss(rel: string): string | null {
+      if (!rel) return null;
+      rel = rel.trim();
+      if (/^(?:https?:|data:|blob:|\/\/)/i.test(rel)) return null;
+      rel = rel.split('?')[0].split('#')[0];
+      if (!rel) return null;
+      rel = rel.replace(/\\/g, '/');
+      const p = rel.startsWith('/') ? rel.substring(1) : (cssDir + rel);
+      return lookupZipKey(normalizePath(p));
+    }
+    return css
+      .replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (_m: string, _q: string, url: string) => {
+        const zp = resolveRelToCss(url);
+        if (!zp) return _m;
+        const burl = blobUrlFor(zp);
+        return burl ? 'url("' + burl + '")' : _m;
+      })
+      .replace(/@import\s+(?:url\()?\s*(['"]?)([^'")\s;]+)\1\)?/g, (_m: string, _q: string, url: string) => {
+        const zp = resolveRelToCss(url);
+        if (!zp) return _m;
+        const f = state.files[zp];
+        if (f && f.isText) {
+          const zpFwd = zp.replace(/\\/g, '/');
+          const subDir = zpFwd.includes('/') ? zpFwd.substring(0, zpFwd.lastIndexOf('/') + 1) : '';
+          return rewriteCss(f.content, subDir);
+        }
+        const burl = blobUrlFor(zp);
+        return burl ? '@import url("' + burl + '")' : _m;
+      });
+  }
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(htmlText, 'text/html');
+  const cssBlocks: CssBlock[] = [];
+
+  doc.querySelectorAll('link[rel~="stylesheet"][href]').forEach(link => {
+    const href = link.getAttribute('href');
+    const zp = resolveZipPath(href);
+    if (!zp) return;
+    const f = state.files[zp];
+    if (f && f.isText) {
+      const zpFwd = zp.replace(/\\/g, '/');
+      const cssDir = zpFwd.includes('/') ? zpFwd.substring(0, zpFwd.lastIndexOf('/') + 1) : '';
+      const rewritten = rewriteCss(f.content, cssDir);
+      const style = doc.createElement('style');
+      style.setAttribute('data-from', zp);
+      style.textContent = rewritten;
+      link.replaceWith(style);
+      cssBlocks.push({ label: zp + ' (linked stylesheet)', css: rewritten, bytes: rewritten.length });
+    } else {
+      const burl = blobUrlFor(zp);
+      if (burl) link.setAttribute('href', burl);
+    }
+  });
+
+  doc.querySelectorAll('style').forEach((s, i) => {
+    if (s.getAttribute('data-from')) return;
+    const rewritten = rewriteCss(s.textContent || '', baseDir);
+    s.textContent = rewritten;
+    cssBlocks.push({ label: htmlPath + ' <style #' + (i + 1) + '>', css: rewritten, bytes: rewritten.length });
+  });
+
+  doc.querySelectorAll('[style]').forEach(el => {
+    el.setAttribute('style', rewriteCss(el.getAttribute('style') || '', baseDir));
+  });
+
+  doc.querySelectorAll('img[src]').forEach(img => {
+    const zp = resolveZipPath(img.getAttribute('src'));
+    if (zp) { const u = blobUrlFor(zp); if (u) img.setAttribute('src', u); }
+    const srcset = img.getAttribute('srcset');
+    if (srcset) {
+      const rebuilt = srcset.split(',').map(part => {
+        const tok = part.trim().split(/\s+/);
+        const zp2 = resolveZipPath(tok[0]);
+        if (zp2) { const u = blobUrlFor(zp2); if (u) tok[0] = u; }
+        return tok.join(' ');
+      }).join(', ');
+      img.setAttribute('srcset', rebuilt);
+    }
+  });
+
+  doc.querySelectorAll('source[src], video[src], audio[src]').forEach(el => {
+    const zp = resolveZipPath(el.getAttribute('src'));
+    if (zp) { const u = blobUrlFor(zp); if (u) el.setAttribute('src', u); }
+  });
+
+  doc.querySelectorAll('script[src]').forEach(s => {
+    const zp = resolveZipPath(s.getAttribute('src'));
+    if (!zp) return;
+    const f = state.files[zp];
+    if (f && f.isText) {
+      const inline = doc.createElement('script');
+      const t = s.getAttribute('type'); if (t) inline.setAttribute('type', t);
+      inline.textContent = f.content;
+      s.replaceWith(inline);
+    } else {
+      const u = blobUrlFor(zp);
+      if (u) s.setAttribute('src', u);
+    }
+  });
+
+  doc.querySelectorAll('link[href]:not([rel~="stylesheet"])').forEach(link => {
+    const zp = resolveZipPath(link.getAttribute('href'));
+    if (zp) { const u = blobUrlFor(zp); if (u) link.setAttribute('href', u); }
+  });
+
+  doc.querySelectorAll('object[data], embed[src], iframe[src]').forEach(el => {
+    const attr = el.tagName.toLowerCase() === 'object' ? 'data' : 'src';
+    const zp = resolveZipPath(el.getAttribute(attr));
+    if (zp) { const u = blobUrlFor(zp); if (u) el.setAttribute(attr, u); }
+  });
+
+  doc.querySelectorAll('base').forEach(b => b.remove());
+
+  const resolvedCount = withData ? applyDatamodelPersonalization(doc) : 0;
+  previewState.unresolved = collectUnresolvedTokens(doc);
+
+  const banner = doc.createElement('div');
+  let bannerText: string, bannerBg: string, bannerFg: string, bannerBorder: string;
+  if (!withData) {
+    bannerText = 'Preview (Raw) — datamodel substitution disabled; @field@ tokens shown literally';
+    bannerBg = '#e1edf7'; bannerFg = '#0a3a66'; bannerBorder = '#b6d4ee';
+  } else if (resolvedCount > 0) {
+    const scn = scenariosState?.active ?? null;
+    if (scn) {
+      bannerText = `Preview (With Data) — scenario "${scn}", ${resolvedCount} field${resolvedCount === 1 ? '' : 's'} resolved`;
+      bannerBg = '#d1f0d4'; bannerFg = '#1f4d23'; bannerBorder = '#a8dcb0';
+    } else {
+      bannerText = `Preview (With Data) — ${resolvedCount} field${resolvedCount === 1 ? '' : 's'} resolved from datamodel sample values`;
+      bannerBg = '#fff3cd'; bannerFg = '#664d03'; bannerBorder = '#ffecb5';
+    }
+  } else {
+    bannerText = 'Preview (With Data) — open a template with a datamodel to resolve @field@ placeholders';
+    bannerBg = '#fff3cd'; bannerFg = '#664d03'; bannerBorder = '#ffecb5';
+  }
+  banner.style.cssText = 'position:fixed;top:0;left:0;right:0;background:' + bannerBg + ';color:' + bannerFg + ';border-bottom:1px solid ' + bannerBorder + ';font:11px -apple-system,sans-serif;padding:4px 8px;z-index:99999;';
+  banner.textContent = bannerText;
+  if (doc.body) doc.body.insertBefore(banner, doc.body.firstChild);
+
+  if (!withData && doc.body) {
+    const tokenStyle = doc.createElement('style');
+    tokenStyle.textContent =
+      '/* injected by editor — highlight @field@ tokens in raw preview */\n' +
+      '.__cw_raw_token { background:#fde68a; color:#7c2d12; padding:0 2px; border-radius:2px; }';
+    if (doc.head) doc.head.appendChild(tokenStyle);
+    const re = /@[A-Za-z0-9_./\-]+@/g;
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, null);
+    const targets: Text[] = [];
+    let n: Node | null;
+    while ((n = walker.nextNode())) {
+      if (n.parentNode && /^(SCRIPT|STYLE)$/i.test((n.parentNode as Element).nodeName)) continue;
+      if (re.test((n as Text).nodeValue ?? '')) targets.push(n as Text);
+      re.lastIndex = 0;
+    }
+    for (const t of targets) {
+      const frag = doc.createDocumentFragment();
+      let last = 0;
+      const text = t.nodeValue ?? '';
+      let m: RegExpExecArray | null;
+      re.lastIndex = 0;
+      while ((m = re.exec(text)) !== null) {
+        if (m.index > last) frag.appendChild(doc.createTextNode(text.slice(last, m.index)));
+        const span = doc.createElement('span');
+        span.className = '__cw_raw_token';
+        span.textContent = m[0];
+        frag.appendChild(span);
+        last = m.index + m[0].length;
+      }
+      if (last < text.length) frag.appendChild(doc.createTextNode(text.slice(last)));
+      t.parentNode!.replaceChild(frag, t);
+    }
+  }
+
+  previewState.lastCssBlocks = cssBlocks;
+  previewState.lastCss = cssBlocks.map(b => '/* ' + b.label + ' */\n' + b.css).join('\n\n');
+
+  return '<!doctype html>\n' + doc.documentElement.outerHTML;
+}
+
+/** Substitute @field@ placeholders and apply conditional show/hide rules
+ *  from the script blocks in index.xml. Returns the count of distinct
+ *  fields resolved. */
+export function applyDatamodelPersonalization(doc: Document): number {
+  const fields = scriptsState?.datamodelFields ?? [];
+  const overrides = scenariosState?.activeOverrides ?? null;
+  if (!fields.length && !overrides) return 0;
+  if (!doc.body) return 0;
+
+  const valueByPath = new Map<string, string>();
+  for (const f of fields) valueByPath.set(f.path, f.lastValue == null ? '' : String(f.lastValue));
+  if (overrides) {
+    for (const [path, val] of overrides.entries()) valueByPath.set(path, val == null ? '' : String(val));
+  }
+
+  const tokenToValue = new Map<string, string>();
+  const conditionals: import('./scripts-panel').ParsedScript[] = [];
+  for (const s of scriptsState?.list ?? []) {
+    if (s.kind === 'TEXT' && s.findText && s.fieldPath) {
+      const v = valueByPath.has(s.fieldPath) ? valueByPath.get(s.fieldPath) : null;
+      if (v != null) tokenToValue.set(s.findText, (s.prefix || '') + v + (s.suffix || ''));
+    } else if (s.kind === 'CONDITIONAL' && s.condField && s.selectorType === 'QUERY' && s.selectorText) {
+      conditionals.push(s);
+    }
+  }
+  for (const [path, val] of valueByPath.entries()) {
+    const token = '@' + path + '@';
+    if (!tokenToValue.has(token)) tokenToValue.set(token, val);
+  }
+
+  if (!tokenToValue.size && !conditionals.length) return 0;
+
+  const tokens = Array.from(tokenToValue.keys());
+  if (tokens.length) {
+    const escTokens = tokens.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const re = new RegExp('(' + escTokens.join('|') + ')', 'g');
+    const replace = (text: string) => text.replace(re, m => tokenToValue.get(m) ?? m);
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, null);
+    const replacements: Text[] = [];
+    let n: Node | null;
+    while ((n = walker.nextNode())) {
+      if ((n as Text).nodeValue && re.test((n as Text).nodeValue!)) replacements.push(n as Text);
+      re.lastIndex = 0;
+    }
+    for (const n of replacements) n.nodeValue = replace(n.nodeValue!);
+    doc.body.querySelectorAll('[alt],[title],[href],[src],[value]').forEach(el => {
+      (['alt', 'title', 'href', 'src', 'value'] as const).forEach(attr => {
+        if (!el.hasAttribute(attr)) return;
+        const v = el.getAttribute(attr);
+        if (v && re.test(v)) { re.lastIndex = 0; el.setAttribute(attr, replace(v)); }
+      });
+    });
+  }
+
+  for (const s of conditionals) {
+    const v = valueByPath.get(s.condField!);
+    if (v == null) continue;
+    let pass: boolean;
+    const a = s.condCaseInsensitive ? String(v).toLowerCase() : String(v);
+    const b = s.condCaseInsensitive ? String(s.condValue).toLowerCase() : String(s.condValue);
+    switch (s.condition) {
+      case 'EQUAL_TO':              pass = a === b; break;
+      case 'NOT_EQUAL_TO':          pass = a !== b; break;
+      case 'GREATER_THAN':          pass = parseFloat(a) >  parseFloat(b); break;
+      case 'GREATER_THAN_OR_EQUAL': pass = parseFloat(a) >= parseFloat(b); break;
+      case 'LESS_THAN':             pass = parseFloat(a) <  parseFloat(b); break;
+      case 'LESS_THAN_OR_EQUAL':    pass = parseFloat(a) <= parseFloat(b); break;
+      case 'CONTAINS':              pass = a.indexOf(b) !== -1; break;
+      case 'STARTS_WITH':           pass = a.startsWith(b); break;
+      case 'ENDS_WITH':             pass = a.endsWith(b); break;
+      case 'IS_EMPTY':              pass = !a; break;
+      case 'IS_NOT_EMPTY':          pass = !!a; break;
+      default:                      pass = true;
+    }
+    const shouldShow = (s.condAction === 'SHOW') ? pass : !pass;
+    let matches: NodeListOf<Element>;
+    try { matches = doc.body.querySelectorAll(s.selectorText!); }
+    catch (_) { continue; }
+    matches.forEach(el => {
+      if (s.condToggleVisibility !== false) {
+        (el as HTMLElement).style.display = shouldShow ? '' : 'none';
+      } else if (!shouldShow) {
+        el.remove();
+      }
+    });
+  }
+
+  return tokenToValue.size;
 }

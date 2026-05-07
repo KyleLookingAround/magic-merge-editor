@@ -3,13 +3,14 @@
 //
 // Scope: openModal / closeModal / renderDiff (the modal shell) plus
 // zipTextMap (a pure JSZip helper used by compareTemplates).
-// reviewAndSave and compareTemplates stay in legacy.ts - both reach
-// into commitCurrentEdit / setStatus / loadFromHandle, all of which
-// are still legacy-resident and heavily monkey-patched.
 //
-// Globals: `Diff` (jsdiff) is loaded from CDN and read off
+// Phase 8: compareTemplates and reviewAndSave migrated here.
+//
+// Globals: `Diff` (jsdiff) and `JSZip` are loaded from CDN and read off
 // globalThis. JSZip instances are passed in by callers.
 
+import { state } from './state';
+import { escapeHtml } from './tree';
 import { isTextPath, isImagePath, looksLikeText, decodeBytes } from './fs';
 
 const getDiff = () => (globalThis as any).Diff;
@@ -130,4 +131,137 @@ export async function zipTextMap(zip: any): Promise<Record<string, string>> {
     }
   }
   return out;
+}
+
+// ============================================================
+// COMPARE + REVIEW (carved from legacy.ts in Phase 8)
+// ============================================================
+
+interface ReviewModalDeps {
+  setStatus: (msg: string, kind?: string) => void;
+  commitCurrentEdit: (showStatus: boolean) => void;
+  rezipAndSave: () => Promise<void>;
+}
+
+let rmDeps: ReviewModalDeps = {
+  setStatus: () => {},
+  commitCurrentEdit: () => {},
+  rezipAndSave: async () => {},
+};
+
+export function configureReviewModal(d: ReviewModalDeps): void { rmDeps = d; }
+
+export async function compareTemplates(): Promise<void> {
+  if (!state.zip) {
+    rmDeps.setStatus('Open a template first, then click Compare to pick a second one.', 'warn');
+    return;
+  }
+  if (!(window as any).showOpenFilePicker) return;
+  let handle: any;
+  try {
+    [handle] = await (window as any).showOpenFilePicker({ multiple: false });
+  } catch (e: any) { if (e.name !== 'AbortError') rmDeps.setStatus(e.message, 'err'); return; }
+
+  rmDeps.setStatus('Loading second template...');
+  const file = await handle.getFile();
+  let other: any;
+  try { other = await (globalThis as any).JSZip.loadAsync(file); }
+  catch (e: any) { rmDeps.setStatus('Not a valid zip: ' + e.message, 'err'); return; }
+
+  const A = await zipTextMap(state.zip);
+  const B = await zipTextMap(other);
+
+  const allPaths = new Set([...Object.keys(A), ...Object.keys(B)]);
+  const items: { path: string; status: string; a: string; b: string }[] = [];
+  for (const p of [...allPaths].sort()) {
+    const a = A[p], b = B[p];
+    if (a === undefined && b !== undefined) items.push({ path: p, status: 'added', a: '', b });
+    else if (a !== undefined && b === undefined) items.push({ path: p, status: 'removed', a, b: '' });
+    else if (a !== b) items.push({ path: p, status: 'modified', a, b });
+  }
+
+  if (!items.length) { rmDeps.setStatus('Templates are identical (text content).', 'ok'); return; }
+
+  openModal(`Compare — ${state.fileName} ↔ ${handle.name}`, 'Close', closeModal);
+  const m = getModalEls();
+  m.status.textContent = `${items.length} differing file${items.length === 1 ? '' : 's'}.`;
+
+  m.sidebar.innerHTML = '';
+  items.forEach((it, i) => {
+    const el = document.createElement('div');
+    el.className = 'modal-file-item' + (i === 0 ? ' active' : '');
+    const badge = it.status === 'added' ? 'ADD' : it.status === 'removed' ? 'DEL' : 'CHG';
+    el.innerHTML = `<span class="badge ${it.status}">${badge}</span><span style="overflow:hidden;text-overflow:ellipsis;">${escapeHtml(it.path)}</span>`;
+    el.addEventListener('click', () => {
+      m.sidebar.querySelectorAll('.modal-file-item').forEach(x => x.classList.remove('active'));
+      el.classList.add('active');
+      renderDiff(it.a, it.b);
+    });
+    m.sidebar.appendChild(el);
+  });
+  renderDiff(items[0].a, items[0].b);
+  rmDeps.setStatus('', '');
+}
+
+export async function reviewAndSave(): Promise<void> {
+  if (!state.fileHandle) return;
+  rmDeps.commitCurrentEdit(false);
+
+  const changes: { path: string; original: string; current: string; status: string }[] = [];
+  if (state.zip) {
+    const inZip = new Set<string>();
+    state.zip.forEach((p: string, e: any) => { if (!e.dir) inZip.add(p); });
+    for (const path of Object.keys(state.files)) {
+      const f = state.files[path];
+      if (!inZip.has(path)) {
+        const current = f.isText ? f.content : `(${(f.content && f.content.length) || 0} bytes binary)`;
+        changes.push({ path, original: '', current, status: 'added' });
+        continue;
+      }
+      if (!f.isText) continue;
+      const original: string = await state.zip.file(path).async('string');
+      if (original !== f.content) changes.push({ path, original, current: f.content, status: 'modified' });
+    }
+    for (const p of inZip) {
+      if (!state.files[p]) {
+        let original = '';
+        try { original = await state.zip.file(p).async('string'); } catch (_) {}
+        changes.push({ path: p, original, current: '', status: 'removed' });
+      }
+    }
+  } else if (state.standalone) {
+    const f = state.files[state.fileName as string];
+    const original: string = state.standalone.original ?? '';
+    if (original !== f.content) changes.push({ path: state.fileName as string, original, current: f.content, status: 'modified' });
+  }
+
+  if (!changes.length) {
+    rmDeps.setStatus('No changes to save.', 'warn');
+    return;
+  }
+
+  openModal(
+    `Review changes — ${state.fileName}`,
+    `Save ${changes.length} file${changes.length === 1 ? '' : 's'} to disk`,
+    async () => { closeModal(); await rmDeps.rezipAndSave(); },
+  );
+  const m = getModalEls();
+  m.status.textContent = `${changes.length} file${changes.length === 1 ? '' : 's'} changed.`;
+
+  m.sidebar.innerHTML = '';
+  changes.forEach((c, i) => {
+    const el = document.createElement('div');
+    el.className = 'modal-file-item' + (i === 0 ? ' active' : '');
+    const badge = c.status === 'added' ? '<span class="badge added">ADD</span>'
+                : c.status === 'removed' ? '<span class="badge removed">DEL</span>'
+                : '<span class="badge modified">CHG</span>';
+    el.innerHTML = `${badge}<span style="overflow:hidden;text-overflow:ellipsis;">${escapeHtml(c.path)}</span>`;
+    el.addEventListener('click', () => {
+      m.sidebar.querySelectorAll('.modal-file-item').forEach(x => x.classList.remove('active'));
+      el.classList.add('active');
+      renderDiff(c.original, c.current);
+    });
+    m.sidebar.appendChild(el);
+  });
+  renderDiff(changes[0].original, changes[0].current);
 }

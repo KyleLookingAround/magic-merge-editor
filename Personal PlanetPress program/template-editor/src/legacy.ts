@@ -73,7 +73,7 @@ import {
 import { buildTree, refreshTreeDirtyMarkers, escapeHtml, configureTree } from './tree';
 import { validateXml, formatXml } from './editor';
 import { appendSearchFile, renderSnippet, configureSearch, runSearch } from './search';
-import { openModal, closeModal, renderDiff, zipTextMap, getModalEls } from './review-modal';
+import { openModal, closeModal, renderDiff, zipTextMap, getModalEls, configureReviewModal, compareTemplates, reviewAndSave } from './review-modal';
 import {
   ZOOM_STEPS, collectUnresolvedTokens, themeState,
   getZipText, parseDocxTheme, renderThemePanel, buildThemeCss,
@@ -81,7 +81,11 @@ import {
   renderTokensStrip, scriptByToken, jumpToScriptByToken,
   attachTokenJumpHandlers, renderCssView, openPreviewNewTab,
   configurePreviewHelpers,
+  setPreviewMode, stepZoom, setZoom, applyZoomToFrame, applyZoomToFrameEl,
+  togglePreview, openPreview, closePreview, refreshPreview,
+  buildPreviewHtml, applyDatamodelPersonalization,
 } from './preview';
+import { setSidebarMode, configureSidebar } from './sidebar';
 import {
   scenariosState, scnPersistKey, parseScenarioXmlToMap,
   readScenariosFromZip, autoLoadScenariosFromFolder,
@@ -166,7 +170,7 @@ function setStatus(msg, kind) {
 document.getElementById('btn-open').addEventListener('click', () => pickAndOpenFile());
 document.getElementById('btn-open-folder').addEventListener('click', () => pickAndOpenFolder());
 document.getElementById('btn-save').addEventListener('click', () => commitCurrentEdit(true));
-document.getElementById('btn-rezip').addEventListener('click', rezipAndSave);
+document.getElementById('btn-rezip').addEventListener('click', () => reviewAndSave());
 document.getElementById('btn-back').addEventListener('click', backToFolderList);
 document.getElementById('btn-rescan').addEventListener('click', () => state.dirHandle && scanFolderTemplates(state.dirHandle, true));
 
@@ -681,44 +685,13 @@ function formatCurrent() {
 // undefined names - dropped.
 
 // ============================================================
-// SIDEBAR MODE TOGGLE (Files / Search)
+// SIDEBAR MODE TOGGLE
 // ============================================================
+// setSidebarMode carved out to ./sidebar.ts (Phase 8).
+// Event wiring stays here; the imported function handles all modes.
 document.getElementById('mode-files').addEventListener('click', () => setSidebarMode('files'));
 document.getElementById('mode-search').addEventListener('click', () => setSidebarMode('search'));
 document.getElementById('mode-theme').addEventListener('click', () => setSidebarMode('theme'));
-
-function setSidebarMode(mode) {
-  const isFiles = mode === 'files';
-  const isNav = mode === 'nav';
-  const isScripts = mode === 'scripts';
-  const isSearch = mode === 'search';
-  const isTheme = mode === 'theme';
-  document.getElementById('mode-files').classList.toggle('active', isFiles);
-  const navBtn = document.getElementById('mode-nav');
-  if (navBtn) navBtn.classList.toggle('active', isNav);
-  const scriptsBtn = document.getElementById('mode-scripts');
-  if (scriptsBtn) scriptsBtn.classList.toggle('active', isScripts);
-  const themeBtn = document.getElementById('mode-theme');
-  if (themeBtn) themeBtn.classList.toggle('active', isTheme);
-  document.getElementById('mode-search').classList.toggle('active', isSearch);
-  document.getElementById('tree').style.display = isFiles ? '' : 'none';
-  const fileToolbar = document.getElementById('file-toolbar');
-  if (fileToolbar) fileToolbar.style.display = isFiles ? '' : 'none';
-  const navPanel = document.getElementById('nav-panel');
-  if (navPanel) navPanel.classList.toggle('show', isNav);
-  const scriptsPanel = document.getElementById('scripts-panel');
-  if (scriptsPanel) scriptsPanel.classList.toggle('show', isScripts);
-  document.getElementById('search-panel').classList.toggle('show', isSearch);
-  const themePanel = document.getElementById('theme-panel');
-  if (themePanel) themePanel.classList.toggle('show', isTheme);
-  if (isSearch) document.getElementById('search-input').focus();
-  if (isScripts && typeof refreshScriptsList === 'function') {
-    refreshScriptsList();
-    document.getElementById('scripts-search').focus();
-  }
-  if (isNav && typeof renderNavigator === 'function') renderNavigator();
-  if (isTheme && typeof renderThemePanel === 'function') renderThemePanel();
-}
 
 // Ctrl+Shift+F opens search
 document.addEventListener('keydown', e => {
@@ -781,25 +754,33 @@ configureScenarios({
   refreshPreview: () => refreshPreview(),
 });
 
-// Wire deps for preview panel helpers (Phase 6 carve).
+// Wire deps for preview panel helpers (Phase 6 carve; buildPreviewHtml removed Phase 8 — now local).
 configurePreviewHelpers({
   setSidebarMode: (mode) => setSidebarMode(mode),
   openScriptForm: (id) => openScriptForm(id),
   setStatus: (msg, kind) => setStatus(msg, kind),
-  buildPreviewHtml: (htmlPath, htmlText, opts) => buildPreviewHtml(htmlPath, htmlText, opts),
+});
+
+// Wire sidebar configure (Phase 8 carve).
+configureSidebar({
+  onNotes: () => loadNotesForCurrentTemplate(),
+});
+
+// Wire review-modal configure (Phase 8 carve).
+configureReviewModal({
+  setStatus: (msg, kind) => setStatus(msg, kind),
+  commitCurrentEdit: (showStatus) => commitCurrentEdit(showStatus),
+  rezipAndSave: () => rezipAndSave(),
 });
 
 // ============================================================
 // MODAL helpers
 // ============================================================
-// modalEls / openModal / closeModal / renderDiff carved out to
-// ./review-modal.ts. Legacy code that still pokes the modal sidebar
-// / main / status directly (compareTemplates, reviewAndSave) goes
-// through getModalEls() to grab the cached element references.
-const modalEls = getModalEls();
+// modalEls / openModal / closeModal / renderDiff / zipTextMap carved out to
+// ./review-modal.ts. compareTemplates / reviewAndSave carved out in Phase 8.
+const modalEls = getModalEls(); // still used by scenario matrix + diff views
 
-// Track standalone original so diff works for non-zip files
-// (Consumed by the live reviewAndSave defined further below.)
+// Track standalone original so diff works for non-zip files.
 hookOn('afterLoadFromHandle', () => {
   if (state.standalone) state.standalone.original = state.standalone.content;
 });
@@ -807,63 +788,10 @@ hookOn('afterLoadFromHandle', () => {
 // ============================================================
 // COMPARE TWO TEMPLATES
 // ============================================================
+// compareTemplates carved out to ./review-modal.ts (Phase 8).
 document.getElementById('btn-compare').addEventListener('click', compareTemplates);
 
-async function compareTemplates() {
-  if (!state.zip) {
-    setStatus('Open a template first, then click Compare to pick a second one.', 'warn');
-    return;
-  }
-  if (!window.showOpenFilePicker) return;
-  let handle;
-  try {
-    [handle] = await window.showOpenFilePicker({ multiple: false });
-  } catch (e) { if (e.name !== 'AbortError') setStatus(e.message, 'err'); return; }
-
-  setStatus('Loading second template...');
-  const file = await handle.getFile();
-  let other;
-  try { other = await JSZip.loadAsync(file); }
-  catch (e) { setStatus('Not a valid zip: ' + e.message, 'err'); return; }
-
-  // Build map of path -> text content (for text files only) for both
-  const A = await zipTextMap(state.zip);
-  const B = await zipTextMap(other);
-
-  const allPaths = new Set([...Object.keys(A), ...Object.keys(B)]);
-  const items = [];
-  for (const p of [...allPaths].sort()) {
-    const a = A[p], b = B[p];
-    if (a === undefined && b !== undefined) items.push({ path: p, status: 'added', a: '', b });
-    else if (a !== undefined && b === undefined) items.push({ path: p, status: 'removed', a, b: '' });
-    else if (a !== b) items.push({ path: p, status: 'modified', a, b });
-  }
-
-  if (!items.length) { setStatus('Templates are identical (text content).', 'ok'); return; }
-
-  openModal(`Compare — ${state.fileName} ↔ ${handle.name}`, 'Close', closeModal);
-  modalEls.status.textContent = `${items.length} differing file${items.length === 1 ? '' : 's'}.`;
-
-  modalEls.sidebar.innerHTML = '';
-  items.forEach((it, i) => {
-    const el = document.createElement('div');
-    el.className = 'modal-file-item' + (i === 0 ? ' active' : '');
-    const badge = it.status === 'added' ? 'ADD' : it.status === 'removed' ? 'DEL' : 'CHG';
-    el.innerHTML = `<span class="badge ${it.status}">${badge}</span><span style="overflow:hidden;text-overflow:ellipsis;">${escapeHtml(it.path)}</span>`;
-    el.addEventListener('click', () => {
-      modalEls.sidebar.querySelectorAll('.modal-file-item').forEach(x => x.classList.remove('active'));
-      el.classList.add('active');
-      renderDiff(it.a, it.b);
-    });
-    modalEls.sidebar.appendChild(el);
-  });
-  renderDiff(items[0].a, items[0].b);
-  setStatus('', '');
-}
-
-// zipTextMap carved out to ./review-modal.ts.
-
-// Enable Compare button once a zip-based template is open; reset preview
+// Enable Compare button once a zip-based template is open; reset preview.
 hookOn('afterLoadFromHandle', () => {
   document.getElementById('btn-compare').disabled = !state.zip;
   closePreview();
@@ -899,75 +827,8 @@ document.getElementById('btn-preview-tokens-dismiss').addEventListener('click', 
   document.getElementById('preview-tokens-strip').classList.remove('show');
 });
 
-function setPreviewMode(mode) {
-  if (!['data','raw','split','css'].includes(mode)) return;
-  previewState.mode = mode;
-  // Reset the dismissed-strip flag so a fresh switch re-shows it if relevant.
-  // (Per-template memory is written inside refreshPreview, after htmlPath updates.)
-  previewState.tokensDismissed = false;
-
-  document.getElementById('btn-pv-tab-data').classList.toggle('active', mode === 'data');
-  document.getElementById('btn-pv-tab-raw').classList.toggle('active', mode === 'raw');
-  document.getElementById('btn-pv-tab-split').classList.toggle('active', mode === 'split');
-  document.getElementById('btn-pv-tab-css').classList.toggle('active', mode === 'css');
-  // Zoom only meaningful for the iframe modes (data/raw/split/doc)
-  const zoomCluster = document.querySelector('#preview-header .zoom-cluster');
-  if (zoomCluster) zoomCluster.style.visibility = (mode === 'css') ? 'hidden' : 'visible';
-  // Copy HTML button is only meaningful in doc mode
-  // Switch which body view is visible
-  const frame = document.getElementById('preview-frame');
-  const split = document.getElementById('preview-split');
-  const cssView = document.getElementById('preview-css-view');
-  // Single iframe is reused for data/raw/doc; split has its own; css has its own.
-  frame.classList.toggle('hidden', mode !== 'data' && mode !== 'raw' && mode !== 'doc');
-  split.classList.toggle('show', mode === 'split');
-  cssView.classList.toggle('show', mode === 'css');
-  if (previewState.open) refreshPreview();
-}
-
-function stepZoom(dir) {
-  const cur = previewState.zoom;
-  let idx = ZOOM_STEPS.findIndex(z => Math.abs(z - cur) < 0.001);
-  if (idx === -1) {
-    // current zoom not on the step list — find nearest
-    idx = ZOOM_STEPS.reduce((best, z, i) => Math.abs(z - cur) < Math.abs(ZOOM_STEPS[best] - cur) ? i : best, 0);
-  }
-  idx = Math.max(0, Math.min(ZOOM_STEPS.length - 1, idx + dir));
-  setZoom(ZOOM_STEPS[idx]);
-}
-
-function setZoom(z) {
-  previewState.zoom = z;
-  document.getElementById('preview-zoom-level').textContent = Math.round(z * 100) + '%';
-  document.getElementById('btn-preview-zoom-out').disabled = z <= ZOOM_STEPS[0];
-  document.getElementById('btn-preview-zoom-in').disabled = z >= ZOOM_STEPS[ZOOM_STEPS.length - 1];
-  applyZoomToFrame();
-}
-
-function applyZoomToFrame() {
-  // Apply to whichever frames are currently visible.
-  applyZoomToFrameEl(document.getElementById('preview-frame'));
-  if (previewState.mode === 'split') {
-    applyZoomToFrameEl(document.getElementById('preview-frame-data'));
-    applyZoomToFrameEl(document.getElementById('preview-frame-raw'));
-  }
-}
-
-function applyZoomToFrameEl(frame) {
-  if (!frame) return;
-  let doc;
-  try { doc = frame.contentDocument; } catch (_) { doc = null; }
-  if (!doc || !doc.documentElement) return;
-  let style = doc.getElementById('__cw_zoom__');
-  if (!style) {
-    style = doc.createElement('style');
-    style.id = '__cw_zoom__';
-    (doc.head || doc.documentElement).appendChild(style);
-  }
-  // Use `zoom` (Chromium) — it scales layout *and* font sizes naturally.
-  // Fallback to transform-origin scale via wrapper if needed (skipped for simplicity; Chromium target).
-  style.textContent = 'html { zoom: ' + previewState.zoom + '; }';
-}
+// setPreviewMode, stepZoom, setZoom, applyZoomToFrame, applyZoomToFrameEl
+// carved out to ./preview.ts (Phase 8).
 
 // Ctrl + scroll over the preview pane to zoom
 document.getElementById('preview-pane').addEventListener('wheel', e => {
@@ -976,54 +837,16 @@ document.getElementById('preview-pane').addEventListener('wheel', e => {
   stepZoom(e.deltaY < 0 ? 1 : -1);
 }, { passive: false });
 
-function togglePreview() {
-  if (previewState.open) closePreview();
-  else openPreview();
-}
-
-function openPreview() {
-  if (!state.currentPath) return;
-  const ext = extOf(state.currentPath);
-  if (!['html','htm'].includes(ext)) {
-    setStatus('Preview only supports HTML files.', 'warn');
-    return;
-  }
-  previewState.open = true;
-  document.getElementById('preview-pane').classList.add('show');
-  document.getElementById('preview-resizer').style.display = '';
-  document.getElementById('btn-preview').classList.add('active');
-  // Restore the mode the user last picked for this template (default: data)
-  const restored = previewState.modeByPath[state.currentPath] || previewState.mode || 'data';
-  setPreviewMode(restored); // calls refreshPreview internally
-}
-
-function closePreview() {
-  previewState.open = false;
-  document.getElementById('preview-pane').classList.remove('show');
-  document.getElementById('preview-resizer').style.display = 'none';
-  document.getElementById('btn-preview').classList.remove('active');
-  revokePreviewBlobs();
-}
-
-function revokePreviewBlobs() {
-  for (const u of previewState.blobUrls) URL.revokeObjectURL(u);
-  previewState.blobUrls = [];
-}
+// togglePreview, openPreview, closePreview carved out to ./preview.ts (Phase 8).
+// revokePreviewBlobs already in ./preview.ts (Phase 6) — duplicate removed.
 
 // ============================================================
 // DOCX theme extractor (sidebar Theme mode)
 // ============================================================
-// Parses word/theme/theme1.xml + word/styles.xml and renders a
-// designer-friendly summary: colour palette, font scheme, and named styles.
-// The "Copy as CSS" button serialises the same data as a CSS block with
-// custom properties + named-style classes the user can drop into any
-// stylesheet that needs to match the Word source.
-// themeState migrated to ./preview.ts (Phase 5). Imported above.
-
-// getZipText carved out to ./preview.ts (Phase 6).
-// parseDocxTheme carved out to ./preview.ts (Phase 6).
-// renderThemePanel carved out to ./preview.ts (Phase 6).
-// buildThemeCss carved out to ./preview.ts (Phase 6).
+// themeState / getZipText / parseDocxTheme / renderThemePanel / buildThemeCss
+// carved out to ./preview.ts (Phase 6). Imported above.
+// refreshPreview / renderTokensStrip / attachTokenJumpHandlers / renderCssView
+// also in ./preview.ts (Phase 6 + Phase 8).
 
 document.getElementById('btn-theme-copy').addEventListener('click', () => {
   if (!state.isDocx) { setStatus('Open a .docx first.', 'warn'); return; }
@@ -1035,461 +858,7 @@ document.getElementById('btn-theme-copy').addEventListener('click', () => {
   );
 });
 
-function refreshPreview() {
-  if (!previewState.open) return;
-  // Doc mode used to render the whole .docx via mammoth.js. Removed because
-  // mammoth never reliably converted these templates; the Theme panel and the
-  // file tree still expose everything useful from the .docx.
-  if (previewState.mode === 'doc') {
-    const frame = document.getElementById('preview-frame');
-    if (frame) frame.srcdoc = '<div style="font:13px sans-serif;color:#888;padding:16px;line-height:1.5">Document preview was removed (mammoth.js was unreliable on these templates).<br><br>Use the <strong>Theme</strong> sidebar for colours, fonts, and styles, or open the .docx in Word directly.</div>';
-    return;
-  }
-  // Pick the HTML to render: prefer the currently-open HTML file, else stick with the last one.
-  let target = null;
-  if (state.currentPath && ['html','htm'].includes(extOf(state.currentPath))) {
-    target = state.currentPath;
-  } else if (previewState.htmlPath && state.files[previewState.htmlPath]) {
-    target = previewState.htmlPath;
-  }
-  if (!target) return;
-  const text = state.monacoModels[target]
-    ? state.monacoModels[target].getValue()
-    : state.files[target].content;
-
-  previewState.htmlPath = target;
-  document.getElementById('preview-title').textContent = target;
-  // Now that htmlPath is known, save the mode preference for this template too.
-  previewState.modeByPath[target] = previewState.mode;
-
-  const mode = previewState.mode;
-  if (mode === 'css') {
-    // Build once with-data so cssBlocks reflect the actual render.
-    buildPreviewHtml(target, text, { withData: true });
-    renderCssView();
-    renderTokensStrip();
-    return;
-  }
-
-  if (mode === 'split') {
-    // Build both flavors.
-    const builtData = buildPreviewHtml(target, text, { withData: true });
-    // Stash unresolved tokens from the with-data render — that's the meaningful set.
-    const unresolvedFromData = previewState.unresolved.slice();
-    const builtRaw = buildPreviewHtml(target, text, { withData: false });
-    // Restore unresolved from the data render so the strip reflects "what's missing".
-    previewState.unresolved = unresolvedFromData;
-    const fData = document.getElementById('preview-frame-data');
-    const fRaw  = document.getElementById('preview-frame-raw');
-    fData.onload = () => { applyZoomToFrameEl(fData); attachTokenJumpHandlers(fData); };
-    fRaw.onload  = () => { applyZoomToFrameEl(fRaw);  attachTokenJumpHandlers(fRaw);  };
-    fData.srcdoc = builtData;
-    fRaw.srcdoc  = builtRaw;
-    renderTokensStrip();
-    return;
-  }
-
-  // 'data' or 'raw' single-iframe modes
-  const withData = mode === 'data';
-  const built = buildPreviewHtml(target, text, { withData });
-  const frame = document.getElementById('preview-frame');
-  frame.onload = () => { applyZoomToFrame(); attachTokenJumpHandlers(frame); };
-  frame.srcdoc = built;
-  renderTokensStrip();
-}
-
-// renderTokensStrip, scriptByToken, jumpToScriptByToken,
-// attachTokenJumpHandlers, openPreviewNewTab, renderCssView
-// carved out to ./preview.ts (Phase 6).
-
-function buildPreviewHtml(htmlPath, htmlText, opts) {
-  opts = opts || {};
-  const withData = opts.withData !== false;
-  // Revoke any previous blobs to avoid leaking
-  revokePreviewBlobs();
-
-  // PlanetPress zips frequently use BACKSLASHES inside entry names (e.g.
-  // `public\document\css\Header.css`). Normalize the host HTML path and any
-  // refs we resolve to forward slashes for path math, then look up the file
-  // in state.files trying both separator flavors.
-  const htmlPathFwd = htmlPath.replace(/\\/g, '/');
-  const baseDir = htmlPathFwd.includes('/')
-    ? htmlPathFwd.substring(0, htmlPathFwd.lastIndexOf('/') + 1)
-    : '';
-
-  function normalizePath(p) {
-    const parts = p.replace(/\\/g, '/').split('/');
-    const out = [];
-    for (const part of parts) {
-      if (part === '..') out.pop();
-      else if (part !== '.' && part !== '') out.push(part);
-    }
-    return out.join('/');
-  }
-
-  // Try forward-slash key first, then backslash key. Returns the key that
-  // actually exists in state.files, or null. The returned key is what we
-  // store on cssBlocks/blobUrls so subsequent lookups stay consistent.
-  function lookupZipKey(norm) {
-    if (state.files[norm]) return norm;
-    const back = norm.replace(/\//g, '\\');
-    if (state.files[back]) return back;
-    return null;
-  }
-
-  function resolveZipPath(rel) {
-    if (!rel) return null;
-    rel = rel.trim();
-    if (/^(?:https?:|data:|blob:|mailto:|tel:|javascript:|#|\/\/)/i.test(rel)) return null;
-    rel = rel.split('?')[0].split('#')[0];
-    if (!rel) return null;
-    rel = rel.replace(/\\/g, '/');
-    if (rel.startsWith('/')) rel = rel.substring(1);
-    else rel = baseDir + rel;
-    const norm = normalizePath(rel);
-    return lookupZipKey(norm);
-  }
-
-  const mimeFor = (path) => {
-    const e = extOf(path);
-    return ({
-      css: 'text/css', js: 'text/javascript', mjs: 'text/javascript',
-      json: 'application/json', html: 'text/html', htm: 'text/html',
-      svg: 'image/svg+xml', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
-      gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', ico: 'image/x-icon',
-      woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', otf: 'font/otf',
-      eot: 'application/vnd.ms-fontobject',
-    }[e]) || 'application/octet-stream';
-  };
-
-  const blobCache = new Map();
-  function blobUrlFor(zipPath) {
-    if (blobCache.has(zipPath)) return blobCache.get(zipPath);
-    const f = state.files[zipPath];
-    if (!f) return null;
-    const data = f.isText ? f.content : f.content;
-    const blob = new Blob([data], { type: mimeFor(zipPath) });
-    const url = URL.createObjectURL(blob);
-    blobCache.set(zipPath, url);
-    previewState.blobUrls.push(url);
-    return url;
-  }
-
-  // Rewrite url(...) and @import inside CSS text
-  function rewriteCss(css, cssDir) {
-    const savedBaseDir = baseDir;
-    function resolveRelToCss(rel) {
-      if (!rel) return null;
-      rel = rel.trim();
-      if (/^(?:https?:|data:|blob:|\/\/)/i.test(rel)) return null;
-      rel = rel.split('?')[0].split('#')[0];
-      if (!rel) return null;
-      rel = rel.replace(/\\/g, '/');
-      let p = rel.startsWith('/') ? rel.substring(1) : (cssDir + rel);
-      const norm = normalizePath(p);
-      return lookupZipKey(norm);
-    }
-    return css
-      .replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (m, q, url) => {
-        const zp = resolveRelToCss(url);
-        if (!zp) return m;
-        const burl = blobUrlFor(zp);
-        return burl ? 'url("' + burl + '")' : m;
-      })
-      .replace(/@import\s+(?:url\()?\s*(['"]?)([^'")\s;]+)\1\)?/g, (m, q, url) => {
-        const zp = resolveRelToCss(url);
-        if (!zp) return m;
-        const f = state.files[zp];
-        if (f && f.isText) {
-          // Inline the imported CSS so its own url() refs resolve correctly
-          const zpFwd = zp.replace(/\\/g, '/');
-          const subDir = zpFwd.includes('/') ? zpFwd.substring(0, zpFwd.lastIndexOf('/') + 1) : '';
-          return rewriteCss(f.content, subDir);
-        }
-        const burl = blobUrlFor(zp);
-        return burl ? '@import url("' + burl + '")' : m;
-      });
-  }
-
-  // Parse the HTML
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(htmlText, 'text/html');
-
-  // Track every CSS source we encounter, so the CSS tab can show the merged result.
-  const cssBlocks = [];
-
-  // Inline external stylesheets so we can rewrite url() within them.
-  // Replace <link rel="stylesheet"> with <style> containing rewritten CSS.
-  doc.querySelectorAll('link[rel~="stylesheet"][href]').forEach(link => {
-    const href = link.getAttribute('href');
-    const zp = resolveZipPath(href);
-    if (!zp) return;
-    const f = state.files[zp];
-    if (f && f.isText) {
-      const zpFwd = zp.replace(/\\/g, '/');
-      const cssDir = zpFwd.includes('/') ? zpFwd.substring(0, zpFwd.lastIndexOf('/') + 1) : '';
-      const rewritten = rewriteCss(f.content, cssDir);
-      const style = doc.createElement('style');
-      style.setAttribute('data-from', zp);
-      style.textContent = rewritten;
-      link.replaceWith(style);
-      cssBlocks.push({ label: zp + ' (linked stylesheet)', css: rewritten, bytes: rewritten.length });
-    } else {
-      const burl = blobUrlFor(zp);
-      if (burl) link.setAttribute('href', burl);
-    }
-  });
-
-  // Inline <style> blocks: rewrite url() refs (relative to the HTML file)
-  doc.querySelectorAll('style').forEach((s, i) => {
-    if (s.getAttribute('data-from')) return; // already handled above
-    const rewritten = rewriteCss(s.textContent || '', baseDir);
-    s.textContent = rewritten;
-    cssBlocks.push({ label: htmlPath + ' <style #' + (i + 1) + '>', css: rewritten, bytes: rewritten.length });
-  });
-
-  // Inline style="" attributes
-  doc.querySelectorAll('[style]').forEach(el => {
-    el.setAttribute('style', rewriteCss(el.getAttribute('style') || '', baseDir));
-  });
-
-  // Images
-  doc.querySelectorAll('img[src]').forEach(img => {
-    const zp = resolveZipPath(img.getAttribute('src'));
-    if (zp) { const u = blobUrlFor(zp); if (u) img.setAttribute('src', u); }
-    const srcset = img.getAttribute('srcset');
-    if (srcset) {
-      const rebuilt = srcset.split(',').map(part => {
-        const tok = part.trim().split(/\s+/);
-        const zp2 = resolveZipPath(tok[0]);
-        if (zp2) { const u = blobUrlFor(zp2); if (u) tok[0] = u; }
-        return tok.join(' ');
-      }).join(', ');
-      img.setAttribute('srcset', rebuilt);
-    }
-  });
-
-  // Sources (picture/video/audio)
-  doc.querySelectorAll('source[src], video[src], audio[src]').forEach(el => {
-    const zp = resolveZipPath(el.getAttribute('src'));
-    if (zp) { const u = blobUrlFor(zp); if (u) el.setAttribute('src', u); }
-  });
-
-  // Scripts — also inline them so module/relative paths inside resolve
-  doc.querySelectorAll('script[src]').forEach(s => {
-    const zp = resolveZipPath(s.getAttribute('src'));
-    if (!zp) return;
-    const f = state.files[zp];
-    if (f && f.isText) {
-      const inline = doc.createElement('script');
-      // copy type, but drop src
-      const t = s.getAttribute('type'); if (t) inline.setAttribute('type', t);
-      inline.textContent = f.content;
-      s.replaceWith(inline);
-    } else {
-      const u = blobUrlFor(zp);
-      if (u) s.setAttribute('src', u);
-    }
-  });
-
-  // Link rels other than stylesheet (icons, preload images, etc.) — rewrite href to blob url
-  doc.querySelectorAll('link[href]:not([rel~="stylesheet"])').forEach(link => {
-    const zp = resolveZipPath(link.getAttribute('href'));
-    if (zp) { const u = blobUrlFor(zp); if (u) link.setAttribute('href', u); }
-  });
-
-  // Object/embed
-  doc.querySelectorAll('object[data], embed[src], iframe[src]').forEach(el => {
-    const attr = el.tagName.toLowerCase() === 'object' ? 'data' : 'src';
-    const zp = resolveZipPath(el.getAttribute(attr));
-    if (zp) { const u = blobUrlFor(zp); if (u) el.setAttribute(attr, u); }
-  });
-
-  // Strip any <base> tag — would interfere with our resolved URLs
-  doc.querySelectorAll('base').forEach(b => b.remove());
-
-  // Resolve @field@ placeholders + apply conditional show/hide rules using
-  // values from the open template's datamodel. Both are best-effort and
-  // skipped silently if the data isn't available.
-  // In raw mode we skip personalization entirely so @field@ tokens render
-  // literally and conditional show/hide rules don't fire.
-  const resolvedCount = withData ? applyDatamodelPersonalization(doc) : 0;
-  // After (or instead of) substitution, scan the body for tokens that remain.
-  // These are "unresolved" — surfaced in the strip above the preview so the
-  // user can spot missing datamodel values or typoed placeholders at a glance.
-  previewState.unresolved = collectUnresolvedTokens(doc);
-
-  // Inject a small banner so it's clear this is a static preview.
-  const banner = doc.createElement('div');
-  let bannerText, bannerBg, bannerFg, bannerBorder;
-  if (!withData) {
-    bannerText = 'Preview (Raw) — datamodel substitution disabled; @field@ tokens shown literally';
-    bannerBg = '#e1edf7'; bannerFg = '#0a3a66'; bannerBorder = '#b6d4ee';
-  } else if (resolvedCount > 0) {
-    const scn = (typeof scenariosState !== 'undefined' && scenariosState.active) ? scenariosState.active : null;
-    if (scn) {
-      bannerText = `Preview (With Data) — scenario "${scn}", ${resolvedCount} field${resolvedCount === 1 ? '' : 's'} resolved`;
-      bannerBg = '#d1f0d4'; bannerFg = '#1f4d23'; bannerBorder = '#a8dcb0';
-    } else {
-      bannerText = `Preview (With Data) — ${resolvedCount} field${resolvedCount === 1 ? '' : 's'} resolved from datamodel sample values`;
-      bannerBg = '#fff3cd'; bannerFg = '#664d03'; bannerBorder = '#ffecb5';
-    }
-  } else {
-    bannerText = 'Preview (With Data) — open a template with a datamodel to resolve @field@ placeholders';
-    bannerBg = '#fff3cd'; bannerFg = '#664d03'; bannerBorder = '#ffecb5';
-  }
-  banner.style.cssText = 'position:fixed;top:0;left:0;right:0;background:' + bannerBg + ';color:' + bannerFg + ';border-bottom:1px solid ' + bannerBorder + ';font:11px -apple-system,sans-serif;padding:4px 8px;z-index:99999;';
-  banner.textContent = bannerText;
-  if (doc.body) doc.body.insertBefore(banner, doc.body.firstChild);
-
-  // In raw mode, give @token@ placeholders a subtle highlight so they're easy
-  // to spot at a glance. Pure CSS — does not change the underlying text.
-  if (!withData && doc.body) {
-    const tokenStyle = doc.createElement('style');
-    tokenStyle.textContent =
-      '/* injected by editor — highlight @field@ tokens in raw preview */\n' +
-      '.__cw_raw_token { background:#fde68a; color:#7c2d12; padding:0 2px; border-radius:2px; }';
-    doc.head && doc.head.appendChild(tokenStyle);
-    const re = /@[A-Za-z0-9_./\-]+@/g;
-    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, null);
-    const targets = [];
-    let n;
-    while ((n = walker.nextNode())) {
-      if (n.parentNode && /^(SCRIPT|STYLE)$/i.test(n.parentNode.nodeName)) continue;
-      if (re.test(n.nodeValue)) targets.push(n);
-      re.lastIndex = 0;
-    }
-    for (const t of targets) {
-      const frag = doc.createDocumentFragment();
-      let last = 0;
-      const text = t.nodeValue;
-      let m;
-      re.lastIndex = 0;
-      while ((m = re.exec(text)) !== null) {
-        if (m.index > last) frag.appendChild(doc.createTextNode(text.slice(last, m.index)));
-        const span = doc.createElement('span');
-        span.className = '__cw_raw_token';
-        span.textContent = m[0];
-        frag.appendChild(span);
-        last = m.index + m[0].length;
-      }
-      if (last < text.length) frag.appendChild(doc.createTextNode(text.slice(last)));
-      t.parentNode.replaceChild(frag, t);
-    }
-  }
-
-  // Stash the collected CSS for the CSS tab.
-  previewState.lastCssBlocks = cssBlocks;
-  previewState.lastCss = cssBlocks.map(b => '/* ' + b.label + ' */\n' + b.css).join('\n\n');
-
-  return '<!doctype html>\n' + doc.documentElement.outerHTML;
-}
-
-// Walk the body and surface every @token@-shaped string that's still present
-// after substitution (or the full set, in raw mode). Returns a sorted, deduped
-// array of token strings, e.g. ['@LenderName@', '@MissingField@'].
-// collectUnresolvedTokens carved out to ./preview.ts.
-
-// Substitute @field@ placeholders and apply conditional show/hide rules from
-// the script blocks in index.xml. Returns how many distinct fields resolved.
-function applyDatamodelPersonalization(doc) {
-  // Build a map of @token@ -> string value using the datamodel + script wrappers.
-  const fields = (scriptsState && scriptsState.datamodelFields) || [];
-  // Scenarios layer on top of the datamodel — they may add field paths the
-  // datamodel doesn't list, so we still want to run when fields is empty but
-  // scenario overrides are present.
-  const overrides = (typeof scenariosState !== 'undefined' && scenariosState.activeOverrides) || null;
-  if (!fields.length && !overrides) return 0;
-  if (!doc.body) return 0;
-  const valueByPath = new Map();
-  for (const f of fields) valueByPath.set(f.path, f.lastValue == null ? '' : String(f.lastValue));
-  if (overrides) {
-    for (const [path, val] of overrides.entries()) valueByPath.set(path, val == null ? '' : String(val));
-  }
-
-  // From parsed scripts: build token -> rendered value (with prefix/suffix)
-  const tokenToValue = new Map();
-  const conditionals = [];
-  for (const s of (scriptsState && scriptsState.list) || []) {
-    if (s.kind === 'TEXT' && s.findText && s.fieldPath) {
-      const v = valueByPath.has(s.fieldPath) ? valueByPath.get(s.fieldPath) : null;
-      if (v != null) {
-        tokenToValue.set(s.findText, (s.prefix || '') + v + (s.suffix || ''));
-      }
-    } else if (s.kind === 'CONDITIONAL' && s.condField && s.selectorType === 'QUERY' && s.selectorText) {
-      conditionals.push(s);
-    }
-  }
-  // Plus a fallback @path@ -> value mapping for any field not bound by a script
-  for (const [path, val] of valueByPath.entries()) {
-    const token = '@' + path + '@';
-    if (!tokenToValue.has(token)) tokenToValue.set(token, val);
-  }
-
-  if (!tokenToValue.size && !conditionals.length) return 0;
-
-  // Replace tokens in text nodes and attribute values
-  const tokens = Array.from(tokenToValue.keys());
-  if (tokens.length) {
-    // Build a single regex matching any token (must escape chars; tokens contain @)
-    const escTokens = tokens.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-    const re = new RegExp('(' + escTokens.join('|') + ')', 'g');
-    const replace = (text) => text.replace(re, m => tokenToValue.get(m) ?? m);
-    // Walk text nodes
-    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, null);
-    const replacements = [];
-    let n;
-    while ((n = walker.nextNode())) {
-      if (n.nodeValue && re.test(n.nodeValue)) replacements.push(n);
-      re.lastIndex = 0;
-    }
-    for (const n of replacements) n.nodeValue = replace(n.nodeValue);
-    // Plus a few attributes that commonly hold tokens (alt, title, href, src)
-    doc.body.querySelectorAll('[alt],[title],[href],[src],[value]').forEach(el => {
-      ['alt','title','href','src','value'].forEach(attr => {
-        if (!el.hasAttribute(attr)) return;
-        const v = el.getAttribute(attr);
-        if (v && re.test(v)) { re.lastIndex = 0; el.setAttribute(attr, replace(v)); }
-      });
-    });
-  }
-
-  // Apply conditional show/hide rules
-  for (const s of conditionals) {
-    const v = valueByPath.get(s.condField);
-    if (v == null) continue;
-    let pass;
-    const a = s.condCaseInsensitive ? String(v).toLowerCase() : String(v);
-    const b = s.condCaseInsensitive ? String(s.condValue).toLowerCase() : String(s.condValue);
-    switch (s.condition) {
-      case 'EQUAL_TO':              pass = a === b; break;
-      case 'NOT_EQUAL_TO':          pass = a !== b; break;
-      case 'GREATER_THAN':          pass = parseFloat(a) >  parseFloat(b); break;
-      case 'GREATER_THAN_OR_EQUAL': pass = parseFloat(a) >= parseFloat(b); break;
-      case 'LESS_THAN':             pass = parseFloat(a) <  parseFloat(b); break;
-      case 'LESS_THAN_OR_EQUAL':    pass = parseFloat(a) <= parseFloat(b); break;
-      case 'CONTAINS':              pass = a.indexOf(b) !== -1; break;
-      case 'STARTS_WITH':           pass = a.startsWith(b); break;
-      case 'ENDS_WITH':             pass = a.endsWith(b); break;
-      case 'IS_EMPTY':              pass = !a; break;
-      case 'IS_NOT_EMPTY':          pass = !!a; break;
-      default: pass = true;
-    }
-    const shouldShow = (s.condAction === 'SHOW') ? pass : !pass;
-    let matches;
-    try { matches = doc.body.querySelectorAll(s.selectorText); }
-    catch (_) { continue; } // bad selector
-    matches.forEach(el => {
-      if (s.condToggleVisibility !== false) {
-        el.style.display = shouldShow ? '' : 'none';
-      } else if (!shouldShow) {
-        el.remove();
-      }
-    });
-  }
-
-  return tokenToValue.size;
-}
+// buildPreviewHtml and applyDatamodelPersonalization carved out to ./preview.ts (Phase 8).
 
 // Auto-refresh preview when committing an edit to the previewed file
 hookOn('afterCommitCurrentEdit', () => {
@@ -2409,72 +1778,7 @@ rezipAndSave = async function () {
   }
 };
 
-// Updated review modal that handles add/delete/modify
-async function reviewAndSave() {
-  if (!state.fileHandle) return;
-  commitCurrentEdit(false);
-
-  const changes = [];
-  if (state.zip) {
-    const inZip = new Set();
-    state.zip.forEach((p, e) => { if (!e.dir) inZip.add(p); });
-    for (const path of Object.keys(state.files)) {
-      const f = state.files[path];
-      if (!inZip.has(path)) {
-        const current = f.isText ? f.content : `(${(f.content && f.content.length) || 0} bytes binary)`;
-        changes.push({ path, original: '', current, status: 'added' });
-        continue;
-      }
-      if (!f.isText) continue;
-      const original = await state.zip.file(path).async('string');
-      if (original !== f.content) {
-        changes.push({ path, original, current: f.content, status: 'modified' });
-      }
-    }
-    for (const p of inZip) {
-      if (!state.files[p]) {
-        let original = '';
-        try { original = await state.zip.file(p).async('string'); } catch (_) {}
-        changes.push({ path: p, original, current: '', status: 'removed' });
-      }
-    }
-  } else if (state.standalone) {
-    const f = state.files[state.fileName];
-    const original = state.standalone.original ?? '';
-    if (original !== f.content) changes.push({ path: state.fileName, original, current: f.content, status: 'modified' });
-  }
-
-  if (!changes.length) {
-    setStatus('No changes to save.', 'warn');
-    return;
-  }
-
-  openModal(`Review changes — ${state.fileName}`, `Save ${changes.length} file${changes.length === 1 ? '' : 's'} to disk`, async () => {
-    closeModal();
-    await rezipAndSave();
-  });
-  modalEls.status.textContent = `${changes.length} file${changes.length === 1 ? '' : 's'} changed.`;
-
-  modalEls.sidebar.innerHTML = '';
-  changes.forEach((c, i) => {
-    const el = document.createElement('div');
-    el.className = 'modal-file-item' + (i === 0 ? ' active' : '');
-    const badge = c.status === 'added' ? '<span class="badge added">ADD</span>'
-                : c.status === 'removed' ? '<span class="badge removed">DEL</span>'
-                : '<span class="badge modified">CHG</span>';
-    el.innerHTML = `${badge}<span style="overflow:hidden;text-overflow:ellipsis;">${escapeHtml(c.path)}</span>`;
-    el.addEventListener('click', () => {
-      modalEls.sidebar.querySelectorAll('.modal-file-item').forEach(x => x.classList.remove('active'));
-      el.classList.add('active');
-      renderDiff(c.original, c.current);
-    });
-    modalEls.sidebar.appendChild(el);
-  });
-  renderDiff(changes[0].original, changes[0].current);
-}
-// Re-bind the Review button to the new function
-document.getElementById('btn-rezip').replaceWith(document.getElementById('btn-rezip').cloneNode(true));
-document.getElementById('btn-rezip').addEventListener('click', () => reviewAndSave());
+// reviewAndSave carved out to ./review-modal.ts (Phase 8). replaceWith hack removed.
 document.getElementById('btn-rezip').disabled = !state.fileHandle;
 
 // Whenever a template is loaded, refresh the scripts list and toolbar
@@ -2954,35 +2258,7 @@ async function saveNotes() {
   if (modeNotesBtn) modeNotesBtn.addEventListener('click', () => setSidebarMode('notes'));
 })();
 
-// Extend setSidebarMode to handle 'notes'. We do this by monkey-patching:
-// the original function only knows 'files'/'nav'/'scripts'/'theme'/'search',
-// and silently no-ops for unknown modes. We override to add 'notes' handling.
-(function patchSidebarMode() {
-  const orig = setSidebarMode;
-  setSidebarMode = function (mode) {
-    if (mode === 'notes') {
-      document.getElementById('mode-files').classList.remove('active');
-      const navBtn = document.getElementById('mode-nav'); if (navBtn) navBtn.classList.remove('active');
-      const scrBtn = document.getElementById('mode-scripts'); if (scrBtn) scrBtn.classList.remove('active');
-      const themeBtn = document.getElementById('mode-theme'); if (themeBtn) themeBtn.classList.remove('active');
-      const notesBtn = document.getElementById('mode-notes'); if (notesBtn) notesBtn.classList.add('active');
-      document.getElementById('mode-search').classList.remove('active');
-      document.getElementById('tree').style.display = 'none';
-      const ftb = document.getElementById('file-toolbar'); if (ftb) ftb.style.display = 'none';
-      const navPanel = document.getElementById('nav-panel'); if (navPanel) navPanel.classList.remove('show');
-      const scrPanel = document.getElementById('scripts-panel'); if (scrPanel) scrPanel.classList.remove('show');
-      document.getElementById('search-panel').classList.remove('show');
-      const themePanel = document.getElementById('theme-panel'); if (themePanel) themePanel.classList.remove('show');
-      const notesPanel = document.getElementById('notes-panel'); if (notesPanel) notesPanel.classList.add('show');
-      loadNotesForCurrentTemplate();
-      return;
-    }
-    // Hide notes panel for any other mode
-    const notesBtn = document.getElementById('mode-notes'); if (notesBtn) notesBtn.classList.remove('active');
-    const notesPanel = document.getElementById('notes-panel'); if (notesPanel) notesPanel.classList.remove('show');
-    return orig(mode);
-  };
-})();
+// patchSidebarMode IIFE removed — sidebar.ts now handles all modes including 'notes' natively.
 
 // ---------- RECENTLY-EDITED SCRIPTS ----------
 const recentScriptsState = {

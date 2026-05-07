@@ -87,6 +87,8 @@ import {
 } from './preview';
 import { setSidebarMode } from './sidebar';
 import { loadNotesForCurrentTemplate, configureNotes } from './notes';
+import { configureRecentScripts } from './recent-scripts';
+import { openContextMenu, closeCtxMenu } from './context-menu';
 import {
   scenariosState, scnPersistKey, parseScenarioXmlToMap,
   readScenariosFromZip, autoLoadScenariosFromFolder,
@@ -735,12 +737,12 @@ configureScriptsList({
 });
 
 // Wire deps for the script form and CRUD operations (Phase 7 carve).
+// Phase 10: showCtxMenu / closeCtxMenu DI seam removed — script-form.ts now
+// imports context-menu helpers directly from ./context-menu.
 configureScriptForm({
   openFile: (path) => openFile(path),
   setStatus: (msg, kind) => setStatus(msg, kind),
   setSidebarMode: (mode) => setSidebarMode(mode),
-  showCtxMenu: (el) => { _ctxMenuEl = el; document.body.appendChild(el); },
-  closeCtxMenu: () => closeCtxMenu(),
 });
 
 // Wire deps for the navigator panel (Phase 6 carve).
@@ -766,6 +768,11 @@ configurePreviewHelpers({
 configureNotes({
   setStatus: (msg, kind) => setStatus(msg, kind),
 });
+
+// Wire recent-scripts (Phase 10 carve). Registers the afterOpenScriptForm /
+// afterLoadFromHandle / afterReparseScripts hook handlers and seeds the
+// initial list from localStorage.
+configureRecentScripts();
 
 // Wire review-modal configure (Phase 8 carve).
 configureReviewModal({
@@ -871,36 +878,9 @@ hookOn('afterReparseScripts', () => {
   renderScriptsList();
 });
 
-// Append the "Recent" group on top of the just-rendered scripts list.
-// Runs as a second afterReparseScripts handler so it fires after renderScriptsList.
-hookOn('afterReparseScripts', () => {
-  if (!recentScriptsState.list.length) return;
-  const list = document.getElementById('scripts-list');
-  if (!list) return;
-  const existing = list.querySelector('.scripts-group[data-recent="1"]');
-  if (existing) existing.remove();
-  list.querySelectorAll('.script-item[data-recent="1"]').forEach(el => el.remove());
-  const head = document.createElement('div');
-  head.className = 'scripts-group';
-  head.dataset.recent = '1';
-  head.textContent = `Recent  (${recentScriptsState.list.length})`;
-  list.insertBefore(head, list.firstChild);
-  let prev = head;
-  for (const r of recentScriptsState.list) {
-    const found = scriptsState.list.find(x => x.name === r.name);
-    const el = document.createElement('div');
-    el.className = 'script-item' + (found ? '' : ' disabled');
-    el.dataset.recent = '1';
-    const ago = Math.max(0, Date.now() - r.ts);
-    const mins = Math.floor(ago / 60000);
-    const when = mins < 1 ? 'just now' : (mins < 60 ? mins + 'm ago' : Math.floor(mins / 60) + 'h ago');
-    el.innerHTML = `<span class="badge">${escapeHtml(when)}</span><span class="name">${escapeHtml(r.name)}</span>${r.findText ? `<span class="find">${escapeHtml(r.findText)}</span>` : ''}`;
-    el.title = found ? 'Open this script' : 'Script no longer present in this template';
-    if (found) el.addEventListener('click', () => openScriptForm(found.id));
-    prev.parentNode.insertBefore(el, prev.nextSibling);
-    prev = el;
-  }
-});
+// Recent-scripts strip carved out to ./recent-scripts.ts (Phase 10). Its
+// `afterReparseScripts` handler injects the "Recent" group on top of the
+// rendered scripts list; `configureRecentScripts()` is called below.
 
 // Preview pane resizer
 (function () {
@@ -1453,43 +1433,9 @@ function deleteFile(path) {
   setStatus(`Removed ${path}. Click Review & Save to apply.`, 'ok');
 }
 
-// Right-click on a tree file item -> mini context menu
-let _ctxMenuEl = null;
-function closeCtxMenu() { if (_ctxMenuEl) { _ctxMenuEl.remove(); _ctxMenuEl = null; } }
-document.addEventListener('click', closeCtxMenu);
-
-// Generic context-menu builder. Items are [{ label, onClick, danger?, sep? }];
-// pass { sep: true } as a divider. Mounts at (x, y), auto-dismisses on
-// the next document click (handled by the global `click → closeCtxMenu`
-// listener above). Centralised so the Scripts / Sections / Search /
-// File-tree menus all share the same look + dismiss semantics.
-function openContextMenu(items, x, y) {
-  closeCtxMenu();
-  const menu = document.createElement('div');
-  menu.className = 'ctxmenu';
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
-  for (const it of items) {
-    if (it.sep) {
-      const sep = document.createElement('div');
-      sep.className = 'sep';
-      menu.appendChild(sep);
-      continue;
-    }
-    const el = document.createElement('div');
-    el.className = 'item' + (it.danger ? ' danger' : '');
-    el.textContent = it.label;
-    if (it.title) el.title = it.title;
-    el.addEventListener('click', () => {
-      closeCtxMenu();
-      try { it.onClick && it.onClick(); } catch (e) { console.error(e); }
-    });
-    menu.appendChild(el);
-  }
-  document.body.appendChild(menu);
-  _ctxMenuEl = menu;
-  return menu;
-}
+// Right-click context menu carved out to ./context-menu.ts (Phase 10).
+// The global `click → closeCtxMenu` listener is registered at module load
+// time inside context-menu.ts.
 
 // Best-effort copy-to-clipboard. Falls back to a transient textarea select
 // for non-secure-context environments where navigator.clipboard isn't
@@ -2185,77 +2131,10 @@ function scenarioMapToXml(map) {
 // including 'notes' natively (importing loadNotesForCurrentTemplate directly
 // since Phase 9).
 
-// ---------- RECENTLY-EDITED SCRIPTS ----------
-const recentScriptsState = {
-  list: [],   // [{ name, findText, ts }]
-  max: 8,
-};
-function recentScriptsKey() { return 'cw_recent_scripts:' + (state.fileName || ''); }
-function loadRecentScripts() {
-  try {
-    const raw = localStorage.getItem(recentScriptsKey());
-    recentScriptsState.list = raw ? JSON.parse(raw) : [];
-  } catch (_) { recentScriptsState.list = []; }
-}
-function saveRecentScripts() {
-  try { localStorage.setItem(recentScriptsKey(), JSON.stringify(recentScriptsState.list)); } catch (_) {}
-}
-function pushRecentScript(s) {
-  if (!s || !s.name) return;
-  const entry = { name: s.name, findText: s.findText || '', ts: Date.now() };
-  recentScriptsState.list = [entry, ...recentScriptsState.list.filter(x => x.name !== s.name)].slice(0, recentScriptsState.max);
-  saveRecentScripts();
-}
-
-// Track recently-opened scripts; reload list on template change
-hookOn('afterOpenScriptForm', (id) => {
-  const s = scriptsState.list.find(x => x.id === id);
-  if (s) {
-    pushRecentScript(s);
-    try { renderScriptsList(); } catch (_) {}
-  }
-});
-hookOn('afterLoadFromHandle', () => {
-  loadRecentScripts();
-  if (typeof renderScriptsList === 'function') {
-    try { renderScriptsList(); } catch (_) {}
-  }
-});
-loadRecentScripts();
-
-// Inject a "Recent" group at the top of the rendered scripts list after
-// renderScriptsList runs. Registered as a second afterReparseScripts handler
-// so it fires after the first one (which calls renderScriptsList).
-hookOn('afterReparseScripts', () => {
-  if (!recentScriptsState.list.length) return;
-  const list = document.getElementById('scripts-list');
-  if (!list) return;
-  // Avoid duplicates if the function is re-run quickly
-  const existing = list.querySelector('.scripts-group[data-recent="1"]');
-  if (existing) existing.remove();
-  list.querySelectorAll('.script-item[data-recent="1"]').forEach(el => el.remove());
-  const head = document.createElement('div');
-  head.className = 'scripts-group';
-  head.dataset.recent = '1';
-  head.textContent = `Recent  (${recentScriptsState.list.length})`;
-  list.insertBefore(head, list.firstChild);
-  // Insert items in reverse so the most recent ends up just under the header
-  let prev = head;
-  for (const r of recentScriptsState.list) {
-    const found = scriptsState.list.find(x => x.name === r.name);
-    const el = document.createElement('div');
-    el.className = 'script-item' + (found ? '' : ' disabled');
-    el.dataset.recent = '1';
-    const ago = Math.max(0, Date.now() - r.ts);
-    const mins = Math.floor(ago / 60000);
-    const when = mins < 1 ? 'just now' : (mins < 60 ? mins + 'm ago' : Math.floor(mins / 60) + 'h ago');
-    el.innerHTML = `<span class="badge">${escapeHtml(when)}</span><span class="name">${escapeHtml(r.name)}</span>${r.findText ? `<span class="find">${escapeHtml(r.findText)}</span>` : ''}`;
-    el.title = found ? 'Open this script' : 'Script no longer present in this template';
-    if (found) el.addEventListener('click', () => openScriptForm(found.id));
-    prev.parentNode!.insertBefore(el, prev.nextSibling);
-    prev = el;
-  }
-});
+// Recent-scripts strip carved out to ./recent-scripts.ts (Phase 10).
+// State, persistence, push/load helpers, and all three hookOn registrations
+// (afterOpenScriptForm / afterLoadFromHandle / afterReparseScripts) live in
+// the module. configureRecentScripts() is called above.
 
 // ---------- MONACO "GO TO SCRIPT" ----------
 // Adds an editor action so right-click on an @token@ in HTML/XML offers a

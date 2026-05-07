@@ -72,13 +72,22 @@ import {
 } from './fs';
 import { buildTree, refreshTreeDirtyMarkers, escapeHtml, configureTree } from './tree';
 import { validateXml, formatXml } from './editor';
-import { appendSearchFile, renderSnippet, configureSearch } from './search';
+import { appendSearchFile, renderSnippet, configureSearch, runSearch } from './search';
 import { openModal, closeModal, renderDiff, zipTextMap, getModalEls } from './review-modal';
 import {
   ZOOM_STEPS, collectUnresolvedTokens, themeState,
   getZipText, parseDocxTheme, renderThemePanel, buildThemeCss,
+  previewState, revokePreviewBlobs,
+  renderTokensStrip, scriptByToken, jumpToScriptByToken,
+  attachTokenJumpHandlers, renderCssView, openPreviewNewTab,
+  configurePreviewHelpers,
 } from './preview';
-import { scenariosState, scnPersistKey, parseScenarioXmlToMap } from './scenarios';
+import {
+  scenariosState, scnPersistKey, parseScenarioXmlToMap,
+  readScenariosFromZip, autoLoadScenariosFromFolder,
+  pickAndLoadScenarios, populateScenarioPicker, activateScenario,
+  configureScenarios,
+} from './scenarios';
 import {
   SCRIPT_HOST_CANDIDATES,
   stripCdataKeepingOffsets,
@@ -93,7 +102,12 @@ import {
   countScriptUsages,
   refreshDatamodelFields,
   refreshScriptsList,
+  renderScriptsList,
+  updateBulkBar,
+  computeVisibleScripts,
+  configureScriptsList,
 } from './scripts-panel';
+import { renderNavigator, parseNavigatorEntries, normalizeNavPath, configureNavigator } from './navigator';
 
 (function () {
 'use strict';
@@ -726,69 +740,40 @@ document.getElementById('search-input').addEventListener('keydown', e => {
   if (e.key === 'Escape') { e.target.value = ''; runSearch(); }
 });
 
-function runSearch() {
-  const q = document.getElementById('search-input').value;
-  const resultsEl = document.getElementById('search-results');
-  const summary = document.getElementById('search-summary');
-  resultsEl.innerHTML = '';
-  if (!q) { summary.textContent = ''; return; }
+// runSearch carved out to ./search.ts (Phase 6).
 
-  const caseSensitive = document.getElementById('search-case').checked;
-  const useRegex = document.getElementById('search-regex').checked;
-  const wholeWord = document.getElementById('search-word').checked;
-
-  let pattern;
-  try {
-    let src = useRegex ? q : q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    if (wholeWord) src = `\\b(?:${src})\\b`;
-    pattern = new RegExp(src, caseSensitive ? 'g' : 'gi');
-  } catch (e) {
-    summary.textContent = 'Bad regex: ' + e.message;
-    return;
-  }
-
-  let totalHits = 0; let filesHit = 0;
-  const MAX_HITS_PER_FILE = 50;
-  const MAX_TOTAL = 1000;
-
-  const paths = Object.keys(state.files).sort();
-  for (const path of paths) {
-    const f = state.files[path];
-    if (!f.isText) continue;
-    // Use the live-edited content if there's a model
-    const text = state.monacoModels[path] ? state.monacoModels[path].getValue() : f.content;
-    if (!text) continue;
-
-    const hits = [];
-    const lines = text.split('\n');
-    for (let i = 0; i < lines.length && hits.length < MAX_HITS_PER_FILE; i++) {
-      const line = lines[i];
-      pattern.lastIndex = 0;
-      let m;
-      while ((m = pattern.exec(line)) !== null) {
-        hits.push({ lineNo: i + 1, col: m.index, match: m[0], lineText: line });
-        if (m.index === pattern.lastIndex) pattern.lastIndex++;
-        if (hits.length >= MAX_HITS_PER_FILE) break;
-      }
-    }
-    if (!hits.length) continue;
-    filesHit++;
-    totalHits += hits.length;
-    appendSearchFile(resultsEl, path, hits, pattern);
-    if (totalHits >= MAX_TOTAL) {
-      const more = document.createElement('div');
-      more.className = 'search-hit';
-      more.textContent = `… stopped at ${MAX_TOTAL} matches`;
-      resultsEl.appendChild(more);
-      break;
-    }
-  }
-  summary.textContent = totalHits ? `${totalHits} match${totalHits === 1 ? '' : 'es'} in ${filesHit} file${filesHit === 1 ? '' : 's'}` : 'No matches';
-}
-
-// appendSearchFile / renderSnippet carved out to ./search.ts.
+// appendSearchFile / renderSnippet / runSearch carved out to ./search.ts.
 // configureSearch wires the legacy-resident openFile callback in.
 configureSearch({ openFile: path => openFile(path) });
+
+// Wire deps for the scripts-list renderer (Phase 6 carve).
+configureScriptsList({
+  openScriptForm: (id) => openScriptForm(id),
+  toggleScriptEnabled: (id, enabled) => toggleScriptEnabled(id, enabled),
+  setStatus: (msg, kind) => setStatus(msg, kind),
+  moveScript: (fromId, toId, pos) => moveScript(fromId, toId, pos),
+  setSidebarMode: (mode) => setSidebarMode(mode),
+});
+
+// Wire deps for the navigator panel (Phase 6 carve).
+configureNavigator({
+  openFile: (path) => openFile(path),
+  setStatus: (msg, kind) => setStatus(msg, kind),
+});
+
+// Wire deps for scenario orchestrators (Phase 6 carve).
+configureScenarios({
+  setStatus: (msg, kind) => setStatus(msg, kind),
+  refreshPreview: () => refreshPreview(),
+});
+
+// Wire deps for preview panel helpers (Phase 6 carve).
+configurePreviewHelpers({
+  setSidebarMode: (mode) => setSidebarMode(mode),
+  openScriptForm: (id) => openScriptForm(id),
+  setStatus: (msg, kind) => setStatus(msg, kind),
+  buildPreviewHtml: (htmlPath, htmlText, opts) => buildPreviewHtml(htmlPath, htmlText, opts),
+});
 
 // ============================================================
 // MODAL helpers
@@ -873,19 +858,7 @@ hookOn('afterLoadFromHandle', () => {
 // ============================================================
 // HTML PREVIEW (split iframe)
 // ============================================================
-const previewState = {
-  open: false,
-  blobUrls: [],  // urls created for the current preview, to revoke later
-  htmlPath: null,
-  zoom: 1,
-  mode: 'data',  // 'data' | 'raw' | 'split' | 'css' | 'doc'
-  modeByPath: {}, // htmlPath -> mode (per-template memory; in-memory only)
-  lastCss: '',   // cached merged CSS for the current preview (for CSS tab + copy)
-  lastDocxHtml: '', // cached HTML from the most recent mammoth render (for Copy HTML)
-  lastDocxHtmlFor: null, // fileName the cached HTML was rendered from (cache key)
-  unresolved: [], // distinct @tokens@ the last render couldn't resolve
-  tokensDismissed: false, // user clicked × on the strip — re-show on refresh
-};
+// previewState carved out to ./preview.ts (Phase 6). Imported above.
 // ZOOM_STEPS carved out to ./preview.ts.
 
 document.getElementById('btn-preview').addEventListener('click', togglePreview);
@@ -1111,132 +1084,9 @@ function refreshPreview() {
   renderTokensStrip();
 }
 
-// Render (or hide) the unresolved-tokens strip based on the last build's findings.
-function renderTokensStrip() {
-  const strip = document.getElementById('preview-tokens-strip');
-  const list = document.getElementById('preview-tokens-list');
-  const tokens = previewState.unresolved || [];
-  // Strip is meaningful in data + split modes; raw shows the markers in-frame; CSS hides it.
-  const meaningful = (previewState.mode === 'data' || previewState.mode === 'split');
-  if (!meaningful || !tokens.length || previewState.tokensDismissed) {
-    strip.classList.remove('show');
-    return;
-  }
-  list.innerHTML = '';
-  for (const tok of tokens) {
-    const chip = document.createElement('span');
-    chip.className = 't-chip';
-    chip.textContent = tok;
-    // If we have a script bound to this token, mark it and make the chip jump.
-    const bound = scriptByToken(tok);
-    if (bound) {
-      chip.classList.add('has-script');
-      chip.title = 'Jump to script: ' + (bound.name || tok);
-      chip.addEventListener('click', () => jumpToScriptByToken(tok));
-    } else {
-      chip.title = 'No script binds this token — value is missing from the datamodel sample';
-    }
-    list.appendChild(chip);
-  }
-  strip.classList.add('show');
-}
-
-// Find a script whose findText matches the @token@ exactly.
-function scriptByToken(token) {
-  const list = (scriptsState && scriptsState.list) || [];
-  return list.find(s => s.findText === token) || null;
-}
-
-// Switch the sidebar to the Scripts panel and open the matching script's form.
-function jumpToScriptByToken(token) {
-  const s = scriptByToken(token);
-  if (!s) {
-    setStatus('No script binds ' + token, 'warn');
-    return;
-  }
-  if (typeof setSidebarMode === 'function') setSidebarMode('scripts');
-  if (typeof openScriptForm === 'function') openScriptForm(s.id);
-  setStatus('Jumped to script: ' + (s.name || token), 'ok');
-}
-
-// Wire click handlers onto __cw_raw_token spans inside an iframe so users can
-// jump from a token in the rendered preview straight to its script binding.
-function attachTokenJumpHandlers(frame) {
-  let doc;
-  try { doc = frame.contentDocument; } catch (_) { return; }
-  if (!doc || !doc.body) return;
-  doc.body.querySelectorAll('.__cw_raw_token').forEach(el => {
-    if (el.dataset.cwBound === '1') return; // idempotent
-    el.dataset.cwBound = '1';
-    el.style.cursor = 'pointer';
-    el.title = 'Click: jump to the script that binds this token';
-    el.addEventListener('click', e => {
-      e.preventDefault();
-      e.stopPropagation();
-      const token = el.textContent.trim();
-      if (!token) return;
-      jumpToScriptByToken(token);
-    });
-  });
-}
-
-function openPreviewNewTab() {
-  if (!previewState.open || !state.currentPath) return;
-  const text = state.monacoModels[state.currentPath]
-    ? state.monacoModels[state.currentPath].getValue()
-    : state.files[state.currentPath].content;
-  // New-tab opens the same flavor as the active iframe; CSS tab opens the With-Data render.
-  const withData = previewState.mode !== 'raw';
-  const built = buildPreviewHtml(state.currentPath, text, { withData });
-  const blob = new Blob([built], { type: 'text/html' });
-  const url = URL.createObjectURL(blob);
-  window.open(url, '_blank');
-  // Revoke after a delay so the new tab can load it
-  setTimeout(() => URL.revokeObjectURL(url), 60000);
-}
-
-// Render the cached merged CSS into the CSS tab, with light syntax highlighting
-// and a per-source separator so it's clear which file each rule came from.
-function renderCssView() {
-  const codeEl = document.getElementById('preview-css-code');
-  const statsEl = document.getElementById('preview-css-stats');
-  const blocks = previewState.lastCssBlocks || [];
-  if (!blocks.length) {
-    codeEl.innerHTML = '<span class="comment">/* No CSS found in this template. */</span>';
-    statsEl.textContent = 'No CSS yet';
-    return;
-  }
-  const escape = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  // Lightweight tokenizer — good enough for highlighting, not a real parser.
-  function highlight(css) {
-    // Strip /* comments */ and re-inject with a marker so we can colour them.
-    let s = css;
-    s = escape(s);
-    s = s.replace(/\/\*[\s\S]*?\*\//g, m => 'C' + m + '');
-    // @-rules
-    s = s.replace(/(@[-\w]+)/g, 'A$1');
-    // selectors (rough): everything up to the next "{" on a line that has one
-    s = s.replace(/([^{};\n]+)\{/g, (m, sel) => 'S' + sel + '{');
-    // declarations: prop: value;
-    s = s.replace(/([-\w]+)\s*:\s*([^;{}\n]+)([;}])/g, (m, p, v, t) => 'P' + p + ':V' + v + '' + t);
-    s = s
-      .replace(/C([\s\S]*?)/g, (_, x) => '<span class="comment">' + x + '</span>')
-      .replace(/A([^]*)/g, (_, x) => '<span class="at">' + x + '</span>')
-      .replace(/S([^]*)/g, (_, x) => '<span class="selector">' + x + '</span>')
-      .replace(/P([^]*)/g, (_, x) => '<span class="prop">' + x + '</span>')
-      .replace(/V([^]*)/g, (_, x) => '<span class="val">' + x + '</span>');
-    return s;
-  }
-  const html = blocks.map(b => {
-    const head = '<span class="src-tag">/* ' + escape(b.label) + ' — ' + (b.bytes || 0) + ' bytes */</span>';
-    return head + highlight(b.css);
-  }).join('\n\n');
-  codeEl.innerHTML = html;
-  const totalBytes = blocks.reduce((s, b) => s + (b.bytes || 0), 0);
-  statsEl.innerHTML =
-    '<span class="pill">' + blocks.length + ' source' + (blocks.length === 1 ? '' : 's') + '</span>' +
-    '<span class="pill">' + totalBytes.toLocaleString() + ' bytes</span>';
-}
+// renderTokensStrip, scriptByToken, jumpToScriptByToken,
+// attachTokenJumpHandlers, openPreviewNewTab, renderCssView
+// carved out to ./preview.ts (Phase 6).
 
 function buildPreviewHtml(htmlPath, htmlText, opts) {
   opts = opts || {};
@@ -1637,6 +1487,37 @@ hookOn('afterReparseScripts', () => {
   renderScriptsList();
 });
 
+// Append the "Recent" group on top of the just-rendered scripts list.
+// Runs as a second afterReparseScripts handler so it fires after renderScriptsList.
+hookOn('afterReparseScripts', () => {
+  if (!recentScriptsState.list.length) return;
+  const list = document.getElementById('scripts-list');
+  if (!list) return;
+  const existing = list.querySelector('.scripts-group[data-recent="1"]');
+  if (existing) existing.remove();
+  list.querySelectorAll('.script-item[data-recent="1"]').forEach(el => el.remove());
+  const head = document.createElement('div');
+  head.className = 'scripts-group';
+  head.dataset.recent = '1';
+  head.textContent = `Recent  (${recentScriptsState.list.length})`;
+  list.insertBefore(head, list.firstChild);
+  let prev = head;
+  for (const r of recentScriptsState.list) {
+    const found = scriptsState.list.find(x => x.name === r.name);
+    const el = document.createElement('div');
+    el.className = 'script-item' + (found ? '' : ' disabled');
+    el.dataset.recent = '1';
+    const ago = Math.max(0, Date.now() - r.ts);
+    const mins = Math.floor(ago / 60000);
+    const when = mins < 1 ? 'just now' : (mins < 60 ? mins + 'm ago' : Math.floor(mins / 60) + 'h ago');
+    el.innerHTML = `<span class="badge">${escapeHtml(when)}</span><span class="name">${escapeHtml(r.name)}</span>${r.findText ? `<span class="find">${escapeHtml(r.findText)}</span>` : ''}`;
+    el.title = found ? 'Open this script' : 'Script no longer present in this template';
+    if (found) el.addEventListener('click', () => openScriptForm(found.id));
+    prev.parentNode.insertBefore(el, prev.nextSibling);
+    prev = el;
+  }
+});
+
 // Preview pane resizer
 (function () {
   const r = document.getElementById('preview-resizer');
@@ -1727,207 +1608,8 @@ function bindFieldPathAutotype(pathInputId, typeSelectId) {
 bindFieldPathAutotype('sf-field-path', 'sf-field-type');
 bindFieldPathAutotype('sf-cond-field', 'sf-cond-field-type');
 
-function renderScriptsList() {
-  const list = document.getElementById('scripts-list');
-  list.innerHTML = '';
-  if (!scriptsState.hostPath) {
-    list.innerHTML = '<div class="scripts-empty">Open a template (with index.xml) to list its scripts.</div>';
-    updateBulkBar([]);
-    return;
-  }
-  if (!scriptsState.list.length) {
-    list.innerHTML = '<div class="scripts-empty">No &lt;script&gt; elements found in index.xml.</div>';
-    updateBulkBar([]);
-    return;
-  }
-  const filter = (scriptsState.filter || '').toLowerCase();
-  const kindFilter = scriptsState.kindFilter || 'ALL';
-  // Group by kind so TEXT (FLD) and CONDITIONAL (IF) get their own headers
-  // — the old "Personalization" bucket lumped them together. CONTROL stays
-  // separate; OTHER is anything we couldn't classify.
-  const groups = { CONTROL: [], TEXT: [], CONDITIONAL: [], OTHER: [] };
-  const visibleScripts = []; // for the "Select all visible" affordance
-  for (const s of scriptsState.list) {
-    if (filter && !(s.name.toLowerCase().includes(filter) || (s.findText || '').toLowerCase().includes(filter))) continue;
-    if (kindFilter !== 'ALL' && s.kind !== kindFilter) continue;
-    const g = s.kind === 'CONTROL' ? 'CONTROL'
-            : s.kind === 'TEXT' ? 'TEXT'
-            : s.kind === 'CONDITIONAL' ? 'CONDITIONAL'
-            : 'OTHER';
-    groups[g].push(s);
-    visibleScripts.push(s);
-  }
-  const order = [
-    ['CONTROL', 'Control / JS'],
-    ['TEXT', 'Field text (FLD)'],
-    ['CONDITIONAL', 'Conditional (IF)'],
-    ['OTHER', 'Other'],
-  ];
-  let total = 0;
-  for (const [key, label] of order) {
-    if (!groups[key].length) continue;
-    const head = document.createElement('div');
-    head.className = 'scripts-group';
-    head.textContent = `${label}  (${groups[key].length})`;
-    list.appendChild(head);
-    for (const s of groups[key]) {
-      total++;
-      const invalid = isScriptFieldInvalid(s);
-      // Only check usages if the field path is valid — invalid path is the
-      // more critical signal, so we don't want both badges fighting for space.
-      const usageCount = invalid ? null : countScriptUsages(s);
-      const unused = usageCount === 0; // -1 means "no findText/selector to search for", treat as N/A
-      const isPicked = scriptsState.selected && scriptsState.selected.has(s.id);
-      const el = document.createElement('div');
-      el.className = 'script-item'
-        + (scriptsState.active === s.id ? ' active' : '')
-        + (s.enabled ? '' : ' disabled')
-        + (invalid ? ' invalid' : '')
-        + (unused ? ' unused' : '');
-      el.dataset.scriptId = s.id;
-      el.draggable = true;
-      const drag = `<span class="drag" title="Drag to reorder in &lt;scripts&gt;">⋮⋮</span>`;
-      const pick = `<input type="checkbox" class="pick" title="Select for bulk actions" ${isPicked ? 'checked' : ''}>`;
-      const badge = s.kind === 'CONDITIONAL' ? '<span class="badge cnd">IF</span>'
-                   : s.kind === 'TEXT' ? '<span class="badge std">FLD</span>'
-                   : s.kind === 'CONTROL' ? '<span class="badge ctl">JS</span>'
-                   : `<span class="badge">${escapeHtml(s.type || '?')}</span>`;
-      const find = s.findText ? `<span class="find">${escapeHtml(s.findText)}</span>` : '';
-      const statusBadge = invalid
-        ? '<span class="badge bad" title="Field path not in datamodel">!</span>'
-        : (unused
-            ? `<span class="badge unused" title="Click to search the template for this token (no usages found in HTML/XML files — searched findText${s.selectorText ? ' and selectorText' : ''})">?</span>`
-            : '');
-      const toggle = `<input type="checkbox" class="toggle" title="Enable / disable" ${s.enabled ? 'checked' : ''}>`;
-      el.innerHTML = `${drag}${pick}${toggle}${badge}<span class="name">${escapeHtml(s.name || '(unnamed)')}</span>${find}${statusBadge}`;
-
-      el.addEventListener('click', ev => {
-        // Clicks on interactive children handle themselves; only the row
-        // background opens the form.
-        const t = ev.target;
-        if (t.classList && (
-          t.classList.contains('toggle') ||
-          t.classList.contains('pick') ||
-          t.classList.contains('drag') ||
-          (t.classList.contains('badge') && t.classList.contains('unused'))
-        )) return;
-        openScriptForm(s.id);
-      });
-
-      const toggleEl = el.querySelector('.toggle');
-      toggleEl.addEventListener('click', ev => ev.stopPropagation());
-      toggleEl.addEventListener('change', () => toggleScriptEnabled(s.id, toggleEl.checked));
-
-      const pickEl = el.querySelector('.pick');
-      pickEl.addEventListener('click', ev => ev.stopPropagation());
-      pickEl.addEventListener('change', () => {
-        if (pickEl.checked) scriptsState.selected.add(s.id);
-        else scriptsState.selected.delete(s.id);
-        updateBulkBar(visibleScripts);
-      });
-
-      // ?-badge click → switch to Search panel with this script's findText pre-filled.
-      // Closes the loop between "this script looks dead" and "let me confirm by grepping."
-      const unusedBadge = el.querySelector('.badge.unused');
-      if (unusedBadge) {
-        unusedBadge.addEventListener('click', ev => {
-          ev.stopPropagation();
-          const needle = (s.findText || s.selectorText || '').trim();
-          if (!needle) { setStatus('No findText / selectorText to search for.', 'warn'); return; }
-          jumpToSearch(needle);
-        });
-      }
-
-      // Drag-to-reorder. Persists the new order back to <scripts> in index.xml
-      // using the same _raw / offset splice pattern the rest of the file uses.
-      el.addEventListener('dragstart', ev => {
-        scriptsDnd.from = s.id;
-        el.classList.add('dragging');
-        try { ev.dataTransfer.setData('text/plain', s.id); ev.dataTransfer.effectAllowed = 'move'; } catch (_) {}
-      });
-      el.addEventListener('dragend', () => {
-        el.classList.remove('dragging');
-        document.querySelectorAll('.script-item.drop-before, .script-item.drop-after')
-          .forEach(x => x.classList.remove('drop-before', 'drop-after'));
-        scriptsDnd.from = null;
-      });
-      el.addEventListener('dragover', ev => {
-        if (!scriptsDnd.from || scriptsDnd.from === s.id) return;
-        ev.preventDefault();
-        ev.dataTransfer.dropEffect = 'move';
-        const rect = el.getBoundingClientRect();
-        const before = (ev.clientY - rect.top) < (rect.height / 2);
-        el.classList.toggle('drop-before', before);
-        el.classList.toggle('drop-after', !before);
-      });
-      el.addEventListener('dragleave', () => {
-        el.classList.remove('drop-before', 'drop-after');
-      });
-      el.addEventListener('drop', ev => {
-        if (!scriptsDnd.from || scriptsDnd.from === s.id) return;
-        ev.preventDefault();
-        const rect = el.getBoundingClientRect();
-        const before = (ev.clientY - rect.top) < (rect.height / 2);
-        const fromId = scriptsDnd.from;
-        el.classList.remove('drop-before', 'drop-after');
-        moveScript(fromId, s.id, before ? 'before' : 'after');
-      });
-
-      list.appendChild(el);
-    }
-  }
-  if (total === 0 && (filter || kindFilter !== 'ALL')) {
-    const empty = document.createElement('div');
-    empty.className = 'scripts-empty';
-    empty.textContent = 'No scripts match the current filter.';
-    list.appendChild(empty);
-  }
-  updateBulkBar(visibleScripts);
-}
-
-// Track the in-flight drag source id. Reset in dragend.
-const scriptsDnd = { from: null };
-
-// Keep the bulk-action bar's checkbox + button states in sync with the
-// current selection. Only operates on visible (filter-passing) scripts so
-// "select all" doesn't sweep up scripts the user can't see.
-function updateBulkBar(visibleScripts) {
-  const bar = document.getElementById('scripts-bulk-bar');
-  if (!bar) return;
-  const visIds = visibleScripts.map(s => s.id);
-  const sel = scriptsState.selected || new Set();
-  // Drop selections that aren't in the current visible set so the count
-  // and button-enabled state always reflect what the user can see.
-  let visibleSelected = 0;
-  for (const id of visIds) if (sel.has(id)) visibleSelected++;
-  const allCheckbox = document.getElementById('scripts-bulk-all');
-  const countEl = document.getElementById('scripts-bulk-count');
-  if (allCheckbox) {
-    allCheckbox.checked = visIds.length > 0 && visibleSelected === visIds.length;
-    allCheckbox.indeterminate = visibleSelected > 0 && visibleSelected < visIds.length;
-    allCheckbox.disabled = visIds.length === 0;
-  }
-  if (countEl) countEl.textContent = visibleSelected ? `${visibleSelected} selected` : '0 selected';
-  for (const id of ['scripts-bulk-enable','scripts-bulk-disable','scripts-bulk-delete']) {
-    const b = document.getElementById(id);
-    if (b) b.disabled = visibleSelected === 0;
-  }
-}
-
-// Switch the sidebar to the Search panel and pre-fill the input with `needle`.
-// Used by the ?-badge click — clicking the unused badge takes the user
-// straight to a search for the script's findText so they can confirm
-// (or refute) that the script is genuinely dead.
-function jumpToSearch(needle) {
-  setSidebarMode('search');
-  const inp = document.getElementById('search-input');
-  if (!inp) return;
-  inp.value = needle;
-  // Defer focus so the panel-show CSS transition is settled first.
-  setTimeout(() => { inp.focus(); inp.select(); }, 0);
-  // Trigger the existing debounced runner.
-  if (typeof runSearch === 'function') runSearch();
-}
+// renderScriptsList, updateBulkBar, computeVisibleScripts, jumpToSearch,
+// scriptsDnd carved out to ./scripts-panel.ts (Phase 6).
 
 // isScriptFieldInvalid carved out to ./scripts-panel.ts (Phase 6).
 // countScriptUsages carved out to ./scripts-panel.ts (Phase 6).
@@ -2060,15 +1742,7 @@ document.getElementById('scripts-bulk-disable').addEventListener('click', () => 
 document.getElementById('scripts-bulk-delete').addEventListener('click', () => bulkDelete());
 
 // Mirror of the renderer's filter logic so bulk-all only acts on what's visible.
-function computeVisibleScripts() {
-  const filter = (scriptsState.filter || '').toLowerCase();
-  const kindFilter = scriptsState.kindFilter || 'ALL';
-  return scriptsState.list.filter(s => {
-    if (filter && !(s.name.toLowerCase().includes(filter) || (s.findText || '').toLowerCase().includes(filter))) return false;
-    if (kindFilter !== 'ALL' && s.kind !== kindFilter) return false;
-    return true;
-  });
-}
+// computeVisibleScripts carved out to ./scripts-panel.ts (Phase 6).
 
 // Apply enable/disable to every selected (and still visible) script in one
 // pass, then re-render once at the end. Each script mutation reuses the
@@ -2683,96 +2357,9 @@ document.getElementById('mode-nav').addEventListener('click', () => setSidebarMo
 // ============================================================
 // SECTION / MASTER / SNIPPET NAVIGATOR
 // ============================================================
-function parseNavigatorEntries() {
-  // Returns { masters, sections, snippets } each as [{ id, name, location }]
-  const out = { masters: [], sections: [], snippets: [] };
-  if (!scriptsState.hostPath) return out;
-  const text = state.monacoModels[scriptsState.hostPath]
-    ? state.monacoModels[scriptsState.hostPath].getValue()
-    : (state.files[scriptsState.hostPath] && state.files[scriptsState.hostPath].content) || '';
-  if (!text) return out;
-  function pluck(parentTag, childTag, key) {
-    const m = new RegExp(`<${parentTag}>([\\s\\S]*?)<\\/${parentTag}>`).exec(text);
-    if (!m) return;
-    const inner = m[1];
-    const re = new RegExp(`<${childTag}\\s+id="([^"]*)"[^>]*>([\\s\\S]*?)<\\/${childTag}>`, 'g');
-    let cm;
-    while ((cm = re.exec(inner)) !== null) {
-      const body = cm[2];
-      const nameM = /<name>([\s\S]*?)<\/name>/.exec(body);
-      const locM = /<location>([\s\S]*?)<\/location>/.exec(body);
-      out[key].push({
-        id: cm[1],
-        name: nameM ? decodeXmlEntities(nameM[1]) : '(unnamed)',
-        location: locM ? decodeXmlEntities(locM[1]) : '',
-      });
-    }
-  }
-  pluck('masters', 'master', 'masters');
-  pluck('sections', 'section', 'sections');
-  pluck('snippets', 'snippet', 'snippets');
-  return out;
-}
-
-function renderNavigator() {
-  const list = document.getElementById('nav-list');
-  if (!list) return;
-  list.innerHTML = '';
-  if (!scriptsState.hostPath) {
-    list.innerHTML = '<div class="scripts-empty">Open a template (with index.xml) to see its sections.</div>';
-    return;
-  }
-  const groups = parseNavigatorEntries();
-  const total = groups.masters.length + groups.sections.length + groups.snippets.length;
-  if (!total) {
-    list.innerHTML = '<div class="scripts-empty">No sections, masters, or snippets found in index.xml.</div>';
-    return;
-  }
-  const order = [
-    ['sections', 'Sections', '📄'],
-    ['masters', 'Master pages', '📑'],
-    ['snippets', 'Snippets', '🧩'],
-  ];
-  for (const [key, label, ico] of order) {
-    const items = groups[key];
-    if (!items.length) continue;
-    const head = document.createElement('div');
-    head.className = 'nav-group';
-    head.textContent = `${label}  (${items.length})`;
-    list.appendChild(head);
-    // Sort by name
-    items.sort((a, b) => a.name.localeCompare(b.name));
-    for (const it of items) {
-      const el = document.createElement('div');
-      el.className = 'nav-item' + (state.currentPath && state.currentPath === normalizeNavPath(it.location) ? ' active' : '');
-      el.innerHTML = `<span class="ico">${ico}</span><span class="name">${escapeHtml(it.name)}</span>`;
-      el.title = it.location;
-      el.addEventListener('click', () => {
-        const p = normalizeNavPath(it.location);
-        if (state.files[p]) {
-          openFile(p);
-          // Reflect active state
-          renderNavigator();
-        } else {
-          setStatus(`Not found in package: ${p}`, 'warn');
-        }
-      });
-      list.appendChild(el);
-    }
-  }
-}
-
-// PlanetPress paths inside index.xml use forward slashes; the zip may contain
-// the same paths with backslashes. Try both.
-function normalizeNavPath(p) {
-  if (!p) return '';
-  if (state.files[p]) return p;
-  const back = p.replace(/\//g, '\\');
-  if (state.files[back]) return back;
-  const fwd = p.replace(/\\/g, '/');
-  if (state.files[fwd]) return fwd;
-  return p;
-}
+// parseNavigatorEntries carved out to ./navigator.ts (Phase 6).
+// renderNavigator carved out to ./navigator.ts (Phase 6).
+// normalizeNavPath carved out to ./navigator.ts (Phase 6).
 
 // ============================================================
 // RECENT TEMPLATES (IndexedDB-backed)
@@ -3863,136 +3450,11 @@ hookOn('afterLoadFromHandle', () => {
 // scnPersistKey carved out to ./scenarios.ts (Phase 6).
 // parseScenarioXmlToMap carved out to ./scenarios.ts (Phase 6).
 
-// Extract sample XMLs from a .OL-datamapper zip (already-loaded JSZip instance).
-// PlanetPress zips routinely store paths with backslashes, so we test both.
-async function readScenariosFromZip(zip, sourceLabel) {
-  const out = [];
-  const entries = [];
-  zip.forEach((path, entry) => { if (!entry.dir) entries.push({ path, entry }); });
-  for (const { path, entry } of entries) {
-    const norm = path.replace(/\\/g, '/');
-    if (!/^SampleDataFiles\//i.test(norm)) continue;
-    if (!/\.xml$/i.test(norm)) continue;
-    let text;
-    try {
-      const bytes = await entry.async('uint8array');
-      text = decodeBytes(bytes);
-    } catch (_) { continue; }
-    const valueByPath = parseScenarioXmlToMap(text);
-    out.push({
-      name: norm.split('/').pop(),
-      path: path,                  // original path (may contain backslashes)
-      xmlText: text,
-      valueByPath,
-    });
-  }
-  out.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-  scenariosState.source = sourceLabel || null;
-  scenariosState.list = out;
-  return out;
-}
-
-// If the open template lives in a folder (Open Folder mode), look for an
-// .OL-datamapper sibling and auto-load its scenarios. Returns true if loaded.
-async function autoLoadScenariosFromFolder() {
-  if (!state.dirHandle) return false;
-  // Pick the first .OL-datamapper in the folder list
-  const dm = (state.folderTemplates || []).find(t => t.ext === 'ol-datamapper');
-  if (!dm) return false;
-  try {
-    const file = await dm.handle.getFile();
-    const zip = await JSZip.loadAsync(file);
-    await readScenariosFromZip(zip, dm.name);
-    scenariosState.sourceHandle = dm.handle;
-    return true;
-  } catch (e) {
-    console.warn('[scenarios] auto-load failed:', e);
-    return false;
-  }
-}
-
-// User-initiated: pick a .OL-datamapper from disk and load its scenarios.
-async function pickAndLoadScenarios() {
-  if (!window.showOpenFilePicker) {
-    alert('File picker not available — try Chrome or Edge.');
-    return;
-  }
-  let handle;
-  try { [handle] = await window.showOpenFilePicker({ multiple: false }); }
-  catch (e) { if (e.name !== 'AbortError') setStatus('Pick failed: ' + e.message, 'err'); return; }
-  try {
-    const file = await handle.getFile();
-    const zip = await JSZip.loadAsync(file);
-    await readScenariosFromZip(zip, handle.name);
-    scenariosState.sourceHandle = handle;
-    populateScenarioPicker();
-    setStatus(`Loaded ${scenariosState.list.length} scenario${scenariosState.list.length === 1 ? '' : 's'} from ${handle.name}.`, 'ok');
-  } catch (e) { setStatus('Load failed: ' + e.message, 'err'); }
-}
-
-// Reflect scenariosState.list in the <select>; show/hide the wrap based on
-// whether the open template type makes scenarios meaningful.
-function populateScenarioPicker() {
-  const wrap = document.getElementById('preview-scenario-wrap');
-  const row = document.getElementById('preview-scenario-row');
-  const sel = document.getElementById('preview-scenario');
-  const matrixBtn = document.getElementById('btn-scenario-matrix');
-  const diffBtn = document.getElementById('btn-scenario-diff');
-  const editBtn = document.getElementById('btn-scenario-edit');
-  if (!wrap || !sel) return;
-  // Only meaningful for templates (.OL-template / .OL-datamapper) — not docx, not standalone.
-  const isHostUseful = !state.isDocx;
-  wrap.style.display = isHostUseful ? '' : 'none';
-  if (row) row.style.display = isHostUseful ? '' : 'none';
-  sel.innerHTML = '';
-  const def = document.createElement('option');
-  def.value = '';
-  def.textContent = scenariosState.list.length
-    ? `(datamodel sample) — ${scenariosState.list.length} scenarios available`
-    : '(datamodel sample) — no scenarios loaded';
-  sel.appendChild(def);
-  for (const s of scenariosState.list) {
-    const opt = document.createElement('option');
-    opt.value = s.name;
-    opt.textContent = s.name + (scenariosState.source ? '  ·  ' + scenariosState.source : '');
-    sel.appendChild(opt);
-  }
-  // Restore last-picked scenario for this template
-  let restore = null;
-  try { restore = localStorage.getItem(scnPersistKey()); } catch (_) {}
-  if (restore && scenariosState.list.some(s => s.name === restore)) {
-    sel.value = restore;
-    activateScenario(restore, /*silent*/true);
-  } else {
-    sel.value = '';
-    activateScenario(null, true);
-  }
-  const anyScenarios = scenariosState.list.length > 0;
-  matrixBtn.disabled = !anyScenarios;
-  diffBtn.disabled = scenariosState.list.length < 2;
-  editBtn.disabled = !scenariosState.active;
-}
-
-function activateScenario(name, silent) {
-  if (!name) {
-    scenariosState.active = null;
-    scenariosState.activeOverrides = null;
-  } else {
-    const s = scenariosState.list.find(x => x.name === name);
-    if (!s) { scenariosState.active = null; scenariosState.activeOverrides = null; }
-    else { scenariosState.active = name; scenariosState.activeOverrides = s.valueByPath; }
-  }
-  try { localStorage.setItem(scnPersistKey(), scenariosState.active || ''); } catch (_) {}
-  document.getElementById('preview-scenario-wrap').classList.toggle('has-active', !!scenariosState.active);
-  const editBtn = document.getElementById('btn-scenario-edit');
-  if (editBtn) editBtn.disabled = !scenariosState.active;
-  if (previewState && previewState.open) refreshPreview();
-  if (!silent) {
-    setStatus(scenariosState.active
-      ? `Scenario: ${scenariosState.active}`
-      : 'Scenario cleared (using datamodel lastValue)', 'ok');
-  }
-}
+// readScenariosFromZip carved out to ./scenarios.ts (Phase 6).
+// autoLoadScenariosFromFolder carved out to ./scenarios.ts (Phase 6).
+// pickAndLoadScenarios carved out to ./scenarios.ts (Phase 6).
+// populateScenarioPicker carved out to ./scenarios.ts (Phase 6).
+// activateScenario carved out to ./scenarios.ts (Phase 6).
 
 // Wire scenario picker UI
 (function wireScenarios() {
@@ -4496,43 +3958,39 @@ hookOn('afterLoadFromHandle', () => {
 });
 loadRecentScripts();
 
-// Inject a "Recent" group at the top of the rendered scripts list. We do this
-// by wrapping renderScriptsList and prepending DOM nodes after the original
-// runs.
-(function patchRenderScriptsList() {
-  const orig = renderScriptsList;
-  renderScriptsList = function () {
-    orig.apply(this, arguments);
-    if (!recentScriptsState.list.length) return;
-    const list = document.getElementById('scripts-list');
-    if (!list) return;
-    // Avoid duplicates if the function is re-run quickly
-    const existing = list.querySelector('.scripts-group[data-recent="1"]');
-    if (existing) existing.remove();
-    list.querySelectorAll('.script-item[data-recent="1"]').forEach(el => el.remove());
-    const head = document.createElement('div');
-    head.className = 'scripts-group';
-    head.dataset.recent = '1';
-    head.textContent = `Recent  (${recentScriptsState.list.length})`;
-    list.insertBefore(head, list.firstChild);
-    // Insert items in reverse so the most recent ends up just under the header
-    let prev = head;
-    for (const r of recentScriptsState.list) {
-      const found = scriptsState.list.find(x => x.name === r.name);
-      const el = document.createElement('div');
-      el.className = 'script-item' + (found ? '' : ' disabled');
-      el.dataset.recent = '1';
-      const ago = Math.max(0, Date.now() - r.ts);
-      const mins = Math.floor(ago / 60000);
-      const when = mins < 1 ? 'just now' : (mins < 60 ? mins + 'm ago' : Math.floor(mins / 60) + 'h ago');
-      el.innerHTML = `<span class="badge">${escapeHtml(when)}</span><span class="name">${escapeHtml(r.name)}</span>${r.findText ? `<span class="find">${escapeHtml(r.findText)}</span>` : ''}`;
-      el.title = found ? 'Open this script' : 'Script no longer present in this template';
-      if (found) el.addEventListener('click', () => openScriptForm(found.id));
-      prev.parentNode.insertBefore(el, prev.nextSibling);
-      prev = el;
-    }
-  };
-})();
+// Inject a "Recent" group at the top of the rendered scripts list after
+// renderScriptsList runs. Registered as a second afterReparseScripts handler
+// so it fires after the first one (which calls renderScriptsList).
+hookOn('afterReparseScripts', () => {
+  if (!recentScriptsState.list.length) return;
+  const list = document.getElementById('scripts-list');
+  if (!list) return;
+  // Avoid duplicates if the function is re-run quickly
+  const existing = list.querySelector('.scripts-group[data-recent="1"]');
+  if (existing) existing.remove();
+  list.querySelectorAll('.script-item[data-recent="1"]').forEach(el => el.remove());
+  const head = document.createElement('div');
+  head.className = 'scripts-group';
+  head.dataset.recent = '1';
+  head.textContent = `Recent  (${recentScriptsState.list.length})`;
+  list.insertBefore(head, list.firstChild);
+  // Insert items in reverse so the most recent ends up just under the header
+  let prev = head;
+  for (const r of recentScriptsState.list) {
+    const found = scriptsState.list.find(x => x.name === r.name);
+    const el = document.createElement('div');
+    el.className = 'script-item' + (found ? '' : ' disabled');
+    el.dataset.recent = '1';
+    const ago = Math.max(0, Date.now() - r.ts);
+    const mins = Math.floor(ago / 60000);
+    const when = mins < 1 ? 'just now' : (mins < 60 ? mins + 'm ago' : Math.floor(mins / 60) + 'h ago');
+    el.innerHTML = `<span class="badge">${escapeHtml(when)}</span><span class="name">${escapeHtml(r.name)}</span>${r.findText ? `<span class="find">${escapeHtml(r.findText)}</span>` : ''}`;
+    el.title = found ? 'Open this script' : 'Script no longer present in this template';
+    if (found) el.addEventListener('click', () => openScriptForm(found.id));
+    prev.parentNode!.insertBefore(el, prev.nextSibling);
+    prev = el;
+  }
+});
 
 // ---------- MONACO "GO TO SCRIPT" ----------
 // Adds an editor action so right-click on an @token@ in HTML/XML offers a

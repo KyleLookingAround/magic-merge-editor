@@ -1,16 +1,17 @@
 // HTML-preview helpers. Carved out of legacy.ts as the ninth Phase 3
 // module.
 //
-// Phase 6: theme orchestrators (getZipText, parseDocxTheme, buildThemeCss,
-// renderThemePanel) migrated here alongside themeState. The heavier preview
-// orchestrators (togglePreview, openPreview, closePreview, refreshPreview,
-// buildPreviewHtml, applyDatamodelPersonalization, zoom controls, token-jump
-// handlers) still live in legacy.ts — they depend on previewState (the
-// blob-URL cache + open/mode/zoom shell) which hasn't been carved yet.
+// Phase 6 second pass: previewState, revokePreviewBlobs, renderTokensStrip,
+// scriptByToken, jumpToScriptByToken, attachTokenJumpHandlers, renderCssView,
+// openPreviewNewTab migrated here. The remaining orchestrators (togglePreview,
+// openPreview, closePreview, refreshPreview, setPreviewMode, zoom controls,
+// buildPreviewHtml, applyDatamodelPersonalization) still live in legacy.ts —
+// they depend on the full preview open/close/refresh pipeline.
 //
 import { state } from './state';
 import { escapeHtml } from './tree';
 import { decodeBytes } from './fs';
+import { scriptsState } from './scripts-panel';
 
 export interface ThemePaletteEntry { key: string; name: string; hex: string; }
 export interface ThemeFontSlot { latin: string; ea: string; cs: string; }
@@ -277,4 +278,184 @@ export function buildThemeCss(): string {
     }
   }
   return lines.join('\n');
+}
+
+// ============================================================
+// PREVIEW STATE + HELPERS (carved from legacy.ts in Phase 6)
+// ============================================================
+
+export interface CssBlock { label: string; css: string; bytes: number; }
+
+export interface PreviewState {
+  open: boolean;
+  blobUrls: string[];
+  htmlPath: string | null;
+  zoom: number;
+  mode: string;
+  modeByPath: Record<string, string>;
+  lastCss: string;
+  lastCssBlocks: CssBlock[];
+  lastDocxHtml: string;
+  lastDocxHtmlFor: string | null;
+  unresolved: string[];
+  tokensDismissed: boolean;
+}
+
+export const previewState: PreviewState = {
+  open: false,
+  blobUrls: [],
+  htmlPath: null,
+  zoom: 1,
+  mode: 'data',
+  modeByPath: {},
+  lastCss: '',
+  lastCssBlocks: [],
+  lastDocxHtml: '',
+  lastDocxHtmlFor: null,
+  unresolved: [],
+  tokensDismissed: false,
+};
+
+/** Revoke all blob URLs created for the current preview to prevent leaks. */
+export function revokePreviewBlobs(): void {
+  for (const u of previewState.blobUrls) URL.revokeObjectURL(u);
+  previewState.blobUrls = [];
+}
+
+// ============================================================
+// PREVIEW PANEL HELPERS
+// Deps for cross-panel navigation are injected via configurePreviewHelpers().
+// ============================================================
+
+export interface PreviewHelperDeps {
+  setSidebarMode: (mode: string) => void;
+  openScriptForm: (id: string) => void;
+  setStatus: (msg: string, kind?: string) => void;
+  buildPreviewHtml: (htmlPath: string, htmlText: string, opts?: { withData?: boolean }) => string;
+}
+
+let helperDeps: PreviewHelperDeps = {
+  setSidebarMode: () => {},
+  openScriptForm: () => {},
+  setStatus: () => {},
+  buildPreviewHtml: () => '',
+};
+
+export function configurePreviewHelpers(d: PreviewHelperDeps): void { helperDeps = d; }
+
+/** Find the script whose findText exactly matches @token@. */
+export function scriptByToken(token: string): import('./scripts-panel').ParsedScript | null {
+  const list = scriptsState?.list ?? [];
+  return list.find(s => s.findText === token) ?? null;
+}
+
+/** Switch the sidebar to Scripts mode and open the matching script's form. */
+export function jumpToScriptByToken(token: string): void {
+  const s = scriptByToken(token);
+  if (!s) { helperDeps.setStatus('No script binds ' + token, 'warn'); return; }
+  helperDeps.setSidebarMode('scripts');
+  helperDeps.openScriptForm(s.id);
+  helperDeps.setStatus('Jumped to script: ' + (s.name || token), 'ok');
+}
+
+/** Wire click handlers onto __cw_raw_token spans inside an iframe so users
+ *  can jump from a token in the rendered preview straight to its script. */
+export function attachTokenJumpHandlers(frame: HTMLIFrameElement): void {
+  let doc: Document | null;
+  try { doc = frame.contentDocument; } catch (_) { return; }
+  if (!doc || !doc.body) return;
+  doc.body.querySelectorAll('.__cw_raw_token').forEach(el => {
+    const span = el as HTMLElement;
+    if (span.dataset.cwBound === '1') return;
+    span.dataset.cwBound = '1';
+    span.style.cursor = 'pointer';
+    span.title = 'Click: jump to the script that binds this token';
+    span.addEventListener('click', (e: Event) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const token = span.textContent?.trim() ?? '';
+      if (!token) return;
+      jumpToScriptByToken(token);
+    });
+  });
+}
+
+/** Render (or hide) the unresolved-tokens strip above the preview. */
+export function renderTokensStrip(): void {
+  const strip = document.getElementById('preview-tokens-strip');
+  const list = document.getElementById('preview-tokens-list');
+  if (!strip || !list) return;
+  const tokens = previewState.unresolved ?? [];
+  const meaningful = (previewState.mode === 'data' || previewState.mode === 'split');
+  if (!meaningful || !tokens.length || previewState.tokensDismissed) {
+    strip.classList.remove('show');
+    return;
+  }
+  list.innerHTML = '';
+  for (const tok of tokens) {
+    const chip = document.createElement('span');
+    chip.className = 't-chip';
+    chip.textContent = tok;
+    const bound = scriptByToken(tok);
+    if (bound) {
+      chip.classList.add('has-script');
+      chip.title = 'Jump to script: ' + (bound.name || tok);
+      chip.addEventListener('click', () => jumpToScriptByToken(tok));
+    } else {
+      chip.title = 'No script binds this token — value is missing from the datamodel sample';
+    }
+    list.appendChild(chip);
+  }
+  strip.classList.add('show');
+}
+
+/** Render the cached merged CSS into the CSS tab with lightweight syntax
+ *  highlighting and a per-source label. */
+export function renderCssView(): void {
+  const codeEl = document.getElementById('preview-css-code');
+  const statsEl = document.getElementById('preview-css-stats');
+  if (!codeEl || !statsEl) return;
+  const blocks = previewState.lastCssBlocks ?? [];
+  if (!blocks.length) {
+    codeEl.innerHTML = '<span class="comment">/* No CSS found in this template. */</span>';
+    statsEl.textContent = 'No CSS yet';
+    return;
+  }
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  function highlight(css: string): string {
+    let s = esc(css);
+    s = s.replace(/\/\*[\s\S]*?\*\//g, m => 'C' + m + '');
+    s = s.replace(/(@[-\w]+)/g, 'A$1');
+    s = s.replace(/([^{};\n]+)\{/g, (_m, sel: string) => 'S' + sel + '{');
+    s = s.replace(/([-\w]+)\s*:\s*([^;{}\n]+)([;}])/g, (_m, p: string, v: string, t: string) => 'P' + p + ':V' + v + '' + t);
+    return s
+      .replace(/C([\s\S]*?)/g, (_, x: string) => '<span class="comment">' + x + '</span>')
+      .replace(/A([^]*)/g, (_, x: string) => '<span class="at">' + x + '</span>')
+      .replace(/S([^]*)/g, (_, x: string) => '<span class="selector">' + x + '</span>')
+      .replace(/P([^]*)/g, (_, x: string) => '<span class="prop">' + x + '</span>')
+      .replace(/V([^]*)/g, (_, x: string) => '<span class="val">' + x + '</span>');
+  }
+  const html = blocks.map(b => {
+    const head = '<span class="src-tag">/* ' + esc(b.label) + ' — ' + (b.bytes || 0) + ' bytes */</span>';
+    return head + highlight(b.css);
+  }).join('\n\n');
+  codeEl.innerHTML = html;
+  const totalBytes = blocks.reduce((s, b) => s + (b.bytes || 0), 0);
+  statsEl.innerHTML =
+    '<span class="pill">' + blocks.length + ' source' + (blocks.length === 1 ? '' : 's') + '</span>' +
+    '<span class="pill">' + totalBytes.toLocaleString() + ' bytes</span>';
+}
+
+/** Open the current preview in a new browser tab. */
+export function openPreviewNewTab(): void {
+  if (!previewState.open || !state.currentPath) return;
+  const text = (state.monacoModels as Record<string, { getValue(): string }>)[state.currentPath]
+    ? (state.monacoModels as Record<string, { getValue(): string }>)[state.currentPath].getValue()
+    : (state.files[state.currentPath] as { content?: string }).content ?? '';
+  const withData = previewState.mode !== 'raw';
+  const built = helperDeps.buildPreviewHtml(state.currentPath, text, { withData });
+  const blob = new Blob([built], { type: 'text/html' });
+  const url = URL.createObjectURL(blob);
+  window.open(url, '_blank');
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
 }

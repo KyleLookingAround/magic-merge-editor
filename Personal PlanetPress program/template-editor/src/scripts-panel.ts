@@ -15,6 +15,8 @@
 import { encodeXmlText, encodeXmlAttr, replaceTagInner, decodeXmlEntities, makeMemoCache, MemoCache, extOf } from './fs';
 import { state } from './state';
 import { emit as hookEmit } from './hooks';
+import { escapeHtml } from './tree';
+import { runSearch } from './search';
 
 /** Filenames inside a template that may host the <script> blocks. */
 export const SCRIPT_HOST_CANDIDATES: readonly string[] = ['index.xml'];
@@ -511,4 +513,222 @@ export function refreshScriptsList(): void {
   scriptsState.list = parseScriptsFromXml(text);
   hookEmit('afterReparseScripts');
   refreshDatamodelFields();
+}
+
+// ============================================================
+// SCRIPTS LIST RENDERER (carved from legacy.ts in Phase 6)
+// ============================================================
+
+export interface ScriptListDeps {
+  openScriptForm: (id: string) => void;
+  toggleScriptEnabled: (id: string, enabled: boolean) => void;
+  setStatus: (msg: string, kind?: string) => void;
+  moveScript: (fromId: string, toId: string, position: 'before' | 'after') => void;
+  setSidebarMode: (mode: string) => void;
+}
+
+let listDeps: ScriptListDeps = {
+  openScriptForm: () => {},
+  toggleScriptEnabled: () => {},
+  setStatus: () => {},
+  moveScript: () => {},
+  setSidebarMode: () => {},
+};
+
+export function configureScriptsList(d: ScriptListDeps): void { listDeps = d; }
+
+/** Shared in-flight drag-source id; reset in dragend. */
+const scriptsDnd: { from: string | null } = { from: null };
+
+/** Switch the sidebar to the Search panel and pre-fill the query input. */
+function jumpToSearch(needle: string): void {
+  listDeps.setSidebarMode('search');
+  const inp = document.getElementById('search-input') as HTMLInputElement | null;
+  if (!inp) return;
+  inp.value = needle;
+  setTimeout(() => { inp.focus(); inp.select(); }, 0);
+  runSearch();
+}
+
+/** Re-filter scriptsState.list against the current filter/kindFilter without
+ *  re-rendering. Used by bulk operations so they act only on visible scripts. */
+export function computeVisibleScripts(): ParsedScript[] {
+  const filter = (scriptsState.filter || '').toLowerCase();
+  const kindFilter = scriptsState.kindFilter || 'ALL';
+  return scriptsState.list.filter(s => {
+    if (filter && !(s.name.toLowerCase().includes(filter) || (s.findText || '').toLowerCase().includes(filter))) return false;
+    if (kindFilter !== 'ALL' && s.kind !== kindFilter) return false;
+    return true;
+  });
+}
+
+/** Sync the bulk-action bar's checkbox and button states with the current
+ *  selection. Only counts scripts that are currently visible (filter-passing). */
+export function updateBulkBar(visibleScripts: ParsedScript[]): void {
+  const bar = document.getElementById('scripts-bulk-bar');
+  if (!bar) return;
+  const visIds = visibleScripts.map(s => s.id);
+  const sel = scriptsState.selected || new Set<string>();
+  let visibleSelected = 0;
+  for (const id of visIds) if (sel.has(id)) visibleSelected++;
+  const allCheckbox = document.getElementById('scripts-bulk-all') as HTMLInputElement | null;
+  const countEl = document.getElementById('scripts-bulk-count');
+  if (allCheckbox) {
+    allCheckbox.checked = visIds.length > 0 && visibleSelected === visIds.length;
+    allCheckbox.indeterminate = visibleSelected > 0 && visibleSelected < visIds.length;
+    allCheckbox.disabled = visIds.length === 0;
+  }
+  if (countEl) countEl.textContent = visibleSelected ? `${visibleSelected} selected` : '0 selected';
+  for (const id of ['scripts-bulk-enable', 'scripts-bulk-disable', 'scripts-bulk-delete']) {
+    const b = document.getElementById(id) as HTMLButtonElement | null;
+    if (b) b.disabled = visibleSelected === 0;
+  }
+}
+
+/** Re-render the #scripts-list DOM from scriptsState. */
+export function renderScriptsList(): void {
+  const list = document.getElementById('scripts-list')!;
+  list.innerHTML = '';
+  if (!scriptsState.hostPath) {
+    list.innerHTML = '<div class="scripts-empty">Open a template (with index.xml) to list its scripts.</div>';
+    updateBulkBar([]);
+    return;
+  }
+  if (!scriptsState.list.length) {
+    list.innerHTML = '<div class="scripts-empty">No &lt;script&gt; elements found in index.xml.</div>';
+    updateBulkBar([]);
+    return;
+  }
+  const filter = (scriptsState.filter || '').toLowerCase();
+  const kindFilter = scriptsState.kindFilter || 'ALL';
+  const groups: Record<string, ParsedScript[]> = { CONTROL: [], TEXT: [], CONDITIONAL: [], OTHER: [] };
+  const visibleScripts: ParsedScript[] = [];
+  for (const s of scriptsState.list) {
+    if (filter && !(s.name.toLowerCase().includes(filter) || (s.findText || '').toLowerCase().includes(filter))) continue;
+    if (kindFilter !== 'ALL' && s.kind !== kindFilter) continue;
+    const g = s.kind === 'CONTROL' ? 'CONTROL'
+            : s.kind === 'TEXT' ? 'TEXT'
+            : s.kind === 'CONDITIONAL' ? 'CONDITIONAL'
+            : 'OTHER';
+    groups[g].push(s);
+    visibleScripts.push(s);
+  }
+  const order: [string, string][] = [
+    ['CONTROL', 'Control / JS'],
+    ['TEXT', 'Field text (FLD)'],
+    ['CONDITIONAL', 'Conditional (IF)'],
+    ['OTHER', 'Other'],
+  ];
+  let total = 0;
+  for (const [key, label] of order) {
+    if (!groups[key].length) continue;
+    const head = document.createElement('div');
+    head.className = 'scripts-group';
+    head.textContent = `${label}  (${groups[key].length})`;
+    list.appendChild(head);
+    for (const s of groups[key]) {
+      total++;
+      const invalid = isScriptFieldInvalid(s);
+      const usageCount = invalid ? null : countScriptUsages(s);
+      const unused = usageCount === 0;
+      const isPicked = !!(scriptsState.selected && scriptsState.selected.has(s.id));
+      const el = document.createElement('div');
+      el.className = 'script-item'
+        + (scriptsState.active === s.id ? ' active' : '')
+        + (s.enabled ? '' : ' disabled')
+        + (invalid ? ' invalid' : '')
+        + (unused ? ' unused' : '');
+      el.dataset.scriptId = s.id;
+      el.draggable = true;
+      const drag = `<span class="drag" title="Drag to reorder in &lt;scripts&gt;">⋮⋮</span>`;
+      const pick = `<input type="checkbox" class="pick" title="Select for bulk actions" ${isPicked ? 'checked' : ''}>`;
+      const badge = s.kind === 'CONDITIONAL' ? '<span class="badge cnd">IF</span>'
+                  : s.kind === 'TEXT' ? '<span class="badge std">FLD</span>'
+                  : s.kind === 'CONTROL' ? '<span class="badge ctl">JS</span>'
+                  : `<span class="badge">${escapeHtml(s.type || '?')}</span>`;
+      const find = s.findText ? `<span class="find">${escapeHtml(s.findText)}</span>` : '';
+      const statusBadge = invalid
+        ? '<span class="badge bad" title="Field path not in datamodel">!</span>'
+        : (unused
+            ? `<span class="badge unused" title="Click to search the template for this token (no usages found in HTML/XML files — searched findText${s.selectorText ? ' and selectorText' : ''})">?</span>`
+            : '');
+      const toggle = `<input type="checkbox" class="toggle" title="Enable / disable" ${s.enabled ? 'checked' : ''}>`;
+      el.innerHTML = `${drag}${pick}${toggle}${badge}<span class="name">${escapeHtml(s.name || '(unnamed)')}</span>${find}${statusBadge}`;
+
+      el.addEventListener('click', (ev: MouseEvent) => {
+        const t = ev.target as Element | null;
+        if (t && t.classList && (
+          t.classList.contains('toggle') ||
+          t.classList.contains('pick') ||
+          t.classList.contains('drag') ||
+          (t.classList.contains('badge') && t.classList.contains('unused'))
+        )) return;
+        listDeps.openScriptForm(s.id);
+      });
+
+      const toggleEl = el.querySelector('.toggle') as HTMLInputElement;
+      toggleEl.addEventListener('click', (ev: Event) => ev.stopPropagation());
+      toggleEl.addEventListener('change', () => listDeps.toggleScriptEnabled(s.id, toggleEl.checked));
+
+      const pickEl = el.querySelector('.pick') as HTMLInputElement;
+      pickEl.addEventListener('click', (ev: Event) => ev.stopPropagation());
+      pickEl.addEventListener('change', () => {
+        if (pickEl.checked) scriptsState.selected.add(s.id);
+        else scriptsState.selected.delete(s.id);
+        updateBulkBar(visibleScripts);
+      });
+
+      const unusedBadge = el.querySelector('.badge.unused') as HTMLElement | null;
+      if (unusedBadge) {
+        unusedBadge.addEventListener('click', (ev: Event) => {
+          ev.stopPropagation();
+          const needle = (s.findText || s.selectorText || '').trim();
+          if (!needle) { listDeps.setStatus('No findText / selectorText to search for.', 'warn'); return; }
+          jumpToSearch(needle);
+        });
+      }
+
+      el.addEventListener('dragstart', (ev: DragEvent) => {
+        scriptsDnd.from = s.id;
+        el.classList.add('dragging');
+        try { ev.dataTransfer?.setData('text/plain', s.id); if (ev.dataTransfer) ev.dataTransfer.effectAllowed = 'move'; } catch (_) {}
+      });
+      el.addEventListener('dragend', () => {
+        el.classList.remove('dragging');
+        document.querySelectorAll('.script-item.drop-before, .script-item.drop-after')
+          .forEach(x => x.classList.remove('drop-before', 'drop-after'));
+        scriptsDnd.from = null;
+      });
+      el.addEventListener('dragover', (ev: DragEvent) => {
+        if (!scriptsDnd.from || scriptsDnd.from === s.id) return;
+        ev.preventDefault();
+        if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'move';
+        const rect = el.getBoundingClientRect();
+        const before = (ev.clientY - rect.top) < (rect.height / 2);
+        el.classList.toggle('drop-before', before);
+        el.classList.toggle('drop-after', !before);
+      });
+      el.addEventListener('dragleave', () => {
+        el.classList.remove('drop-before', 'drop-after');
+      });
+      el.addEventListener('drop', (ev: DragEvent) => {
+        if (!scriptsDnd.from || scriptsDnd.from === s.id) return;
+        ev.preventDefault();
+        const rect = el.getBoundingClientRect();
+        const before = (ev.clientY - rect.top) < (rect.height / 2);
+        const fromId = scriptsDnd.from;
+        el.classList.remove('drop-before', 'drop-after');
+        listDeps.moveScript(fromId, s.id, before ? 'before' : 'after');
+      });
+
+      list.appendChild(el);
+    }
+  }
+  if (total === 0 && (filter || kindFilter !== 'ALL')) {
+    const empty = document.createElement('div');
+    empty.className = 'scripts-empty';
+    empty.textContent = 'No scripts match the current filter.';
+    list.appendChild(empty);
+  }
+  updateBulkBar(visibleScripts);
 }

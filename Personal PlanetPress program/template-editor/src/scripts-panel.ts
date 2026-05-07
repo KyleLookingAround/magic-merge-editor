@@ -12,7 +12,7 @@
 // state / DOM / setStatus, and most are wrapped by monkey-patches
 // that span sections.
 
-import { encodeXmlText, encodeXmlAttr, replaceTagInner, decodeXmlEntities } from './fs';
+import { encodeXmlText, encodeXmlAttr, replaceTagInner, decodeXmlEntities, makeMemoCache, MemoCache } from './fs';
 
 /** Filenames inside a template that may host the <script> blocks. */
 export const SCRIPT_HOST_CANDIDATES: readonly string[] = ['index.xml'];
@@ -351,6 +351,35 @@ export function parseDatamodelFields(xmlText: string): DatamodelField[] {
   walk(root, '');
   return out;
 }
+
+/** Shared mutable state for the scripts panel.
+ *
+ *  Exported so legacy.ts can access it without needing a separate shell.
+ *  None of the orchestrators that mutate this object have moved out of
+ *  legacy.ts yet; this export is the first step of that migration.
+ */
+export interface ScriptsState {
+  hostPath: string | null;
+  list: ParsedScript[];
+  active: string | null;
+  sourceEditor: unknown | null;
+  filter: string;
+  kindFilter: 'ALL' | ScriptKind;
+  selected: Set<string>;
+  datamodelFields?: DatamodelField[];
+  usagesCache: MemoCache;
+}
+
+export const scriptsState: ScriptsState = {
+  hostPath: null,
+  list: [],
+  active: null,
+  sourceEditor: null,
+  filter: '',
+  kindFilter: 'ALL',
+  selected: new Set(),
+  usagesCache: makeMemoCache(),
+};
 
 /** Map a PlanetPress datamodel type string onto the script form's
  *  <select> options. Returns null for unknown types. */

@@ -22,25 +22,28 @@
 //   search        -> ./search.ts (appendSearchFile + renderSnippet)
 //   review-modal  -> ./review-modal.ts (openModal/closeModal/renderDiff
 //                    + zipTextMap)
-//   preview       -> ./preview.ts (ZOOM_STEPS + collectUnresolvedTokens)
+//   preview       -> ./preview.ts (ZOOM_STEPS + collectUnresolvedTokens
+//                    + themeState — migrated Phase 5)
 //   scripts-panel -> ./scripts-panel.ts (parseScriptsFromXml +
 //                    serializeScriptBack + buildNewScriptXml +
 //                    parseDatamodelFields + dmTypeToFormType +
-//                    stripCdataKeepingOffsets + SCRIPT_HOST_CANDIDATES)
+//                    stripCdataKeepingOffsets + SCRIPT_HOST_CANDIDATES
+//                    + scriptsState — migrated Phase 5)
+//   scenarios     -> ./scenarios.ts (scenariosState — migrated Phase 5)
 //
 // What's still here (and why) - the pieces above were the pure-leaning
 // cuts. The DOM-coupled orchestrators stayed for these reasons:
 //   - openFile / commitCurrentEdit / loadFromHandle / pickAndOpenFile /
 //     rezipAndSave are wrapped by 12+ cross-section monkey-patches.
-//     They have to move together with their patch chains - phase 4
-//     work, ideally as a real hook system.
+//     They have to move together with their patch chains — phase 4
+//     hook system handles the wiring.
 //   - setSidebarMode / refreshScriptsList / openScriptForm /
 //     applyScriptForm / createScript / cloneScript / moveScript /
-//     bulk* lean on the legacy-resident scriptsState / scenariosState
-//     / themeState shells. Move those state shells into ./scripts-panel.ts
-//     before pulling the orchestrators out.
+//     bulk* orchestrators still reach into the DOM and the now-exported
+//     scriptsState/scenariosState/themeState shells. Moving them out
+//     is the next phase of carve work.
 //   - parseDocxTheme / buildThemeCss / renderThemePanel / refreshPreview
-//     / buildPreviewHtml depend on themeState + the blob-URL cache.
+//     / buildPreviewHtml depend on the blob-URL cache (previewState).
 //   - File add/rename/delete dialogs (promptNewFile / renameFile /
 //     deleteFile / openNewFileModal / openContextMenu) and
 //     revealInTree call into commitCurrentEdit + setStatus + openFile.
@@ -71,7 +74,8 @@ import { buildTree, refreshTreeDirtyMarkers, escapeHtml, configureTree } from '.
 import { validateXml, formatXml } from './editor';
 import { appendSearchFile, renderSnippet, configureSearch } from './search';
 import { openModal, closeModal, renderDiff, zipTextMap, getModalEls } from './review-modal';
-import { ZOOM_STEPS, collectUnresolvedTokens } from './preview';
+import { ZOOM_STEPS, collectUnresolvedTokens, themeState } from './preview';
+import { scenariosState } from './scenarios';
 import {
   SCRIPT_HOST_CANDIDATES,
   stripCdataKeepingOffsets,
@@ -80,6 +84,7 @@ import {
   buildNewScriptXml,
   parseDatamodelFields,
   dmTypeToFormType,
+  scriptsState,
 } from './scripts-panel';
 
 (function () {
@@ -1018,11 +1023,7 @@ function revokePreviewBlobs() {
 // The "Copy as CSS" button serialises the same data as a CSS block with
 // custom properties + named-style classes the user can drop into any
 // stylesheet that needs to match the Word source.
-const themeState = {
-  palette: [],   // [{ key, name, hex }]
-  fonts: { major: { latin: '', ea: '', cs: '' }, minor: { latin: '', ea: '', cs: '' } },
-  styles: [],    // [{ id, name, type, font, sizePt, color, bold, italic }]
-};
+// themeState migrated to ./preview.ts (Phase 5). Imported above.
 
 function getZipText(path) {
   // Tolerate the backslash-vs-forward-slash thing PlanetPress zips do; docx
@@ -1847,18 +1848,7 @@ hookOn('afterCommitCurrentEdit', () => {
 // expose a friendly form view for editing them (LenderRegisteredName,
 // BrokerFeeOnApplicationRefundable, Control, etc.)
 // ============================================================
-const scriptsState = {
-  hostPath: null,        // which file holds the scripts (usually 'index.xml')
-  list: [],              // [{ id, name, type, findText, enabled, scope, selectorType, selectorText, source, fieldPath, fieldType, prefix, suffix, formatType, insertMethod, rawXml, _matchIndex }]
-  active: null,          // currently-edited script id
-  sourceEditor: null,    // monaco model+editor for the form's source field
-  filter: '',
-  kindFilter: 'ALL',     // 'ALL' | 'TEXT' | 'CONDITIONAL' | 'CONTROL'
-  selected: new Set(),   // bulk-selection: Set of script ids that are checked
-  // usagesCache is wired to the shared makeMemoCache helper (see top of file).
-  // Invalidated on every refreshScriptsList; one entry per script id.
-  usagesCache: makeMemoCache(),
-};
+// scriptsState migrated to ./scripts-panel.ts (Phase 5). Imported above.
 
 // SCRIPT_HOST_CANDIDATES carved out to ./scripts-panel.ts.
 
@@ -4157,13 +4147,7 @@ hookOn('afterLoadFromHandle', () => {
 // When a scenario is active, its leaf-element path -> text-content map overrides
 // the datamodel's lastValue substitution in the preview, so the same template
 // renders against many different test inputs without leaving the editor.
-const scenariosState = {
-  source: null,            // human-readable source label (e.g. 'more2life.OL-datamapper')
-  sourceHandle: null,      // FileSystemFileHandle of the loaded datamapper (for re-write of scenario XML)
-  list: [],                // [{ name, path, xmlText, valueByPath: Map }]
-  active: null,            // selected scenario name, or null
-  activeOverrides: null,   // Map<path, value> pushed into applyDatamodelPersonalization
-};
+// scenariosState migrated to ./scenarios.ts (Phase 5). Imported above.
 
 // localStorage key for "remember the last picked scenario per template"
 function scnPersistKey() {

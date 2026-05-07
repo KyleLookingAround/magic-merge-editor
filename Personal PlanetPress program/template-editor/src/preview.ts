@@ -3,12 +3,32 @@
 //
 // Scope is intentionally narrow for now: just the pure helpers that
 // don't depend on legacy-resident state shells (scriptsState,
-// scenariosState, themeState, blob caches). The orchestrators
+// scenariosState, blob caches). The orchestrators
 // (togglePreview, openPreview, closePreview, refreshPreview,
 // buildPreviewHtml, parseDocxTheme, renderThemePanel, buildThemeCss,
 // applyDatamodelPersonalization, the zoom controls and token-jump
-// handlers) all stay in legacy.ts and will move once the scripts
-// panel is itself a module.
+// handlers) all stay in legacy.ts.
+//
+// themeState migrated here in Phase 5; it lives alongside the helpers
+// that parse and render it (parseDocxTheme / buildThemeCss / renderThemePanel).
+
+export interface ThemePaletteEntry { key: string; name: string; hex: string; }
+export interface ThemeFontSlot { latin: string; ea: string; cs: string; }
+export interface ThemeNamedStyle {
+  id: string; name: string; type: string; font: string;
+  sizePt: number; color: string; bold: boolean; italic: boolean;
+}
+export interface ThemeState {
+  palette: ThemePaletteEntry[];
+  fonts: { major: ThemeFontSlot; minor: ThemeFontSlot };
+  styles: ThemeNamedStyle[];
+}
+
+export const themeState: ThemeState = {
+  palette: [],
+  fonts: { major: { latin: '', ea: '', cs: '' }, minor: { latin: '', ea: '', cs: '' } },
+  styles: [],
+};
 
 /** Discrete zoom steps used by the preview's +/- controls. */
 export const ZOOM_STEPS: readonly number[] = [

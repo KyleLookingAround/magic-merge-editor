@@ -75,9 +75,11 @@ export function renderSnippet(line: string, pattern: RegExp): string {
     trimmed = line.slice(start, start + 200);
   }
   pattern.lastIndex = 0;
+  // `trimmed` is HTML-escaped first, so `mm` substrings are already safe to
+  // embed directly — double-escaping here would corrupt display of entities.
   const escaped = escapeHtml(trimmed).replace(
     new RegExp(pattern.source, pattern.flags),
-    (mm: string) => `<mark>${escapeHtml(mm)}</mark>`,
+    (mm: string) => `<mark>${mm}</mark>`,
   );
   return prefix + escaped;
 }

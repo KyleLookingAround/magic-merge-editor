@@ -1,12 +1,11 @@
 // File-system / bytes / XML primitives. Carved out of legacy.ts as the
 // fourth Phase 3 module.
 //
-// Scope: pure helpers only. The handle-driven flows (pickAndOpenFile,
-// pickAndOpenFolder, scanFolderTemplates, loadFromHandle, rezipAndSave)
-// stay in legacy.ts because they're wrapped by multiple monkey-patches
-// scattered across the file - those move out wholesale once their
-// dependents (recents.openRecentItem, scenarios, notes, scripts panel)
-// are themselves in modules.
+// Phase 12: added locked-folder constants + predicates (isLockedFolderMarker,
+// findLockedFolderEntries) so tree.ts can import them directly rather than
+// receiving them via the configureTree DI seam.
+
+import { state } from './state';
 
 export const TEXT_EXTS = new Set<string>([
   'xml','html','htm','js','mjs','css','json','txt','md','svg','xsl','xslt',
@@ -155,4 +154,39 @@ export function decodeBytes(bytes: Uint8Array): string {
   } catch (_) {
     return new TextDecoder('latin1').decode(bytes);
   }
+}
+
+// ============================================================
+// LOCKED-FOLDER PREDICATES (Phase 12 — carved from legacy.ts)
+// ============================================================
+// OL Connect Designer marks five folders inside every template as
+// read-only: snippets, translations, js, fonts, color-profiles.
+// On disk these show up as zero-byte zip entries at the folder path.
+// Removing those entries from the package "unlocks" the folders.
+
+export const LOCKED_FOLDER_RELATIVE_PATHS: string[] = [
+  'public/document/snippets',
+  'public/document/translations',
+  'public/document/js',
+  'public/document/fonts',
+  'public/document/color-profiles',
+];
+
+export const LOCKED_FOLDER_PATH_SET: Set<string> = new Set(LOCKED_FOLDER_RELATIVE_PATHS);
+
+export function isLockedFolderMarker(rawPath: string, fileEntry: any): boolean {
+  if (!fileEntry) return false;
+  const norm = rawPath.replace(/\\/g, '/');
+  if (!LOCKED_FOLDER_PATH_SET.has(norm)) return false;
+  // Marker entries are always zero bytes.
+  if (fileEntry.isText) return typeof fileEntry.content === 'string' && fileEntry.content.length === 0;
+  return !fileEntry.content || fileEntry.content.length === 0;
+}
+
+export function findLockedFolderEntries(): string[] {
+  const out: string[] = [];
+  for (const [path, f] of Object.entries(state.files)) {
+    if (isLockedFolderMarker(path, f)) out.push(path);
+  }
+  return out;
 }

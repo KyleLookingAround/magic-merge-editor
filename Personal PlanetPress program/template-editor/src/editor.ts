@@ -1,11 +1,15 @@
 // Pure editor utilities. Carved out of legacy.ts as the sixth Phase 3
 // module.
 //
-// Scope: just the side-effect-free helpers (validateXml, formatXml).
-// The orchestrators (openFile, commitCurrentEdit, formatCurrent) stay
-// in legacy.ts because they reach into Monaco / state / DOM and are
-// wrapped by multiple cross-section monkey-patches that need to be
-// converted to a hook system before they can move.
+// Phase 12: formatCurrent carved in here from legacy.ts. It reaches
+// into Monaco state and calls setStatus, but has no other legacy deps.
+
+import { state } from './state';
+import { extOf } from './fs';
+import { setStatus } from './status';
+
+/* global monaco */
+declare const monaco: any;
 
 export interface XmlValidation { ok: boolean; error?: string; }
 
@@ -62,4 +66,29 @@ export function formatXml(xml: string): string {
   let result = out.join('\n');
   result = result.replace(/STASH(\d+)HSATS/g, (_, i) => stash[+i]);
   return result;
+}
+
+/** Pretty-print the currently-open file in Monaco (XML or JSON only). */
+export function formatCurrent(): void {
+  if (!state.currentPath) return;
+  const f = state.files[state.currentPath];
+  if (!f || !f.isText) return;
+  const model = state.monacoModels[state.currentPath];
+  if (!model) return;
+  const text = model.getValue();
+  const ext = extOf(state.currentPath);
+  let out: string | null = null, label = '';
+  try {
+    if (ext === 'json') { out = JSON.stringify(JSON.parse(text), null, 2); label = 'JSON'; }
+    else if (['xml','xsl','xslt','svg','config','html','htm','ol-datamodel','ol-jobpreset','ol-outputpreset','ol-script','ol-config'].includes(ext)) {
+      out = formatXml(text); label = 'XML';
+    } else { setStatus('No formatter for this file type.', 'warn'); return; }
+  } catch (e: any) {
+    setStatus('Format failed: ' + e.message, 'err');
+    return;
+  }
+  if (out === text) { setStatus('Already formatted.', 'ok'); return; }
+  const range = model.getFullModelRange();
+  state.editor.executeEdits('format', [{ range, text: out }]);
+  setStatus(`Formatted as ${label}.`, 'ok');
 }

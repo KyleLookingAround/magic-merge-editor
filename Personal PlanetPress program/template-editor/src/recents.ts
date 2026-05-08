@@ -1,10 +1,14 @@
 // IndexedDB-backed recent files list. Carved out of legacy.ts as
 // the second Phase 3 module.
 //
-// Scope: only the pure persistence + formatting helpers. The
-// DOM/menu wiring and `openRecentItem` (which calls into
-// loadFromHandle / scanFolderTemplates / setStatus) still live in
-// legacy.ts and will move out once those modules are also carved.
+// Phase 12: openRecentItem + the recents-menu DOM wiring carved in,
+// now that loadFromHandle / scanFolderTemplates / setStatus are all
+// available as module imports.
+
+import { state } from './state';
+import { setStatus } from './status';
+import { escapeHtml } from './tree';
+import { loadFromHandle, scanFolderTemplates } from './file-ops';
 
 const RECENTS_DB = 'planetpress-template-editor';
 const RECENTS_STORE = 'recents';
@@ -97,3 +101,90 @@ export function formatRecentTime(ts: number): string {
   if (d < 7) return d + 'd ago';
   return new Date(ts).toLocaleDateString();
 }
+
+// ============================================================
+// OPEN RECENT ITEM (Phase 12 — carved from legacy.ts)
+// ============================================================
+
+export async function openRecentItem(item: RecentItem): Promise<void> {
+  try {
+    if (item.handle.queryPermission) {
+      let perm = await item.handle.queryPermission({ mode: 'readwrite' });
+      if (perm !== 'granted') {
+        perm = await item.handle.requestPermission({ mode: 'readwrite' });
+        if (perm !== 'granted') { setStatus('Permission denied.', 'err'); return; }
+      }
+    }
+    if (item.kind === 'folder') {
+      state.dirHandle = item.handle;
+      state.dirName = item.handle.name;
+      await scanFolderTemplates(item.handle, false);
+      document.getElementById('folder-panel')!.style.display = '';
+      document.getElementById('tree-panel')!.style.display = 'none';
+      document.getElementById('folder-name')!.textContent = item.handle.name;
+      (document.getElementById('btn-back') as HTMLButtonElement).style.display = 'none';
+      document.getElementById('empty')!.classList.remove('hidden');
+      (document.getElementById('editor-tab') as HTMLElement).style.display = 'none';
+      document.getElementById('editor')!.style.display = 'none';
+      document.getElementById('binary-view')!.classList.remove('show');
+      (document.getElementById('btn-rezip') as HTMLButtonElement).disabled = true;
+      (document.getElementById('btn-save') as HTMLButtonElement).disabled = true;
+      document.getElementById('filename')!.textContent = `Folder: ${item.handle.name}`;
+    } else {
+      state.dirHandle = null; state.folderTemplates = []; state.dirName = null;
+      (document.getElementById('btn-back') as HTMLButtonElement).style.display = 'none';
+      document.getElementById('folder-panel')!.style.display = 'none';
+      await loadFromHandle(item.handle);
+    }
+    await recentsAdd(item.handle, item.kind);
+  } catch (e: any) {
+    setStatus('Could not re-open ' + item.name + ': ' + e.message, 'err');
+    if (e.name === 'NotFoundError') await recentsRemove(item.name);
+  }
+}
+
+// ============================================================
+// RECENTS MENU DOM WIRING (Phase 12 — carved from legacy.ts)
+// ============================================================
+
+document.getElementById('btn-recents')!.addEventListener('click', async e => {
+  e.stopPropagation();
+  const menu = document.getElementById('recents-menu')!;
+  if (menu.classList.contains('show')) { menu.classList.remove('show'); return; }
+  const items = await recentsList();
+  menu.innerHTML = '';
+  if (!items.length) {
+    menu.innerHTML = "<div class=\"empty\">No recent files yet — open a template and it'll show up here.</div>";
+  } else {
+    for (const it of items) {
+      const row = document.createElement('div');
+      row.className = 'item';
+      row.innerHTML = `<span class="name">${it.kind === 'folder' ? '📁 ' : ''}${escapeHtml(it.name)}</span><span class="when">${formatRecentTime(it.openedAt || 0)}</span>`;
+      row.addEventListener('click', async () => {
+        menu.classList.remove('show');
+        await openRecentItem(it);
+      });
+      menu.appendChild(row);
+    }
+    const clear = document.createElement('div');
+    clear.className = 'clear';
+    clear.textContent = 'Clear recent files';
+    clear.addEventListener('click', async () => {
+      menu.classList.remove('show');
+      await recentsClear();
+      setStatus('Recent files cleared.', 'ok');
+    });
+    menu.appendChild(clear);
+  }
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  menu.style.left = rect.left + 'px';
+  menu.style.top = (rect.bottom + 4) + 'px';
+  menu.classList.add('show');
+});
+
+document.addEventListener('click', e => {
+  const m = document.getElementById('recents-menu');
+  if (m && m.classList.contains('show') && !m.contains(e.target as Node) && (e.target as HTMLElement).id !== 'btn-recents') {
+    m.classList.remove('show');
+  }
+});

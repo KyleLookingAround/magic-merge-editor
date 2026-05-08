@@ -194,12 +194,48 @@ New file `src/preset-overlay.ts` (~256 lines, typed). Lifted out:
 
 `legacy.ts`: 2,475 → 2,250 lines (−225). Build: 189.76 kB / 50.99 kB gzip (essentially flat vs Phase 10). `tsc --noEmit` clean.
 
+## Phase 12 (completed 2026-05-08) — the rest of legacy.ts
+
+Five new/extended modules reduced `legacy.ts` from 2,250 → 473 lines (−1,777 lines). Build green at 186.35 kB / 49.84 kB gzip. `tsc --noEmit` clean.
+
+**New files:**
+- `src/status.ts` — `setStatus`. All modules that previously received it via configure-DI can import directly; the DI seams in the existing modules are left as-is for now and still work (they receive the same function).
+- `src/file-ops.ts` — `openFile`, `commitCurrentEdit`, `rezipAndSave` (the final override version, with added-files support), `pickAndOpenFile`, `pickAndOpenFolder`, `scanFolderTemplates`, `renderTemplatesList`, `backToFolderList`, `loadFromHandle`, `hasUnsaved`. DOM event listeners for `btn-open`, `btn-open-folder`, `btn-save`, `btn-back`, `btn-rescan`, and `beforeunload` are all registered at module load time. `wireTestFileInput` is also here.
+- `src/file-dialogs.ts` — `updateFileButtons`, `unlockTemplateFolders`, `promptNewFile`, `openNewFileModal`, `bindAutotypeByMap`, `renameFile`, `deleteFile`, `copyToClipboard`, `revealInTree`. Also contains the full `contextmenu` event handler (file tree / navigator / search result rows). DOM event wiring for `btn-file-new/rename/delete/unlock` and the `afterOpenFile` hook registration are at module load time.
+
+**Extended files:**
+- `src/fs.ts` — `LOCKED_FOLDER_RELATIVE_PATHS`, `LOCKED_FOLDER_PATH_SET`, `isLockedFolderMarker`, `findLockedFolderEntries`. Added `import { state } from './state'` for `findLockedFolderEntries`.
+- `src/tree.ts` — dropped `isLockedFolderMarker` from `TreeDeps` / `configureTree`; imports it directly from `fs.ts`. `configureTree` now only needs `{ openFile }`.
+- `src/editor.ts` — `formatCurrent` (was legacy-resident; depends on Monaco state + `setStatus`).
+- `src/scenarios.ts` — `openScenarioForm`, `openScenarioFormForActive`, `closeScenarioForm`, `scenarioMapToXml`, `openCoverageMatrix`, `collectSectionHtmlPaths`, `summarizeScenarioForSection`, `openScenarioDiff`. `ScenarioDeps` extended with `openFile`. `configureScenarios` now also wires the scenario picker UI (previously the `wireScenarios` IIFE in legacy.ts). Note: this module now imports from `preview.ts` (bidirectional cycle with `preview.ts → scenarios.ts`); safe because all cross-module accesses are inside function bodies, not at module init time.
+- `src/recents.ts` — `openRecentItem` + the recents-menu button / dismiss DOM wiring.
+
+**What's still in `legacy.ts` (473 lines):**
+- `bootstrapMonaco` call
+- All `configure*` calls (wiring cross-module DI seams)
+- Sidebar mode button listeners (`mode-files`, `mode-search`, `mode-theme`)
+- Keyboard shortcuts (`Ctrl+Shift+F` → search, `Ctrl+Alt+L` → format)
+- Search debounce input wiring
+- Preview button event listeners (btn-preview, zoom, tabs, CSS copy, tokens-dismiss)
+- Preview-pane `wheel` zoom listener
+- Theme CSS copy button
+- Hook registrations: `afterCommitCurrentEdit`, `afterReparseScripts`, `beforeOpenFile`, `afterLoadFromHandle` (scripts + notes + recents + compare-button + auto-open section 1)
+- Monaco "Go to script" action IIFE
+- Sidebar resizer IIFE
+- Preview-pane resizer IIFE
+
 ## Suggested next move
 
-Phase 11 is complete. Build green at 189.76 kB, `tsc --noEmit` clean. Next priorities:
+Phase 12 is complete. Build green at 186.35 kB, `tsc --noEmit` clean. Next priorities:
 
-- **Manual smoke test.** Open `dist/index.html` in Chrome/Edge, load `M2L-KFI.OL-template`, edit a script (round-trip), create/clone/delete a script, try the right-click context menu, flip to Notes and Ctrl+S, verify the "Recent" scripts strip still appears. Open a `.OL-jobpreset` or `.OL-outputpreset` (if present in the test fixtures) and check the "Open as form" banner appears, opens the form, and Apply/Revert/Close/Open-raw all behave as before.
-- **GitHub Pages deploy.** Merge to `main` and verify the Pages deploy completes. Add the live URL to the README.
-- **Phase 12 (optional).** What's still in `legacy.ts` (~2,250 lines): `openFile`, `commitCurrentEdit`, `rezipAndSave`, `loadFromHandle`/`pickAndOpenFolder`, locked-folder unlock, file add/rename/delete dialogs (`promptNewFile` / `openNewFileModal` / `renameFile` / `deleteFile`), scenario matrix/diff, scenario form, monaco "Go to script" wiring, DOM event wiring. Cleanest next targets: (a) **file-IO core** — `openFile` + `commitCurrentEdit` + `rezipAndSave` → new `src/file-ops.ts`; moderately tangled because of `afterLoadFromHandle` / `afterCommitCurrentEdit` hook registrations, but those stay in `legacy.ts`. (b) **locked-folder unlock** — `isLockedFolderMarker` + `findLockedFolderEntries` + `unlockTemplateFolders` → fold into `fs.ts` or new `src/locked-folder.ts`; small and self-contained. (c) **scenario form** — `openScenarioForm`, `closeScenarioForm`, `scenarioMapToXml`, `openScenarioFormForActive` → fold into `scenarios.ts`; medium-sized.
+- **Manual smoke test.** Open `dist/index.html` in Chrome/Edge, load `M2L-KFI.OL-template`, exercise the full round-trip: edit a script, Review & Save, reopen. Also: create/clone/delete a script, right-click context menu on file tree, Notes (Ctrl+S), Recent Scripts strip, scenario picker (if datamapper available), coverage matrix, scenario diff, locked-folder unlock, + New file, rename, delete, open folder mode.
+- **GitHub Pages deploy.** Merge to `main` and verify the Pages deploy completes.
+- **Phase 13 (optional cleanup).** What remains:
+  - Drop `setStatus` from all `configure*` DI seams (each module now has `import { setStatus } from './status'` available) — low risk, purely cosmetic.
+  - Drop `openFile` from `configureSearch`, `configureNavigator`, `configureScriptForm`, `configureTree` DI seams — all can import from `file-ops.ts` directly.
+  - Move the preview/search button event wiring from legacy.ts into their respective modules.
+  - Convert the sidebar resizer and preview-pane resizer IIFEs to a new `src/layout.ts`.
+  - Move the Monaco "Go to script" IIFE to `src/monaco-goto.ts`.
+  - At that point legacy.ts would be only the bootstrap call + configure calls + a few cross-module hooks, which could merge into `main.ts`.
 
 Smoke target after any edit: `npm run build` → open `dist/index.html` in Chrome/Edge → load `M2L-KFI.OL-template` → edit a script → *Review & Save* → reopen → verify round-trip.

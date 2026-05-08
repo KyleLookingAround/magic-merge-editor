@@ -85,7 +85,11 @@ import {
   togglePreview, openPreview, closePreview, refreshPreview,
   buildPreviewHtml, applyDatamodelPersonalization,
 } from './preview';
-import { setSidebarMode, configureSidebar } from './sidebar';
+import { setSidebarMode } from './sidebar';
+import { loadNotesForCurrentTemplate, configureNotes } from './notes';
+import { configureRecentScripts } from './recent-scripts';
+import { openContextMenu, closeCtxMenu } from './context-menu';
+import { configurePresetOverlay } from './preset-overlay';
 import {
   scenariosState, scnPersistKey, parseScenarioXmlToMap,
   readScenariosFromZip, autoLoadScenariosFromFolder,
@@ -734,12 +738,12 @@ configureScriptsList({
 });
 
 // Wire deps for the script form and CRUD operations (Phase 7 carve).
+// Phase 10: showCtxMenu / closeCtxMenu DI seam removed — script-form.ts now
+// imports context-menu helpers directly from ./context-menu.
 configureScriptForm({
   openFile: (path) => openFile(path),
   setStatus: (msg, kind) => setStatus(msg, kind),
   setSidebarMode: (mode) => setSidebarMode(mode),
-  showCtxMenu: (el) => { _ctxMenuEl = el; document.body.appendChild(el); },
-  closeCtxMenu: () => closeCtxMenu(),
 });
 
 // Wire deps for the navigator panel (Phase 6 carve).
@@ -761,9 +765,21 @@ configurePreviewHelpers({
   setStatus: (msg, kind) => setStatus(msg, kind),
 });
 
-// Wire sidebar configure (Phase 8 carve).
-configureSidebar({
-  onNotes: () => loadNotesForCurrentTemplate(),
+// Wire notes configure (Phase 9 carve). sidebar.ts imports loadNotesForCurrentTemplate directly.
+configureNotes({
+  setStatus: (msg, kind) => setStatus(msg, kind),
+});
+
+// Wire recent-scripts (Phase 10 carve). Registers the afterOpenScriptForm /
+// afterLoadFromHandle / afterReparseScripts hook handlers and seeds the
+// initial list from localStorage.
+configureRecentScripts();
+
+// Wire preset overlay (Phase 11 carve). Registers the afterOpenFile hook
+// that toggles the "Open as form" banner and wires the banner button.
+configurePresetOverlay({
+  openFile: (path) => openFile(path),
+  setStatus: (msg, kind) => setStatus(msg, kind),
 });
 
 // Wire review-modal configure (Phase 8 carve).
@@ -870,36 +886,9 @@ hookOn('afterReparseScripts', () => {
   renderScriptsList();
 });
 
-// Append the "Recent" group on top of the just-rendered scripts list.
-// Runs as a second afterReparseScripts handler so it fires after renderScriptsList.
-hookOn('afterReparseScripts', () => {
-  if (!recentScriptsState.list.length) return;
-  const list = document.getElementById('scripts-list');
-  if (!list) return;
-  const existing = list.querySelector('.scripts-group[data-recent="1"]');
-  if (existing) existing.remove();
-  list.querySelectorAll('.script-item[data-recent="1"]').forEach(el => el.remove());
-  const head = document.createElement('div');
-  head.className = 'scripts-group';
-  head.dataset.recent = '1';
-  head.textContent = `Recent  (${recentScriptsState.list.length})`;
-  list.insertBefore(head, list.firstChild);
-  let prev = head;
-  for (const r of recentScriptsState.list) {
-    const found = scriptsState.list.find(x => x.name === r.name);
-    const el = document.createElement('div');
-    el.className = 'script-item' + (found ? '' : ' disabled');
-    el.dataset.recent = '1';
-    const ago = Math.max(0, Date.now() - r.ts);
-    const mins = Math.floor(ago / 60000);
-    const when = mins < 1 ? 'just now' : (mins < 60 ? mins + 'm ago' : Math.floor(mins / 60) + 'h ago');
-    el.innerHTML = `<span class="badge">${escapeHtml(when)}</span><span class="name">${escapeHtml(r.name)}</span>${r.findText ? `<span class="find">${escapeHtml(r.findText)}</span>` : ''}`;
-    el.title = found ? 'Open this script' : 'Script no longer present in this template';
-    if (found) el.addEventListener('click', () => openScriptForm(found.id));
-    prev.parentNode.insertBefore(el, prev.nextSibling);
-    prev = el;
-  }
-});
+// Recent-scripts strip carved out to ./recent-scripts.ts (Phase 10). Its
+// `afterReparseScripts` handler injects the "Recent" group on top of the
+// rendered scripts list; `configureRecentScripts()` is called below.
 
 // Preview pane resizer
 (function () {
@@ -1452,43 +1441,9 @@ function deleteFile(path) {
   setStatus(`Removed ${path}. Click Review & Save to apply.`, 'ok');
 }
 
-// Right-click on a tree file item -> mini context menu
-let _ctxMenuEl = null;
-function closeCtxMenu() { if (_ctxMenuEl) { _ctxMenuEl.remove(); _ctxMenuEl = null; } }
-document.addEventListener('click', closeCtxMenu);
-
-// Generic context-menu builder. Items are [{ label, onClick, danger?, sep? }];
-// pass { sep: true } as a divider. Mounts at (x, y), auto-dismisses on
-// the next document click (handled by the global `click → closeCtxMenu`
-// listener above). Centralised so the Scripts / Sections / Search /
-// File-tree menus all share the same look + dismiss semantics.
-function openContextMenu(items, x, y) {
-  closeCtxMenu();
-  const menu = document.createElement('div');
-  menu.className = 'ctxmenu';
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
-  for (const it of items) {
-    if (it.sep) {
-      const sep = document.createElement('div');
-      sep.className = 'sep';
-      menu.appendChild(sep);
-      continue;
-    }
-    const el = document.createElement('div');
-    el.className = 'item' + (it.danger ? ' danger' : '');
-    el.textContent = it.label;
-    if (it.title) el.title = it.title;
-    el.addEventListener('click', () => {
-      closeCtxMenu();
-      try { it.onClick && it.onClick(); } catch (e) { console.error(e); }
-    });
-    menu.appendChild(el);
-  }
-  document.body.appendChild(menu);
-  _ctxMenuEl = menu;
-  return menu;
-}
+// Right-click context menu carved out to ./context-menu.ts (Phase 10).
+// The global `click → closeCtxMenu` listener is registered at module load
+// time inside context-menu.ts.
 
 // Best-effort copy-to-clipboard. Falls back to a transient textarea select
 // for non-secure-context environments where navigator.clipboard isn't
@@ -2177,160 +2132,17 @@ function scenarioMapToXml(map) {
   return '<?xml version="1.0" encoding="UTF-8"?>\n<Application>\n' + serialize(root, '  ') + '\n</Application>\n';
 }
 
-// ---------- NOTES SIDECAR ----------
-const notesState = {
-  text: '',
-  dirty: false,
-  forTemplate: null, // template fileName the loaded notes belong to
-};
+// Notes sidecar carved out to ./notes.ts (Phase 9). State, load/save, Ctrl+S
+// handler, and mode-notes click wiring all live there. This file only triggers
+// loadNotesForCurrentTemplate via the afterLoadFromHandle hook below.
+// patchSidebarMode IIFE removed in Phase 8 — sidebar.ts now handles all modes
+// including 'notes' natively (importing loadNotesForCurrentTemplate directly
+// since Phase 9).
 
-function notesSidecarName() {
-  if (!state.fileName) return null;
-  return state.fileName.replace(/\.[^.]+$/, '') + '.notes.md';
-}
-
-async function loadNotesForCurrentTemplate() {
-  const ta = document.getElementById('notes-textarea');
-  const name = document.getElementById('notes-filename');
-  const empty = document.getElementById('notes-empty');
-  const saveBtn = document.getElementById('btn-notes-save');
-  if (!ta || !state.fileName) {
-    if (ta) ta.value = '';
-    if (name) name.textContent = '(no template open)';
-    if (saveBtn) saveBtn.disabled = true;
-    if (empty) empty.style.display = '';
-    notesState.text = '';
-    notesState.dirty = false;
-    notesState.forTemplate = null;
-    return;
-  }
-  const sidecar = notesSidecarName();
-  notesState.forTemplate = state.fileName;
-  name.textContent = sidecar;
-  empty.style.display = 'none';
-  saveBtn.disabled = false;
-  // Try to read sidecar from the open dirHandle
-  let text = '';
-  if (state.dirHandle) {
-    try {
-      const fh = await state.dirHandle.getFileHandle(sidecar);
-      const f = await fh.getFile();
-      text = await f.text();
-    } catch (_) { text = ''; }
-  }
-  ta.value = text;
-  notesState.text = text;
-  notesState.dirty = false;
-}
-
-async function saveNotes() {
-  if (!state.dirHandle) { setStatus('Open a folder to save notes.', 'warn'); return; }
-  const sidecar = notesSidecarName();
-  if (!sidecar) return;
-  const ta = document.getElementById('notes-textarea');
-  const text = ta.value;
-  try {
-    const fh = await state.dirHandle.getFileHandle(sidecar, { create: true });
-    const w = await fh.createWritable();
-    await w.write(new Blob([text], { type: 'text/markdown' }));
-    await w.close();
-    notesState.text = text;
-    notesState.dirty = false;
-    setStatus(`Saved ${sidecar}.`, 'ok');
-  } catch (e) { setStatus('Save notes failed: ' + e.message, 'err'); }
-}
-
-(function wireNotes() {
-  const ta = document.getElementById('notes-textarea');
-  const saveBtn = document.getElementById('btn-notes-save');
-  if (ta) ta.addEventListener('input', () => {
-    notesState.dirty = ta.value !== notesState.text;
-  });
-  if (saveBtn) saveBtn.addEventListener('click', saveNotes);
-  // Ctrl+S inside the notes textarea saves the notes (instead of committing template edit)
-  if (ta) ta.addEventListener('keydown', e => {
-    if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
-      e.preventDefault();
-      saveNotes();
-    }
-  });
-  const modeNotesBtn = document.getElementById('mode-notes');
-  if (modeNotesBtn) modeNotesBtn.addEventListener('click', () => setSidebarMode('notes'));
-})();
-
-// patchSidebarMode IIFE removed — sidebar.ts now handles all modes including 'notes' natively.
-
-// ---------- RECENTLY-EDITED SCRIPTS ----------
-const recentScriptsState = {
-  list: [],   // [{ name, findText, ts }]
-  max: 8,
-};
-function recentScriptsKey() { return 'cw_recent_scripts:' + (state.fileName || ''); }
-function loadRecentScripts() {
-  try {
-    const raw = localStorage.getItem(recentScriptsKey());
-    recentScriptsState.list = raw ? JSON.parse(raw) : [];
-  } catch (_) { recentScriptsState.list = []; }
-}
-function saveRecentScripts() {
-  try { localStorage.setItem(recentScriptsKey(), JSON.stringify(recentScriptsState.list)); } catch (_) {}
-}
-function pushRecentScript(s) {
-  if (!s || !s.name) return;
-  const entry = { name: s.name, findText: s.findText || '', ts: Date.now() };
-  recentScriptsState.list = [entry, ...recentScriptsState.list.filter(x => x.name !== s.name)].slice(0, recentScriptsState.max);
-  saveRecentScripts();
-}
-
-// Track recently-opened scripts; reload list on template change
-hookOn('afterOpenScriptForm', (id) => {
-  const s = scriptsState.list.find(x => x.id === id);
-  if (s) {
-    pushRecentScript(s);
-    try { renderScriptsList(); } catch (_) {}
-  }
-});
-hookOn('afterLoadFromHandle', () => {
-  loadRecentScripts();
-  if (typeof renderScriptsList === 'function') {
-    try { renderScriptsList(); } catch (_) {}
-  }
-});
-loadRecentScripts();
-
-// Inject a "Recent" group at the top of the rendered scripts list after
-// renderScriptsList runs. Registered as a second afterReparseScripts handler
-// so it fires after the first one (which calls renderScriptsList).
-hookOn('afterReparseScripts', () => {
-  if (!recentScriptsState.list.length) return;
-  const list = document.getElementById('scripts-list');
-  if (!list) return;
-  // Avoid duplicates if the function is re-run quickly
-  const existing = list.querySelector('.scripts-group[data-recent="1"]');
-  if (existing) existing.remove();
-  list.querySelectorAll('.script-item[data-recent="1"]').forEach(el => el.remove());
-  const head = document.createElement('div');
-  head.className = 'scripts-group';
-  head.dataset.recent = '1';
-  head.textContent = `Recent  (${recentScriptsState.list.length})`;
-  list.insertBefore(head, list.firstChild);
-  // Insert items in reverse so the most recent ends up just under the header
-  let prev = head;
-  for (const r of recentScriptsState.list) {
-    const found = scriptsState.list.find(x => x.name === r.name);
-    const el = document.createElement('div');
-    el.className = 'script-item' + (found ? '' : ' disabled');
-    el.dataset.recent = '1';
-    const ago = Math.max(0, Date.now() - r.ts);
-    const mins = Math.floor(ago / 60000);
-    const when = mins < 1 ? 'just now' : (mins < 60 ? mins + 'm ago' : Math.floor(mins / 60) + 'h ago');
-    el.innerHTML = `<span class="badge">${escapeHtml(when)}</span><span class="name">${escapeHtml(r.name)}</span>${r.findText ? `<span class="find">${escapeHtml(r.findText)}</span>` : ''}`;
-    el.title = found ? 'Open this script' : 'Script no longer present in this template';
-    if (found) el.addEventListener('click', () => openScriptForm(found.id));
-    prev.parentNode!.insertBefore(el, prev.nextSibling);
-    prev = el;
-  }
-});
+// Recent-scripts strip carved out to ./recent-scripts.ts (Phase 10).
+// State, persistence, push/load helpers, and all three hookOn registrations
+// (afterOpenScriptForm / afterLoadFromHandle / afterReparseScripts) live in
+// the module. configureRecentScripts() is called above.
 
 // ---------- MONACO "GO TO SCRIPT" ----------
 // Adds an editor action so right-click on an @token@ in HTML/XML offers a
@@ -2418,245 +2230,12 @@ hookOn('afterLoadFromHandle', async () => {
   } catch (e) { console.warn('[auto-open] failed:', e); }
 });
 
-// ============================================================
-// GENERIC OVERLAY-FORM HELPER + PRESET (.OL-jobpreset / .OL-outputpreset) EDITOR
-// ------------------------------------------------------------
-// Lifts the form-overlay-on-Monaco pattern out of the Scripts feature so
-// any "edit this XML file as a form" view can reuse it. Same overlay
-// container, same Apply / Revert / Open raw / Close action set.
-//
-// Concrete editor included: a basic preset editor that scans a preset
-// XML's top-level scalar children and exposes them as text inputs. The
-// surface is intentionally generic — it's a starting point for richer
-// datamodel / sections editors that should slot into the same plumbing.
-// Apply uses the standard _raw + offset splice pattern via replaceTagInner
-// so whitespace and unknown sibling tags are preserved.
-// ============================================================
-
-const overlayFormState = {
-  active: null, // { path, originalText, fields: [{ tag, value, isMultiline }] }
-};
-
-// Mount an overlay form. `cfg` shape:
-//   { path, title, subtitle, fields: [{ tag, label, value, multiline? }],
-//     onApply(formValues), onClose() }
-// Hides the editor + script/binary/scenario views while shown; restores
-// them in closeOverlayForm. The `originalText` is captured so Revert can
-// reset every input to its parsed-at-open value.
-function openOverlayForm(cfg) {
-  if (!cfg || !cfg.fields) return;
-  // Hide other "main pane" views
-  document.getElementById('editor').style.display = 'none';
-  document.getElementById('binary-view').classList.remove('show');
-  document.getElementById('script-form-view').classList.remove('show');
-  const scnView = document.getElementById('scenario-form-view');
-  if (scnView) scnView.classList.remove('show');
-  // Hide the editor tab strip — irrelevant for form view
-  document.getElementById('editor-tab').style.display = 'none';
-
-  const view = document.getElementById('overlay-form-view');
-  view.classList.add('show');
-  document.getElementById('of-title').textContent = cfg.title || 'Form view';
-  document.getElementById('of-sub').textContent = cfg.subtitle || cfg.path || '';
-
-  const fieldsHost = document.getElementById('of-fields');
-  fieldsHost.innerHTML = '';
-  if (!cfg.fields.length) {
-    fieldsHost.innerHTML = '<div class="of-empty">No editable scalar fields detected. Use "Open raw…" to edit the XML directly.</div>';
-  }
-  for (const fld of cfg.fields) {
-    const row = document.createElement('div');
-    row.className = 'field-row';
-    const lab = document.createElement('label');
-    lab.textContent = fld.label || fld.tag;
-    row.appendChild(lab);
-    let inp;
-    if (fld.multiline || (fld.value && /\n/.test(fld.value)) || (fld.value && fld.value.length > 80)) {
-      inp = document.createElement('textarea');
-      inp.rows = 3;
-    } else {
-      inp = document.createElement('input');
-      inp.type = 'text';
-    }
-    inp.value = fld.value == null ? '' : fld.value;
-    inp.dataset.tag = fld.tag;
-    row.appendChild(inp);
-    fieldsHost.appendChild(row);
-  }
-
-  overlayFormState.active = { path: cfg.path, originalText: cfg.originalText || '', fields: cfg.fields, onApply: cfg.onApply, onClose: cfg.onClose };
-
-  // Wire actions (replaceWith trick to drop any prior listeners cleanly)
-  const apply = document.getElementById('of-apply');
-  const revert = document.getElementById('of-revert');
-  const close = document.getElementById('of-close');
-  const openRaw = document.getElementById('of-open-raw');
-  apply.replaceWith(apply.cloneNode(true));
-  revert.replaceWith(revert.cloneNode(true));
-  close.replaceWith(close.cloneNode(true));
-  openRaw.replaceWith(openRaw.cloneNode(true));
-  document.getElementById('of-apply').addEventListener('click', () => {
-    if (!overlayFormState.active || !overlayFormState.active.onApply) return;
-    const out = {};
-    for (const inp of fieldsHost.querySelectorAll('input,textarea')) {
-      out[inp.dataset.tag] = inp.value;
-    }
-    overlayFormState.active.onApply(out);
-  });
-  document.getElementById('of-revert').addEventListener('click', () => {
-    if (!overlayFormState.active) return;
-    for (const fld of overlayFormState.active.fields) {
-      const inp = fieldsHost.querySelector(`[data-tag="${CSS.escape(fld.tag)}"]`);
-      if (inp) inp.value = fld.value == null ? '' : fld.value;
-    }
-  });
-  document.getElementById('of-close').addEventListener('click', closeOverlayForm);
-  document.getElementById('of-open-raw').addEventListener('click', () => {
-    const path = overlayFormState.active && overlayFormState.active.path;
-    closeOverlayForm();
-    if (path && state.files[path]) openFile(path);
-  });
-
-  // Ctrl/Cmd+S → Apply (mirrors the script form's binding)
-  view.onkeydown = function (e) {
-    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 's' || e.key === 'S')) {
-      if (!view.classList.contains('show')) return;
-      e.preventDefault();
-      e.stopPropagation();
-      document.getElementById('of-apply').click();
-    }
-  };
-}
-
-function closeOverlayForm() {
-  const view = document.getElementById('overlay-form-view');
-  if (!view) return;
-  view.classList.remove('show');
-  view.onkeydown = null;
-  const wasActive = overlayFormState.active;
-  overlayFormState.active = null;
-  if (wasActive && wasActive.onClose) {
-    try { wasActive.onClose(); } catch (_) {}
-  }
-  // Restore whatever the underlying file would normally show.
-  if (state.currentPath) openFile(state.currentPath);
-}
-
-// Hide the "Open as form" banner. Idempotent.
-function hideOverlayBanner() {
-  const b = document.getElementById('overlay-form-banner');
-  if (b) b.classList.remove('show');
-}
-
-// ---------- preset editor ----------
-// Detects when a .OL-jobpreset / .OL-outputpreset is opened and shows a
-// banner offering to "Open as form". The form scans the preset XML's
-// top-level scalar children (text-only elements that aren't structural
-// containers) and surfaces each as a text/textarea input. On Apply we
-// splice each new value back into the original text using replaceTagInner
-// so unknown sibling tags + indentation are preserved.
-
-const PRESET_EXTS = new Set(['ol-jobpreset', 'ol-outputpreset']);
-
-function isPresetPath(path) {
-  return PRESET_EXTS.has(extOf(path || ''));
-}
-
-// Pull every top-level child element of `root` whose only content is text
-// (no nested element children). These are the scalar fields safe to edit
-// without re-encoding nested structure.
-function extractPresetScalarFields(xmlText) {
-  const fields = [];
-  let doc;
-  try { doc = new DOMParser().parseFromString(xmlText, 'application/xml'); }
-  catch (_) { return fields; }
-  const root = doc && doc.documentElement;
-  if (!root || root.nodeName.toLowerCase() === 'parsererror') return fields;
-  for (const child of root.children || []) {
-    // Skip elements that have child elements — those are structural and
-    // need a richer editor than this generic surface.
-    const hasChildElements = Array.from(child.children || []).length > 0;
-    if (hasChildElements) continue;
-    const tag = child.localName || child.nodeName;
-    if (!tag) continue;
-    // The decoder/encoder pair already handles entity round-tripping.
-    fields.push({
-      tag,
-      label: tag,
-      value: decodeXmlEntities(child.textContent || ''),
-      multiline: (child.textContent || '').length > 80,
-    });
-  }
-  return fields;
-}
-
-function openPresetOverlay(path) {
-  const f = state.files[path];
-  if (!f || !f.isText) return;
-  const text = state.monacoModels[path] ? state.monacoModels[path].getValue() : (f.content || '');
-  const fields = extractPresetScalarFields(text);
-  hideOverlayBanner();
-  openOverlayForm({
-    path,
-    title: 'Preset editor — ' + path,
-    subtitle: extOf(path).toUpperCase() + ' · top-level scalar fields shown below; nested elements stay untouched.',
-    originalText: text,
-    fields,
-    onApply: (formValues) => {
-      // Mutate the live text by splicing each changed scalar back in.
-      let updated = text;
-      let touched = 0;
-      for (const fld of fields) {
-        const newVal = formValues[fld.tag];
-        if (newVal == null || newVal === fld.value) continue;
-        updated = replaceTagInner(updated, fld.tag, encodeXmlText(newVal));
-        touched++;
-      }
-      if (!touched) {
-        setStatus('No changes to apply.', 'warn');
-        return;
-      }
-      const model = state.monacoModels[path];
-      if (model) {
-        const range = model.getFullModelRange();
-        model.pushEditOperations([], [{ range, text: updated }], () => null);
-      }
-      f.content = updated;
-      f.dirty = true;
-      refreshTreeDirtyMarkers();
-      setStatus(`Applied ${touched} field${touched === 1 ? '' : 's'} to ${path}. Click Review & Save to write to disk.`, 'ok');
-      // Re-render the form so subsequent changes diff against the new baseline.
-      openPresetOverlay(path);
-    },
-  });
-}
-
-// Hook openFile: when a preset file is opened, show the "Open as form"
-// banner. Banner stays out of the way for non-preset files.
-(function hookPresetBanner() {
-  const _orig = openFile;
-  openFile = function (path) {
-    _orig(path);
-    const banner = document.getElementById('overlay-form-banner');
-    if (!banner) return;
-    if (isPresetPath(path)) {
-      const ext = extOf(path).toUpperCase();
-      document.getElementById('overlay-form-banner-msg').textContent =
-        `${ext} files can be edited as a form (top-level scalar fields).`;
-      banner.classList.add('show');
-    } else {
-      banner.classList.remove('show');
-    }
-  };
-  const btn = document.getElementById('overlay-form-banner-open');
-  if (btn) {
-    btn.addEventListener('click', () => {
-      if (state.currentPath && isPresetPath(state.currentPath)) {
-        openPresetOverlay(state.currentPath);
-      }
-    });
-  }
-})();
+// Generic overlay-form helper + preset (.OL-jobpreset / .OL-outputpreset)
+// editor carved out to ./preset-overlay.ts (Phase 11). State, openOverlayForm
+// / closeOverlayForm, isPresetPath / extractPresetScalarFields /
+// openPresetOverlay, and the preset banner toggle (now a hookOn-
+// 'afterOpenFile' registration instead of an `_orig = openFile` monkey-patch)
+// all live in the module. configurePresetOverlay() is called above.
 
 // ---------- DEFERRED: form-as-overlay editors for datamodel + sections ----------
 // The plumbing above (openOverlayForm + replaceTagInner + the banner hook)

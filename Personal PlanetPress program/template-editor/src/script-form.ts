@@ -17,6 +17,7 @@ import { state } from './state';
 import { on as hookOn, emit as hookEmit } from './hooks';
 import { extOf, indentAt, encodeXmlText } from './fs';
 import { escapeHtml, refreshTreeDirtyMarkers } from './tree';
+import { openContextMenu } from './context-menu';
 import {
   scriptsState,
   ParsedScript,
@@ -43,16 +44,12 @@ export interface ScriptFormDeps {
   openFile: (path: string) => void;
   setStatus: (msg: string, kind?: string) => void;
   setSidebarMode: (mode: string) => void;
-  showCtxMenu: (el: HTMLElement) => void;
-  closeCtxMenu: () => void;
 }
 
 let deps: ScriptFormDeps = {
   openFile: () => {},
   setStatus: () => {},
   setSidebarMode: () => {},
-  showCtxMenu: () => {},
-  closeCtxMenu: () => {},
 };
 
 // ---- Configure ----------------------------------------------------------
@@ -136,22 +133,11 @@ export function configureScriptForm(d: ScriptFormDeps): void {
   $('btn-script-new').addEventListener('click', (e: MouseEvent) => {
     if (!scriptsState.hostPath) { deps.setStatus('Open a template first.', 'warn'); return; }
     e.stopPropagation();
-    deps.closeCtxMenu();
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const menu = document.createElement('div');
-    menu.className = 'ctxmenu';
-    menu.style.left = rect.left + 'px';
-    menu.style.top = (rect.bottom + 4) + 'px';
-    menu.innerHTML = `
-      <div class="item" data-kind="STANDARD">Field text script (FLD)</div>
-      <div class="item" data-kind="CONTROL">Control / JS script (JS)</div>
-    `;
-    menu.addEventListener('click', (ev: MouseEvent) => {
-      const kind = (ev.target as HTMLElement).dataset.kind;
-      deps.closeCtxMenu();
-      if (kind === 'STANDARD' || kind === 'CONTROL') createScript(kind);
-    });
-    deps.showCtxMenu(menu);
+    openContextMenu([
+      { label: 'Field text script (FLD)', onClick: () => createScript('STANDARD') },
+      { label: 'Control / JS script (JS)', onClick: () => createScript('CONTROL') },
+    ], rect.left, rect.bottom + 4);
   });
 
   // Delete buttons
@@ -175,30 +161,17 @@ export function configureScriptForm(d: ScriptFormDeps): void {
     const item = e.target instanceof Element ? e.target.closest('.script-item') : null;
     if (!item) return;
     e.preventDefault();
-    deps.closeCtxMenu();
     const id = (item as HTMLElement).dataset.scriptId;
     if (!id) return;
-    const menu = document.createElement('div');
-    menu.className = 'ctxmenu';
-    menu.style.left = e.clientX + 'px';
-    menu.style.top = e.clientY + 'px';
-    menu.innerHTML = `
-      <div class="item" data-act="open">Open</div>
-      <div class="item" data-act="clone">Duplicate</div>
-      <div class="sep"></div>
-      <div class="item danger" data-act="delete">Delete script</div>
-    `;
-    menu.addEventListener('click', (ev: MouseEvent) => {
-      const act = (ev.target as HTMLElement).dataset.act;
-      deps.closeCtxMenu();
-      if (act === 'open') openScriptForm(id);
-      else if (act === 'clone') cloneScript(id);
-      else if (act === 'delete') {
+    openContextMenu([
+      { label: 'Open', onClick: () => openScriptForm(id) },
+      { label: 'Duplicate', onClick: () => cloneScript(id) },
+      { sep: true },
+      { label: 'Delete script', danger: true, onClick: () => {
         scriptsState.active = id;
         deleteScript(id);
-      }
-    });
-    deps.showCtxMenu(menu);
+      }},
+    ], e.clientX, e.clientY);
   });
 }
 

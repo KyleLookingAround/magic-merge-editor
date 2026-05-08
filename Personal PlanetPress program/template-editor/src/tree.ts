@@ -16,17 +16,13 @@
 // module back into legacy.ts.
 
 import { state } from './state';
-import { isTextPath, isImagePath } from './fs';
-
-interface FileEntry { content: any; isText: boolean; dirty?: boolean; }
+import { isTextPath, isImagePath, isLockedFolderMarker } from './fs';
 
 export interface TreeDeps {
-  isLockedFolderMarker: (path: string, fileEntry: FileEntry | undefined) => boolean;
   openFile: (path: string) => void;
 }
 
 let deps: TreeDeps = {
-  isLockedFolderMarker: () => false,
   openFile: () => {},
 };
 
@@ -63,7 +59,7 @@ export function buildTree(): void {
       node = node.children[seg];
     }
     const leaf = parts[parts.length - 1];
-    if (deps.isLockedFolderMarker(path, state.files[path])) {
+    if (isLockedFolderMarker(path, state.files[path])) {
       node.children[leaf] = node.children[leaf] || { name: leaf, children: {}, files: [], lockedMarker: path };
       continue;
     }

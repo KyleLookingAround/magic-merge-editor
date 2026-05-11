@@ -31,6 +31,7 @@ import { configureScenarios } from './scenarios';
 import { configurePreviewHelpers, previewState, refreshPreview, closePreview, openPreview } from './preview';
 import { setSidebarMode } from './sidebar';
 import { configureRecentScripts } from './recent-scripts';
+import { configureConditionToggles } from './condition-toggles';
 import { on as hookOn } from './hooks';
 import { state } from './state';
 import { openFile } from './file-ops';
@@ -81,6 +82,8 @@ configureScenarios({ openFile: path => openFile(path) });
 configurePreviewHelpers({ setSidebarMode: mode => setSidebarMode(mode) });
 
 configureRecentScripts();
+
+configureConditionToggles({ refreshPreview: () => { if (previewState.open) refreshPreview(); } });
 
 // ============================================================
 // MODAL HELPERS

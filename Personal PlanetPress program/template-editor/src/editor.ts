@@ -92,3 +92,11 @@ export function formatCurrent(): void {
   state.editor.executeEdits('format', [{ range, text: out }]);
   setStatus(`Formatted as ${label}.`, 'ok');
 }
+
+// Ctrl+Alt+L → format current file (runs at module load)
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.altKey && (e.key === 'L' || e.key === 'l')) {
+    e.preventDefault();
+    formatCurrent();
+  }
+});

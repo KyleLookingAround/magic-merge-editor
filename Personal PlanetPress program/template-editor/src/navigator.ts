@@ -1,13 +1,13 @@
 // Navigator panel — sections/masters/snippets from index.xml.
 // Carved from legacy.ts in Phase 6.
-//
-// parseNavigatorEntries, renderNavigator, normalizeNavPath moved here.
-// openFile and setStatus are injected via configureNavigator().
+// Phase 13: openFile and setStatus imported directly; DI seam removed.
 
 import { state } from './state';
 import { escapeHtml } from './tree';
 import { decodeXmlEntities } from './fs';
 import { scriptsState } from './scripts-panel';
+import { openFile } from './file-ops';
+import { setStatus } from './status';
 
 export interface NavEntry { id: string; name: string; location: string; }
 export interface NavigatorGroups {
@@ -15,15 +15,6 @@ export interface NavigatorGroups {
   sections: NavEntry[];
   snippets: NavEntry[];
 }
-
-export interface NavigatorDeps {
-  openFile: (path: string) => void;
-  setStatus: (msg: string, kind?: string) => void;
-}
-
-let deps: NavigatorDeps = { openFile: () => {}, setStatus: () => {} };
-
-export function configureNavigator(d: NavigatorDeps): void { deps = d; }
 
 /** Normalize a path found in index.xml (may use forward or back slashes) to
  *  whichever form exists in state.files. Returns the input if neither variant
@@ -106,10 +97,10 @@ export function renderNavigator(): void {
       el.addEventListener('click', () => {
         const p = normalizeNavPath(it.location);
         if (state.files[p]) {
-          deps.openFile(p);
+          openFile(p);
           renderNavigator();
         } else {
-          deps.setStatus(`Not found in package: ${p}`, 'warn');
+          setStatus(`Not found in package: ${p}`, 'warn');
         }
       });
       list.appendChild(el);

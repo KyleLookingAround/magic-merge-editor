@@ -17,6 +17,7 @@ import { state } from './state';
 import { emit as hookEmit } from './hooks';
 import { escapeHtml } from './tree';
 import { runSearch } from './search';
+import { setStatus } from './status';
 
 /** Filenames inside a template that may host the <script> blocks. */
 export const SCRIPT_HOST_CANDIDATES: readonly string[] = ['index.xml'];
@@ -522,7 +523,6 @@ export function refreshScriptsList(): void {
 export interface ScriptListDeps {
   openScriptForm: (id: string) => void;
   toggleScriptEnabled: (id: string, enabled: boolean) => void;
-  setStatus: (msg: string, kind?: string) => void;
   moveScript: (fromId: string, toId: string, position: 'before' | 'after') => void;
   setSidebarMode: (mode: string) => void;
 }
@@ -530,7 +530,6 @@ export interface ScriptListDeps {
 let listDeps: ScriptListDeps = {
   openScriptForm: () => {},
   toggleScriptEnabled: () => {},
-  setStatus: () => {},
   moveScript: () => {},
   setSidebarMode: () => {},
 };
@@ -683,7 +682,7 @@ export function renderScriptsList(): void {
         unusedBadge.addEventListener('click', (ev: Event) => {
           ev.stopPropagation();
           const needle = (s.findText || s.selectorText || '').trim();
-          if (!needle) { listDeps.setStatus('No findText / selectorText to search for.', 'warn'); return; }
+          if (!needle) { setStatus('No findText / selectorText to search for.', 'warn'); return; }
           jumpToSearch(needle);
         });
       }

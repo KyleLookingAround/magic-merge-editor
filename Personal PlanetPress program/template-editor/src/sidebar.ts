@@ -10,6 +10,7 @@ import { refreshScriptsList } from './scripts-panel';
 import { renderNavigator } from './navigator';
 import { renderThemePanel } from './preview';
 import { loadNotesForCurrentTemplate } from './notes';
+import { state } from './state';
 
 export function setSidebarMode(mode: string): void {
   const isFiles   = mode === 'files';
@@ -53,3 +54,17 @@ export function setSidebarMode(mode: string): void {
   if (isTheme) renderThemePanel();
   if (isNotes) loadNotesForCurrentTemplate();
 }
+
+// ============================================================
+// SIDEBAR BUTTON WIRING (runs at module load)
+// ============================================================
+(function wireSidebarButtons() {
+  document.getElementById('mode-files')!.addEventListener('click', () => setSidebarMode('files'));
+  document.getElementById('mode-search')!.addEventListener('click', () => setSidebarMode('search'));
+  document.getElementById('mode-theme')!.addEventListener('click', () => setSidebarMode('theme'));
+  document.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
+      if (state.fileHandle) { e.preventDefault(); setSidebarMode('search'); }
+    }
+  });
+})();

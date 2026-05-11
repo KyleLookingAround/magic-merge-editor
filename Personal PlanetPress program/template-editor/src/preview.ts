@@ -14,6 +14,10 @@ import { escapeHtml } from './tree';
 import { extOf, decodeBytes } from './fs';
 import { scriptsState } from './scripts-panel';
 import { scenariosState } from './scenarios';
+import { setStatus } from './status';
+import { setSidebarMode } from './sidebar';
+import { on as hookOn } from './hooks';
+import { openScriptForm } from './script-form';
 
 export interface ThemePaletteEntry { key: string; name: string; hex: string; }
 export interface ThemeFontSlot { latin: string; ea: string; cs: string; }
@@ -326,22 +330,7 @@ export function revokePreviewBlobs(): void {
 
 // ============================================================
 // PREVIEW PANEL HELPERS
-// Deps for cross-panel navigation are injected via configurePreviewHelpers().
 // ============================================================
-
-export interface PreviewHelperDeps {
-  setSidebarMode: (mode: string) => void;
-  openScriptForm: (id: string) => void;
-  setStatus: (msg: string, kind?: string) => void;
-}
-
-let helperDeps: PreviewHelperDeps = {
-  setSidebarMode: () => {},
-  openScriptForm: () => {},
-  setStatus: () => {},
-};
-
-export function configurePreviewHelpers(d: PreviewHelperDeps): void { helperDeps = d; }
 
 /** Find the script whose findText exactly matches @token@. */
 export function scriptByToken(token: string): import('./scripts-panel').ParsedScript | null {
@@ -352,10 +341,10 @@ export function scriptByToken(token: string): import('./scripts-panel').ParsedSc
 /** Switch the sidebar to Scripts mode and open the matching script's form. */
 export function jumpToScriptByToken(token: string): void {
   const s = scriptByToken(token);
-  if (!s) { helperDeps.setStatus('No script binds ' + token, 'warn'); return; }
-  helperDeps.setSidebarMode('scripts');
-  helperDeps.openScriptForm(s.id);
-  helperDeps.setStatus('Jumped to script: ' + (s.name || token), 'ok');
+  if (!s) { setStatus('No script binds ' + token, 'warn'); return; }
+  setSidebarMode('scripts');
+  openScriptForm(s.id);
+  setStatus('Jumped to script: ' + (s.name || token), 'ok');
 }
 
 /** Wire click handlers onto __cw_raw_token spans inside an iframe so users
@@ -535,7 +524,7 @@ export function openPreview(): void {
   if (!state.currentPath) return;
   const ext = extOf(state.currentPath);
   if (!['html', 'htm'].includes(ext)) {
-    helperDeps.setStatus('Preview only supports HTML files.', 'warn');
+    setStatus('Preview only supports HTML files.', 'warn');
     return;
   }
   previewState.open = true;
@@ -941,3 +930,45 @@ export function applyDatamodelPersonalization(doc: Document): number {
 
   return tokenToValue.size;
 }
+
+// Preview button event wiring — runs at module load
+document.getElementById('btn-preview')!.addEventListener('click', togglePreview);
+document.getElementById('btn-preview-refresh')!.addEventListener('click', refreshPreview);
+document.getElementById('btn-preview-newtab')!.addEventListener('click', openPreviewNewTab);
+document.getElementById('btn-preview-close')!.addEventListener('click', closePreview);
+document.getElementById('btn-preview-zoom-in')!.addEventListener('click', () => stepZoom(1));
+document.getElementById('btn-preview-zoom-out')!.addEventListener('click', () => stepZoom(-1));
+document.getElementById('preview-zoom-level')!.addEventListener('click', () => setZoom(1));
+document.getElementById('btn-pv-tab-data')!.addEventListener('click', () => setPreviewMode('data'));
+document.getElementById('btn-pv-tab-raw')!.addEventListener('click', () => setPreviewMode('raw'));
+document.getElementById('btn-pv-tab-split')!.addEventListener('click', () => setPreviewMode('split'));
+document.getElementById('btn-pv-tab-css')!.addEventListener('click', () => setPreviewMode('css'));
+document.getElementById('btn-preview-css-copy')!.addEventListener('click', () => {
+  const css = previewState.lastCss || '';
+  if (!css) { setStatus('No CSS to copy yet.', 'warn'); return; }
+  navigator.clipboard.writeText(css).then(
+    () => setStatus('CSS copied to clipboard.', 'ok'),
+    () => setStatus('Copy failed.', 'err'),
+  );
+});
+document.getElementById('btn-preview-tokens-dismiss')!.addEventListener('click', () => {
+  previewState.tokensDismissed = true;
+  document.getElementById('preview-tokens-strip')!.classList.remove('show');
+});
+document.getElementById('preview-pane')!.addEventListener('wheel', e => {
+  if (!e.ctrlKey && !e.metaKey) return;
+  e.preventDefault();
+  stepZoom(e.deltaY < 0 ? 1 : -1);
+}, { passive: false });
+document.getElementById('btn-theme-copy')!.addEventListener('click', () => {
+  if (!state.isDocx) { setStatus('Open a .docx first.', 'warn'); return; }
+  const css = buildThemeCss();
+  if (!css) { setStatus('No theme data to copy.', 'warn'); return; }
+  navigator.clipboard.writeText(css).then(
+    () => setStatus('Theme CSS copied to clipboard.', 'ok'),
+    () => setStatus('Copy failed.', 'err'),
+  );
+});
+hookOn('afterCommitCurrentEdit', () => {
+  if (previewState.open) refreshPreview();
+});

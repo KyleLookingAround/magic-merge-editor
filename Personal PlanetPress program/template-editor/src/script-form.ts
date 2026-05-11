@@ -30,6 +30,9 @@ import {
   refreshScriptsList,
   computeVisibleScripts,
 } from './scripts-panel';
+import { openFile } from './file-ops';
+import { setStatus } from './status';
+import { setSidebarMode } from './sidebar';
 
 declare const monaco: any;
 
@@ -38,25 +41,9 @@ declare const monaco: any;
 const $ = (id: string): HTMLElement => document.getElementById(id)!;
 const $inp = (id: string): HTMLInputElement => document.getElementById(id) as HTMLInputElement;
 
-// ---- Injected dependencies ----------------------------------------------
-
-export interface ScriptFormDeps {
-  openFile: (path: string) => void;
-  setStatus: (msg: string, kind?: string) => void;
-  setSidebarMode: (mode: string) => void;
-}
-
-let deps: ScriptFormDeps = {
-  openFile: () => {},
-  setStatus: () => {},
-  setSidebarMode: () => {},
-};
-
 // ---- Configure ----------------------------------------------------------
 
-export function configureScriptForm(d: ScriptFormDeps): void {
-  deps = d;
-
+export function configureScriptForm(): void {
   // Startup wiring (DOM must be ready)
   bindFieldPathAutotype('sf-field-path', 'sf-field-type');
   bindFieldPathAutotype('sf-cond-field', 'sf-cond-field-type');
@@ -81,7 +68,7 @@ export function configureScriptForm(d: ScriptFormDeps): void {
   $('sf-open-raw').addEventListener('click', () => {
     if (!scriptsState.hostPath) return;
     closeScriptForm();
-    deps.openFile(scriptsState.hostPath);
+    openFile(scriptsState.hostPath);
     const s = scriptsState.list.find((x: ParsedScript) => x.id === scriptsState.active);
     if (s && state.monacoModels[scriptsState.hostPath]) {
       const text = state.monacoModels[scriptsState.hostPath].getValue() as string;
@@ -126,12 +113,12 @@ export function configureScriptForm(d: ScriptFormDeps): void {
   $('scripts-bulk-delete').addEventListener('click', () => bulkDelete());
 
   // Sidebar mode buttons (scripts + navigator)
-  $('mode-scripts').addEventListener('click', () => deps.setSidebarMode('scripts'));
-  $('mode-nav').addEventListener('click', () => deps.setSidebarMode('nav'));
+  $('mode-scripts').addEventListener('click', () => setSidebarMode('scripts'));
+  $('mode-nav').addEventListener('click', () => setSidebarMode('nav'));
 
   // "+ New script" picker
   $('btn-script-new').addEventListener('click', (e: MouseEvent) => {
-    if (!scriptsState.hostPath) { deps.setStatus('Open a template first.', 'warn'); return; }
+    if (!scriptsState.hostPath) { setStatus('Open a template first.', 'warn'); return; }
     e.stopPropagation();
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     openContextMenu([
@@ -173,7 +160,15 @@ export function configureScriptForm(d: ScriptFormDeps): void {
       }},
     ], e.clientX, e.clientY);
   });
+
+  hookOn('beforeOpenFile', () => {
+    document.getElementById('script-form-view')!.classList.remove('show');
+    scriptsState.active = null;
+  });
 }
+
+// Self-invoke at module load.
+configureScriptForm();
 
 // ---- Private helpers ----------------------------------------------------
 
@@ -323,7 +318,7 @@ function updateUsagesPanel(findText: string, selectorText: string): void {
       const p = (row as HTMLElement).dataset.path;
       if (!p) return;
       closeScriptForm();
-      deps.openFile(p);
+      openFile(p);
       setTimeout(() => {
         if (state.editor && state.monacoModels[p]) {
           const text = (state.monacoModels[p] as { getValue(): string }).getValue();
@@ -366,7 +361,7 @@ function bulkSetEnabled(enabled: boolean): void {
     text = text.slice(0, idx) + newRaw + text.slice(idx + s._raw.length);
     touched++;
   }
-  if (!touched) { deps.setStatus('Could not locate any selected scripts in index.xml.', 'err'); return; }
+  if (!touched) { setStatus('Could not locate any selected scripts in index.xml.', 'err'); return; }
   if (model) {
     model.pushEditOperations([], [{ range: model.getFullModelRange(), text }], () => null);
   }
@@ -374,7 +369,7 @@ function bulkSetEnabled(enabled: boolean): void {
   f.dirty = true;
   refreshTreeDirtyMarkers();
   refreshScriptsList();
-  deps.setStatus(`${enabled ? 'Enabled' : 'Disabled'} ${touched} script${touched === 1 ? '' : 's'}. Click Review & Save to apply.`, 'ok');
+  setStatus(`${enabled ? 'Enabled' : 'Disabled'} ${touched} script${touched === 1 ? '' : 's'}. Click Review & Save to apply.`, 'ok');
 }
 
 function bulkDelete(): void {
@@ -398,7 +393,7 @@ function bulkDelete(): void {
     text = text.slice(0, start) + text.slice(idx + s._raw.length);
     touched++;
   }
-  if (!touched) { deps.setStatus('Could not locate any selected scripts in index.xml.', 'err'); return; }
+  if (!touched) { setStatus('Could not locate any selected scripts in index.xml.', 'err'); return; }
   if (model) {
     model.pushEditOperations([], [{ range: model.getFullModelRange(), text }], () => null);
   }
@@ -408,10 +403,10 @@ function bulkDelete(): void {
   if (scriptsState.active && ids.includes(scriptsState.active)) {
     scriptsState.active = null;
     $('script-form-view').classList.remove('show');
-    if (state.currentPath) deps.openFile(state.currentPath);
+    if (state.currentPath) openFile(state.currentPath);
   }
   refreshScriptsList();
-  deps.setStatus(`Deleted ${touched} script${touched === 1 ? '' : 's'}. Click Review & Save to apply.`, 'ok');
+  setStatus(`Deleted ${touched} script${touched === 1 ? '' : 's'}. Click Review & Save to apply.`, 'ok');
 }
 
 function offerRenameTokenAcrossFiles(oldToken: string, newToken: string): void {
@@ -461,7 +456,7 @@ function offerRenameTokenAcrossFiles(oldToken: string, newToken: string): void {
     scriptsState.usagesCache.invalidate();
   }
   refreshScriptsList();
-  deps.setStatus(`Renamed token in ${touched} file${touched === 1 ? '' : 's'} (${replaced} occurrence${replaced === 1 ? '' : 's'}). Click Review & Save to apply.`, 'ok');
+  setStatus(`Renamed token in ${touched} file${touched === 1 ? '' : 's'} (${replaced} occurrence${replaced === 1 ? '' : 's'}). Click Review & Save to apply.`, 'ok');
 }
 
 // ---- Script form --------------------------------------------------------
@@ -541,7 +536,7 @@ export function closeScriptForm(): void {
   $('script-form-view').classList.remove('show');
   scriptsState.active = null;
   if (state.currentPath) {
-    deps.openFile(state.currentPath);
+    openFile(state.currentPath);
   } else {
     $('editor-tab').style.display = 'none';
     $('editor').style.display = 'none';
@@ -602,7 +597,7 @@ export function applyScriptForm(): void {
     if (idx >= 0) { start = idx; end = idx + s._raw.length; }
   }
   if (start === -1) {
-    deps.setStatus('Could not locate the script in index.xml — file may have been edited externally.', 'err');
+    setStatus('Could not locate the script in index.xml — file may have been edited externally.', 'err');
     return;
   }
   const updated = currentText.slice(0, start) + newRaw + currentText.slice(end);
@@ -614,7 +609,7 @@ export function applyScriptForm(): void {
   f.dirty = true;
   refreshTreeDirtyMarkers();
 
-  deps.setStatus(`Applied changes to "${form.name || 'script'}". Click Review & Save to write to disk.`, 'ok');
+  setStatus(`Applied changes to "${form.name || 'script'}". Click Review & Save to write to disk.`, 'ok');
 
   const oldFind = (s.findText || '').trim();
   const newFind = (form.findText || '').trim();
@@ -639,7 +634,7 @@ export function toggleScriptEnabled(id: string, enabled: boolean): void {
   const currentText = model ? model.getValue() : f.content;
   const idx = currentText.indexOf(s._raw);
   if (idx === -1) {
-    deps.setStatus('Could not locate script — please re-open the template.', 'err');
+    setStatus('Could not locate script — please re-open the template.', 'err');
     return;
   }
   const newRaw = s._raw.replace(
@@ -654,7 +649,7 @@ export function toggleScriptEnabled(id: string, enabled: boolean): void {
   f.dirty = true;
   refreshTreeDirtyMarkers();
   refreshScriptsList();
-  deps.setStatus(`Script "${s.name}" ${enabled ? 'enabled' : 'disabled'}. Click Review & Save to apply.`, 'ok');
+  setStatus(`Script "${s.name}" ${enabled ? 'enabled' : 'disabled'}. Click Review & Save to apply.`, 'ok');
 }
 
 // ---- Clone / move -------------------------------------------------------
@@ -668,7 +663,7 @@ export function cloneScript(id: string): void {
   const currentText = model ? model.getValue() : f.content;
   const idx = currentText.indexOf(s._raw);
   if (idx === -1) {
-    deps.setStatus('Could not locate script to clone.', 'err');
+    setStatus('Could not locate script to clone.', 'err');
     return;
   }
 
@@ -702,7 +697,7 @@ export function cloneScript(id: string): void {
   const created = scriptsState.list.find(x => x._start === newStart)
               || [...scriptsState.list].reverse().find(x => x.name === nName);
   if (created) openScriptForm(created.id);
-  deps.setStatus(`Cloned script as "${nName}". Click Review & Save to apply.`, 'ok');
+  setStatus(`Cloned script as "${nName}". Click Review & Save to apply.`, 'ok');
 }
 
 export function moveScript(fromId: string, toId: string, position: 'before' | 'after'): void {
@@ -716,7 +711,7 @@ export function moveScript(fromId: string, toId: string, position: 'before' | 'a
   let text = model ? model.getValue() : f.content;
 
   const srcIdx = text.indexOf(src._raw);
-  if (srcIdx === -1) { deps.setStatus('Could not locate the dragged script — please re-open the template.', 'err'); return; }
+  if (srcIdx === -1) { setStatus('Could not locate the dragged script — please re-open the template.', 'err'); return; }
 
   let liftStart = srcIdx;
   while (liftStart > 0 && (text[liftStart - 1] === ' ' || text[liftStart - 1] === '\t')) liftStart--;
@@ -728,7 +723,7 @@ export function moveScript(fromId: string, toId: string, position: 'before' | 'a
   const dstIdx = text.indexOf(dst._raw);
   if (dstIdx === -1) {
     text = text.slice(0, liftStart) + liftedChunk + text.slice(liftStart);
-    deps.setStatus('Lost track of the drop target — reorder cancelled.', 'err');
+    setStatus('Lost track of the drop target — reorder cancelled.', 'err');
     return;
   }
   let insertAt: number;
@@ -752,14 +747,14 @@ export function moveScript(fromId: string, toId: string, position: 'before' | 'a
   f.dirty = true;
   refreshTreeDirtyMarkers();
   refreshScriptsList();
-  deps.setStatus(`Moved "${src.name || '(unnamed)'}" ${position} "${dst.name || '(unnamed)'}". Click Review & Save to apply.`, 'ok');
+  setStatus(`Moved "${src.name || '(unnamed)'}" ${position} "${dst.name || '(unnamed)'}". Click Review & Save to apply.`, 'ok');
 }
 
 // ---- Create / delete ----------------------------------------------------
 
 export function createScript(kind: 'CONTROL' | 'STANDARD'): void {
   if (!scriptsState.hostPath) {
-    deps.setStatus('Open a template first to create scripts.', 'warn');
+    setStatus('Open a template first to create scripts.', 'warn');
     return;
   }
   const name = prompt(
@@ -770,7 +765,7 @@ export function createScript(kind: 'CONTROL' | 'STANDARD'): void {
   );
   if (name == null) return;
   const trimmed = name.trim();
-  if (!trimmed) { deps.setStatus('Empty name.', 'warn'); return; }
+  if (!trimmed) { setStatus('Empty name.', 'warn'); return; }
 
   const hostPath = scriptsState.hostPath;
   const f = state.files[hostPath] as { content: string; dirty: boolean } | undefined;
@@ -786,7 +781,7 @@ export function createScript(kind: 'CONTROL' | 'STANDARD'): void {
   if (anchor) {
     const idx = currentText.indexOf(anchor._raw);
     if (idx === -1) {
-      deps.setStatus("Couldn't locate a sibling script to anchor on. Edit raw index.xml manually.", 'err');
+      setStatus("Couldn't locate a sibling script to anchor on. Edit raw index.xml manually.", 'err');
       return;
     }
     insertOffset = idx + anchor._raw.length;
@@ -794,7 +789,7 @@ export function createScript(kind: 'CONTROL' | 'STANDARD'): void {
   } else {
     const close = currentText.indexOf('</scripts>');
     if (close === -1) {
-      deps.setStatus('No <scripts> container found in index.xml.', 'err');
+      setStatus('No <scripts> container found in index.xml.', 'err');
       return;
     }
     insertOffset = close;
@@ -817,7 +812,7 @@ export function createScript(kind: 'CONTROL' | 'STANDARD'): void {
     scriptsState.active = created.id;
     openScriptForm(created.id);
   }
-  deps.setStatus(`Added ${kind === 'CONTROL' ? 'control' : 'field'} script "${trimmed}". Click Review & Save to write to disk.`, 'ok');
+  setStatus(`Added ${kind === 'CONTROL' ? 'control' : 'field'} script "${trimmed}". Click Review & Save to write to disk.`, 'ok');
 }
 
 export function deleteScript(id: string): void {
@@ -834,7 +829,7 @@ export function deleteScript(id: string): void {
 
   const idx = currentText.indexOf(s._raw);
   if (idx === -1) {
-    deps.setStatus('Could not locate the script in index.xml — file may have changed.', 'err');
+    setStatus('Could not locate the script in index.xml — file may have changed.', 'err');
     return;
   }
   let start = idx;
@@ -854,7 +849,7 @@ export function deleteScript(id: string): void {
   if (scriptsState.active === id) {
     scriptsState.active = null;
     $('script-form-view').classList.remove('show');
-    if (state.currentPath) deps.openFile(state.currentPath);
+    if (state.currentPath) openFile(state.currentPath);
   }
-  deps.setStatus(`Deleted script "${s.name || '(unnamed)'}". Click Review & Save to apply.`, 'ok');
+  setStatus(`Deleted script "${s.name || '(unnamed)'}". Click Review & Save to apply.`, 'ok');
 }

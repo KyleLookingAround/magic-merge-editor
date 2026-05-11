@@ -17,6 +17,8 @@ import { state } from './state';
 import { on as hookOn } from './hooks';
 import { extOf, decodeXmlEntities, encodeXmlText, replaceTagInner } from './fs';
 import { refreshTreeDirtyMarkers } from './tree';
+import { openFile } from './file-ops';
+import { setStatus } from './status';
 
 export interface OverlayField {
   tag: string;
@@ -41,15 +43,6 @@ interface OverlayFormState {
 
 const overlayFormState: OverlayFormState = { active: null };
 
-export interface PresetOverlayDeps {
-  openFile: (path: string) => void;
-  setStatus: (msg: string, kind?: string) => void;
-}
-
-let deps: PresetOverlayDeps = {
-  openFile: () => {},
-  setStatus: () => {},
-};
 
 const PRESET_EXTS = new Set(['ol-jobpreset', 'ol-outputpreset']);
 
@@ -134,7 +127,7 @@ export function openOverlayForm(cfg: OverlayFormConfig): void {
   document.getElementById('of-open-raw')!.addEventListener('click', () => {
     const path = overlayFormState.active && overlayFormState.active.path;
     closeOverlayForm();
-    if (path && state.files[path]) deps.openFile(path);
+    if (path && state.files[path]) openFile(path);
   });
 
   // Ctrl/Cmd+S → Apply (mirrors the script form's binding)
@@ -158,7 +151,7 @@ export function closeOverlayForm(): void {
   if (wasActive && wasActive.onClose) {
     try { wasActive.onClose(); } catch (_) {}
   }
-  if (state.currentPath) deps.openFile(state.currentPath);
+  if (state.currentPath) openFile(state.currentPath);
 }
 
 // Pull every top-level child element of `root` whose only content is text
@@ -208,7 +201,7 @@ export function openPresetOverlay(path: string): void {
         touched++;
       }
       if (!touched) {
-        deps.setStatus('No changes to apply.', 'warn');
+        setStatus('No changes to apply.', 'warn');
         return;
       }
       const model = state.monacoModels[path];
@@ -219,38 +212,34 @@ export function openPresetOverlay(path: string): void {
       f.content = updated;
       f.dirty = true;
       refreshTreeDirtyMarkers();
-      deps.setStatus(`Applied ${touched} field${touched === 1 ? '' : 's'} to ${path}. Click Review & Save to write to disk.`, 'ok');
+      setStatus(`Applied ${touched} field${touched === 1 ? '' : 's'} to ${path}. Click Review & Save to write to disk.`, 'ok');
       // Re-render the form so subsequent changes diff against the new baseline.
       openPresetOverlay(path);
     },
   });
 }
 
-export function configurePresetOverlay(d: PresetOverlayDeps): void {
-  deps = d;
+// Event wiring — runs at module load
+// Show the "Open as form" banner whenever a preset file is opened.
+hookOn('afterOpenFile', (...args: unknown[]) => {
+  const path = args[0] as string;
+  const banner = document.getElementById('overlay-form-banner');
+  if (!banner) return;
+  if (isPresetPath(path)) {
+    const ext = extOf(path).toUpperCase();
+    document.getElementById('overlay-form-banner-msg')!.textContent =
+      `${ext} files can be edited as a form (top-level scalar fields).`;
+    banner.classList.add('show');
+  } else {
+    banner.classList.remove('show');
+  }
+});
 
-  // Show the "Open as form" banner whenever a preset file is opened. Replaces
-  // the legacy `_orig = openFile; openFile = function` monkey-patch.
-  hookOn('afterOpenFile', (...args: unknown[]) => {
-    const path = args[0] as string;
-    const banner = document.getElementById('overlay-form-banner');
-    if (!banner) return;
-    if (isPresetPath(path)) {
-      const ext = extOf(path).toUpperCase();
-      document.getElementById('overlay-form-banner-msg')!.textContent =
-        `${ext} files can be edited as a form (top-level scalar fields).`;
-      banner.classList.add('show');
-    } else {
-      banner.classList.remove('show');
+const _presetBannerBtn = document.getElementById('overlay-form-banner-open');
+if (_presetBannerBtn) {
+  _presetBannerBtn.addEventListener('click', () => {
+    if (state.currentPath && isPresetPath(state.currentPath)) {
+      openPresetOverlay(state.currentPath);
     }
   });
-
-  const btn = document.getElementById('overlay-form-banner-open');
-  if (btn) {
-    btn.addEventListener('click', () => {
-      if (state.currentPath && isPresetPath(state.currentPath)) {
-        openPresetOverlay(state.currentPath);
-      }
-    });
-  }
 }

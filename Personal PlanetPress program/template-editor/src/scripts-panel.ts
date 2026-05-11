@@ -14,9 +14,11 @@
 
 import { encodeXmlText, encodeXmlAttr, replaceTagInner, decodeXmlEntities, makeMemoCache, MemoCache, extOf } from './fs';
 import { state } from './state';
-import { emit as hookEmit } from './hooks';
+import { emit as hookEmit, on as hookOn } from './hooks';
 import { escapeHtml } from './tree';
 import { runSearch } from './search';
+import { setStatus } from './status';
+import { setSidebarMode } from './sidebar';
 
 /** Filenames inside a template that may host the <script> blocks. */
 export const SCRIPT_HOST_CANDIDATES: readonly string[] = ['index.xml'];
@@ -522,17 +524,13 @@ export function refreshScriptsList(): void {
 export interface ScriptListDeps {
   openScriptForm: (id: string) => void;
   toggleScriptEnabled: (id: string, enabled: boolean) => void;
-  setStatus: (msg: string, kind?: string) => void;
   moveScript: (fromId: string, toId: string, position: 'before' | 'after') => void;
-  setSidebarMode: (mode: string) => void;
 }
 
 let listDeps: ScriptListDeps = {
   openScriptForm: () => {},
   toggleScriptEnabled: () => {},
-  setStatus: () => {},
   moveScript: () => {},
-  setSidebarMode: () => {},
 };
 
 export function configureScriptsList(d: ScriptListDeps): void { listDeps = d; }
@@ -542,7 +540,7 @@ const scriptsDnd: { from: string | null } = { from: null };
 
 /** Switch the sidebar to the Search panel and pre-fill the query input. */
 function jumpToSearch(needle: string): void {
-  listDeps.setSidebarMode('search');
+  setSidebarMode('search');
   const inp = document.getElementById('search-input') as HTMLInputElement | null;
   if (!inp) return;
   inp.value = needle;
@@ -683,7 +681,7 @@ export function renderScriptsList(): void {
         unusedBadge.addEventListener('click', (ev: Event) => {
           ev.stopPropagation();
           const needle = (s.findText || s.selectorText || '').trim();
-          if (!needle) { listDeps.setStatus('No findText / selectorText to search for.', 'warn'); return; }
+          if (!needle) { setStatus('No findText / selectorText to search for.', 'warn'); return; }
           jumpToSearch(needle);
         });
       }
@@ -732,3 +730,12 @@ export function renderScriptsList(): void {
   }
   updateBulkBar(visibleScripts);
 }
+
+// Hook registrations — run at module load
+hookOn('afterReparseScripts', renderScriptsList);
+hookOn('afterCommitCurrentEdit', () => {
+  if (state.currentPath && SCRIPT_HOST_CANDIDATES.includes(state.currentPath)) {
+    refreshScriptsList();
+  }
+});
+hookOn('afterLoadFromHandle', () => refreshScriptsList());

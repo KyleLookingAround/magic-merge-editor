@@ -8,6 +8,10 @@ import { state } from './state';
 import { escapeHtml } from './tree';
 import { decodeXmlEntities } from './fs';
 import { scriptsState } from './scripts-panel';
+import { openFile } from './file-ops';
+import { setStatus } from './status';
+import { on as hookOn } from './hooks';
+import { previewState, openPreview, refreshPreview } from './preview';
 
 export interface NavEntry { id: string; name: string; location: string; }
 export interface NavigatorGroups {
@@ -15,15 +19,6 @@ export interface NavigatorGroups {
   sections: NavEntry[];
   snippets: NavEntry[];
 }
-
-export interface NavigatorDeps {
-  openFile: (path: string) => void;
-  setStatus: (msg: string, kind?: string) => void;
-}
-
-let deps: NavigatorDeps = { openFile: () => {}, setStatus: () => {} };
-
-export function configureNavigator(d: NavigatorDeps): void { deps = d; }
 
 /** Normalize a path found in index.xml (may use forward or back slashes) to
  *  whichever form exists in state.files. Returns the input if neither variant
@@ -106,13 +101,37 @@ export function renderNavigator(): void {
       el.addEventListener('click', () => {
         const p = normalizeNavPath(it.location);
         if (state.files[p]) {
-          deps.openFile(p);
+          openFile(p);
           renderNavigator();
         } else {
-          deps.setStatus(`Not found in package: ${p}`, 'warn');
+          setStatus(`Not found in package: ${p}`, 'warn');
         }
       });
       list.appendChild(el);
     }
   }
 }
+
+// ============================================================
+// HOOK REGISTRATIONS (runs at module load)
+// ============================================================
+
+// Auto-open first section and preview when a template loads
+hookOn('afterLoadFromHandle', async () => {
+  if (state.isDocx) return;
+  if (state.standalone) return;
+  if (!scriptsState || !scriptsState.hostPath) return;
+  let entries;
+  try { entries = parseNavigatorEntries(); } catch (_) { return; }
+  if (!entries || !entries.sections || !entries.sections.length) return;
+  const first = entries.sections[0];
+  const target = normalizeNavPath(first.location);
+  if (!state.files[target]) return;
+  try {
+    openFile(target);
+    if (!previewState.open) openPreview();
+    else refreshPreview();
+  } catch (e) { console.warn('[auto-open] failed:', e); }
+});
+
+hookOn('afterLoadFromHandle', () => renderNavigator());

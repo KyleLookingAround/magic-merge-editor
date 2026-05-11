@@ -515,3 +515,17 @@ document.getElementById('btn-file-unlock')?.addEventListener('click', () => unlo
 
 // Update file button states after each file open and after template load
 hookOn('afterOpenFile', () => updateFileButtons());
+hookOn('afterLoadFromHandle', () => {
+  updateFileButtons();
+  if (state.zip && !state.standalone) {
+    const locked = findLockedFolderEntries();
+    if (locked.length) {
+      setStatus(
+        `${locked.length} locked folder${locked.length === 1 ? '' : 's'} detected (` +
+        locked.map((p: string) => p.replace(/\\/g, '/').replace(/^public\/document\//, '')).join(', ') +
+        `). Click 🔓 Unlock in the file toolbar to make them writable.`,
+        'warn',
+      );
+    }
+  }
+});

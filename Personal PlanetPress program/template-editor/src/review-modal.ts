@@ -12,6 +12,10 @@
 import { state } from './state';
 import { escapeHtml } from './tree';
 import { isTextPath, isImagePath, looksLikeText, decodeBytes } from './fs';
+import { setStatus } from './status';
+import { commitCurrentEdit, rezipAndSave } from './file-ops';
+import { on as hookOn } from './hooks';
+import { closePreview } from './preview';
 
 const getDiff = () => (globalThis as any).Diff;
 
@@ -137,36 +141,22 @@ export async function zipTextMap(zip: any): Promise<Record<string, string>> {
 // COMPARE + REVIEW (carved from legacy.ts in Phase 8)
 // ============================================================
 
-interface ReviewModalDeps {
-  setStatus: (msg: string, kind?: string) => void;
-  commitCurrentEdit: (showStatus: boolean) => void;
-  rezipAndSave: () => Promise<void>;
-}
-
-let rmDeps: ReviewModalDeps = {
-  setStatus: () => {},
-  commitCurrentEdit: () => {},
-  rezipAndSave: async () => {},
-};
-
-export function configureReviewModal(d: ReviewModalDeps): void { rmDeps = d; }
-
 export async function compareTemplates(): Promise<void> {
   if (!state.zip) {
-    rmDeps.setStatus('Open a template first, then click Compare to pick a second one.', 'warn');
+    setStatus('Open a template first, then click Compare to pick a second one.', 'warn');
     return;
   }
   if (!(window as any).showOpenFilePicker) return;
   let handle: any;
   try {
     [handle] = await (window as any).showOpenFilePicker({ multiple: false });
-  } catch (e: any) { if (e.name !== 'AbortError') rmDeps.setStatus(e.message, 'err'); return; }
+  } catch (e: any) { if (e.name !== 'AbortError') setStatus(e.message, 'err'); return; }
 
-  rmDeps.setStatus('Loading second template...');
+  setStatus('Loading second template...');
   const file = await handle.getFile();
   let other: any;
   try { other = await (globalThis as any).JSZip.loadAsync(file); }
-  catch (e: any) { rmDeps.setStatus('Not a valid zip: ' + e.message, 'err'); return; }
+  catch (e: any) { setStatus('Not a valid zip: ' + e.message, 'err'); return; }
 
   const A = await zipTextMap(state.zip);
   const B = await zipTextMap(other);
@@ -180,7 +170,7 @@ export async function compareTemplates(): Promise<void> {
     else if (a !== b) items.push({ path: p, status: 'modified', a, b });
   }
 
-  if (!items.length) { rmDeps.setStatus('Templates are identical (text content).', 'ok'); return; }
+  if (!items.length) { setStatus('Templates are identical (text content).', 'ok'); return; }
 
   openModal(`Compare — ${state.fileName} ↔ ${handle.name}`, 'Close', closeModal);
   const m = getModalEls();
@@ -200,12 +190,12 @@ export async function compareTemplates(): Promise<void> {
     m.sidebar.appendChild(el);
   });
   renderDiff(items[0].a, items[0].b);
-  rmDeps.setStatus('', '');
+  setStatus('', '');
 }
 
 export async function reviewAndSave(): Promise<void> {
   if (!state.fileHandle) return;
-  rmDeps.commitCurrentEdit(false);
+  commitCurrentEdit(false);
 
   const changes: { path: string; original: string; current: string; status: string }[] = [];
   if (state.zip) {
@@ -236,14 +226,14 @@ export async function reviewAndSave(): Promise<void> {
   }
 
   if (!changes.length) {
-    rmDeps.setStatus('No changes to save.', 'warn');
+    setStatus('No changes to save.', 'warn');
     return;
   }
 
   openModal(
     `Review changes — ${state.fileName}`,
     `Save ${changes.length} file${changes.length === 1 ? '' : 's'} to disk`,
-    async () => { closeModal(); await rmDeps.rezipAndSave(); },
+    async () => { closeModal(); await rezipAndSave(); },
   );
   const m = getModalEls();
   m.status.textContent = `${changes.length} file${changes.length === 1 ? '' : 's'} changed.`;
@@ -265,3 +255,10 @@ export async function reviewAndSave(): Promise<void> {
   });
   renderDiff(changes[0].original, changes[0].current);
 }
+
+// Event wiring — runs at module load
+document.getElementById('btn-compare')!.addEventListener('click', compareTemplates);
+hookOn('afterLoadFromHandle', () => {
+  (document.getElementById('btn-compare') as HTMLButtonElement).disabled = !state.zip;
+  closePreview();
+});

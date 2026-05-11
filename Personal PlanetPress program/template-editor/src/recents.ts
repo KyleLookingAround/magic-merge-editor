@@ -9,6 +9,7 @@ import { state } from './state';
 import { setStatus } from './status';
 import { escapeHtml } from './tree';
 import { loadFromHandle, scanFolderTemplates } from './file-ops';
+import { on as hookOn } from './hooks';
 
 const RECENTS_DB = 'planetpress-template-editor';
 const RECENTS_STORE = 'recents';
@@ -187,4 +188,14 @@ document.addEventListener('click', e => {
   if (m && m.classList.contains('show') && !m.contains(e.target as Node) && (e.target as HTMLElement).id !== 'btn-recents') {
     m.classList.remove('show');
   }
+});
+
+// ============================================================
+// HOOK REGISTRATIONS (runs at module load)
+// ============================================================
+hookOn('afterLoadFromHandle', (handle: unknown) => {
+  if (handle && !state.dirHandle) recentsAdd(handle as any, 'file');
+});
+hookOn('afterPickAndOpenFolder', () => {
+  if (state.dirHandle) recentsAdd(state.dirHandle, 'folder');
 });

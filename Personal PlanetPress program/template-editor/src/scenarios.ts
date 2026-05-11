@@ -21,6 +21,9 @@ import {
   buildPreviewHtml, applyDatamodelPersonalization,
   openPreview, refreshPreview as _refreshPreview, previewState,
 } from './preview';
+import { setStatus } from './status';
+import { openFile } from './file-ops';
+import { on as hookOn } from './hooks';
 
 export interface Scenario {
   name: string;
@@ -91,17 +94,7 @@ export function parseScenarioXmlToMap(xmlText: string): Map<string, string> {
 /* global JSZip */
 declare const JSZip: any;
 
-export interface ScenarioDeps {
-  setStatus: (msg: string, kind?: string) => void;
-  refreshPreview: () => void;
-  openFile: (path: string) => void;
-}
-
-let deps: ScenarioDeps = { setStatus: () => {}, refreshPreview: () => {}, openFile: () => {} };
-
-export function configureScenarios(d: ScenarioDeps): void {
-  deps = d;
-
+export function configureScenarios(): void {
   // Wire the scenario picker UI (was wireScenarios IIFE in legacy.ts).
   const sel = document.getElementById('preview-scenario') as HTMLSelectElement | null;
   if (sel) sel.addEventListener('change', () => activateScenario(sel.value || null, false));
@@ -164,15 +157,15 @@ export async function pickAndLoadScenarios(): Promise<void> {
   }
   let handle: any;
   try { [handle] = await (window as any).showOpenFilePicker({ multiple: false }); }
-  catch (e: any) { if (e.name !== 'AbortError') deps.setStatus('Pick failed: ' + e.message, 'err'); return; }
+  catch (e: any) { if (e.name !== 'AbortError') setStatus('Pick failed: ' + e.message, 'err'); return; }
   try {
     const file = await handle.getFile();
     const zip = await JSZip.loadAsync(file);
     await readScenariosFromZip(zip, handle.name);
     scenariosState.sourceHandle = handle;
     populateScenarioPicker();
-    deps.setStatus(`Loaded ${scenariosState.list.length} scenario${scenariosState.list.length === 1 ? '' : 's'} from ${handle.name}.`, 'ok');
-  } catch (e: any) { deps.setStatus('Load failed: ' + e.message, 'err'); }
+    setStatus(`Loaded ${scenariosState.list.length} scenario${scenariosState.list.length === 1 ? '' : 's'} from ${handle.name}.`, 'ok');
+  } catch (e: any) { setStatus('Load failed: ' + e.message, 'err'); }
 }
 
 /** Reflect scenariosState.list in the preview scenario <select>. */
@@ -234,10 +227,10 @@ export function activateScenario(name: string | null, silent: boolean): void {
   // Only refresh if preview is currently open — check via the DOM flag rather
   // than importing previewState to avoid a module cycle.
   if (document.getElementById('preview-pane')?.classList.contains('show')) {
-    deps.refreshPreview();
+    _refreshPreview();
   }
   if (!silent) {
-    deps.setStatus(scenariosState.active
+    setStatus(scenariosState.active
       ? `Scenario: ${scenariosState.active}`
       : 'Scenario cleared (using datamodel lastValue)', 'ok');
   }
@@ -248,7 +241,7 @@ export function activateScenario(name: string | null, silent: boolean): void {
 // ============================================================
 
 export function openScenarioFormForActive(): void {
-  if (!scenariosState.active) { deps.setStatus('Pick a scenario first.', 'warn'); return; }
+  if (!scenariosState.active) { setStatus('Pick a scenario first.', 'warn'); return; }
   const s = scenariosState.list.find(x => x.name === scenariosState.active);
   if (!s) return;
   openScenarioForm(s);
@@ -325,10 +318,10 @@ export function openScenarioForm(scenario: Scenario): void {
     }
     closeScenarioForm();
     if (previewState && previewState.open) _refreshPreview();
-    deps.setStatus('Scenario edits applied (in-memory). Use "Save as new XML…" to persist.', 'ok');
+    setStatus('Scenario edits applied (in-memory). Use "Save as new XML…" to persist.', 'ok');
   };
   document.getElementById('scn-form-save-as')!.onclick = async () => {
-    if (!state.dirHandle) { deps.setStatus('Save-as needs a folder open (Open Folder).', 'warn'); return; }
+    if (!state.dirHandle) { setStatus('Save-as needs a folder open (Open Folder).', 'warn'); return; }
     const name = prompt('Save as XML filename (in the open folder):', scenario.name.replace(/\.xml$/i, '_edited.xml'));
     if (!name) return;
     for (const [p, inp] of inputs.entries()) scenario.valueByPath.set(p, inp.value);
@@ -338,14 +331,14 @@ export function openScenarioForm(scenario: Scenario): void {
       const w = await fh.createWritable();
       await w.write(new Blob([xml], { type: 'application/xml' }));
       await w.close();
-      deps.setStatus(`Saved ${name} to folder.`, 'ok');
-    } catch (e: any) { deps.setStatus('Save failed: ' + e.message, 'err'); }
+      setStatus(`Saved ${name} to folder.`, 'ok');
+    } catch (e: any) { setStatus('Save failed: ' + e.message, 'err'); }
   };
 }
 
 export function closeScenarioForm(): void {
   document.getElementById('scenario-form-view')!.classList.remove('show');
-  if (state.currentPath) deps.openFile(state.currentPath);
+  if (state.currentPath) openFile(state.currentPath);
 }
 
 export function scenarioMapToXml(map: Map<string, string>): string {
@@ -383,9 +376,9 @@ export function scenarioMapToXml(map: Map<string, string>): string {
 // ============================================================
 
 export function openCoverageMatrix(): void {
-  if (!scenariosState.list.length) { deps.setStatus('No scenarios loaded.', 'warn'); return; }
+  if (!scenariosState.list.length) { setStatus('No scenarios loaded.', 'warn'); return; }
   const sectionPaths = collectSectionHtmlPaths();
-  if (!sectionPaths.length) { deps.setStatus('No section HTML found in this template.', 'warn'); return; }
+  if (!sectionPaths.length) { setStatus('No section HTML found in this template.', 'warn'); return; }
 
   const rows: { name: string; valueByPath: Map<string, string> | null }[] =
     scenariosState.list.map(s => ({ name: s.name, valueByPath: s.valueByPath }));
@@ -423,7 +416,7 @@ export function openCoverageMatrix(): void {
         const sel = document.getElementById('preview-scenario') as HTMLSelectElement;
         sel.value = r.valueByPath ? r.name : '';
         activateScenario(r.valueByPath ? r.name : null, false);
-        deps.openFile(sec.path);
+        openFile(sec.path);
         if (!previewState.open) openPreview();
         else _refreshPreview();
         closeModal();
@@ -481,13 +474,13 @@ function summarizeScenarioForSection(
 // ============================================================
 
 export function openScenarioDiff(): void {
-  if (scenariosState.list.length < 2) { deps.setStatus('Need at least 2 scenarios.', 'warn'); return; }
+  if (scenariosState.list.length < 2) { setStatus('Need at least 2 scenarios.', 'warn'); return; }
   let target = state.currentPath && /\.html?$/i.test(state.currentPath) ? state.currentPath : null;
   if (!target) {
     const secs = collectSectionHtmlPaths();
     if (secs.length) target = secs[0].path;
   }
-  if (!target) { deps.setStatus('Open an HTML file first.', 'warn'); return; }
+  if (!target) { setStatus('Open an HTML file first.', 'warn'); return; }
 
   const m = getModalEls();
   openModal('Scenario diff', 'Close', closeModal);
@@ -562,3 +555,13 @@ export function openScenarioDiff(): void {
   selB.addEventListener('change', rerender);
   rerender();
 }
+
+// Self-invoke at module load time.
+configureScenarios();
+
+hookOn('afterLoadFromHandle', async () => {
+  try {
+    if (!scenariosState.list.length) await autoLoadScenariosFromFolder();
+    populateScenarioPicker();
+  } catch (e) { console.warn('[scenarios] hook failed:', e); }
+});

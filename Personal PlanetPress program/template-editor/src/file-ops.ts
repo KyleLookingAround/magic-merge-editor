@@ -10,7 +10,7 @@
 
 import { state } from './state';
 import { setStatus } from './status';
-import { emit as hookEmit, emitAsync as hookEmitAsync } from './hooks';
+import { on as hookOn, emit as hookEmit, emitAsync as hookEmitAsync } from './hooks';
 import {
   extOf, langFor, isTextPath, isImagePath,
   ZIP_EXTS, looksLikeText, decodeBytes,
@@ -476,3 +476,20 @@ window.addEventListener('beforeunload', e => {
     loadFromHandle(fakeHandle);
   });
 })();
+
+// ============================================================
+// ADDITIONAL HOOK REGISTRATIONS (runs at module load)
+// ============================================================
+
+// Initial btn-rezip disabled state (re-enabled after each load)
+(document.getElementById('btn-rezip') as HTMLButtonElement).disabled = !state.fileHandle;
+
+// Track standalone original so diff works for non-zip files
+hookOn('afterLoadFromHandle', () => {
+  if (state.standalone) state.standalone.original = state.standalone.content;
+});
+
+// Re-enable rezip after a template loads
+hookOn('afterLoadFromHandle', () => {
+  (document.getElementById('btn-rezip') as HTMLButtonElement).disabled = false;
+});

@@ -14,6 +14,7 @@ import { escapeHtml } from './tree';
 import { extOf, decodeBytes } from './fs';
 import { scriptsState } from './scripts-panel';
 import { scenariosState } from './scenarios';
+import { getConditionOverride, hasAnyConditionOverride } from './condition-toggles';
 import { setStatus } from './status';
 import { openScriptForm } from './script-form';
 
@@ -905,24 +906,29 @@ export function applyDatamodelPersonalization(doc: Document): number {
   }
 
   for (const s of conditionals) {
-    const v = valueByPath.get(s.condField!);
-    if (v == null) continue;
+    const override = getConditionOverride(s.id);
     let pass: boolean;
-    const a = s.condCaseInsensitive ? String(v).toLowerCase() : String(v);
-    const b = s.condCaseInsensitive ? String(s.condValue).toLowerCase() : String(s.condValue);
-    switch (s.condition) {
-      case 'EQUAL_TO':              pass = a === b; break;
-      case 'NOT_EQUAL_TO':          pass = a !== b; break;
-      case 'GREATER_THAN':          pass = parseFloat(a) >  parseFloat(b); break;
-      case 'GREATER_THAN_OR_EQUAL': pass = parseFloat(a) >= parseFloat(b); break;
-      case 'LESS_THAN':             pass = parseFloat(a) <  parseFloat(b); break;
-      case 'LESS_THAN_OR_EQUAL':    pass = parseFloat(a) <= parseFloat(b); break;
-      case 'CONTAINS':              pass = a.indexOf(b) !== -1; break;
-      case 'STARTS_WITH':           pass = a.startsWith(b); break;
-      case 'ENDS_WITH':             pass = a.endsWith(b); break;
-      case 'IS_EMPTY':              pass = !a; break;
-      case 'IS_NOT_EMPTY':          pass = !!a; break;
-      default:                      pass = true;
+    if (override !== undefined) {
+      pass = override;
+    } else {
+      const v = valueByPath.get(s.condField!);
+      if (v == null) continue;
+      const a = s.condCaseInsensitive ? String(v).toLowerCase() : String(v);
+      const b = s.condCaseInsensitive ? String(s.condValue).toLowerCase() : String(s.condValue);
+      switch (s.condition) {
+        case 'EQUAL_TO':              pass = a === b; break;
+        case 'NOT_EQUAL_TO':          pass = a !== b; break;
+        case 'GREATER_THAN':          pass = parseFloat(a) >  parseFloat(b); break;
+        case 'GREATER_THAN_OR_EQUAL': pass = parseFloat(a) >= parseFloat(b); break;
+        case 'LESS_THAN':             pass = parseFloat(a) <  parseFloat(b); break;
+        case 'LESS_THAN_OR_EQUAL':    pass = parseFloat(a) <= parseFloat(b); break;
+        case 'CONTAINS':              pass = a.indexOf(b) !== -1; break;
+        case 'STARTS_WITH':           pass = a.startsWith(b); break;
+        case 'ENDS_WITH':             pass = a.endsWith(b); break;
+        case 'IS_EMPTY':              pass = !a; break;
+        case 'IS_NOT_EMPTY':          pass = !!a; break;
+        default:                      pass = true;
+      }
     }
     const shouldShow = (s.condAction === 'SHOW') ? pass : !pass;
     let matches: NodeListOf<Element>;
@@ -933,8 +939,24 @@ export function applyDatamodelPersonalization(doc: Document): number {
         (el as HTMLElement).style.display = shouldShow ? '' : 'none';
       } else if (!shouldShow) {
         el.remove();
+        return;
+      }
+      if (override !== undefined) {
+        el.setAttribute('data-mm-overridden', shouldShow ? 'show' : 'hide');
       }
     });
+  }
+
+  if (hasAnyConditionOverride() && doc.head) {
+    const style = doc.createElement('style');
+    style.textContent =
+      '/* injected by editor — flag forced conditional overrides */\n' +
+      '[data-mm-overridden]{outline:2px dashed #d97706;outline-offset:2px;position:relative;}\n' +
+      '[data-mm-overridden]::before{content:attr(data-mm-overridden) " (forced)";' +
+      'position:absolute;top:-10px;left:0;background:#d97706;color:#fff;' +
+      'font:10px/1.4 -apple-system,sans-serif;padding:1px 5px;border-radius:2px;' +
+      'z-index:99999;pointer-events:none;text-transform:uppercase;}';
+    doc.head.appendChild(style);
   }
 
   return tokenToValue.size;

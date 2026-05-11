@@ -60,6 +60,7 @@
           <button id="btn-script-new" title="Add a new script">+ New</button>
           <button id="btn-script-delete" title="Delete selected script" disabled>Delete</button>
           <span class="spacer"></span>
+          <button id="btn-cond-toggles" title="Toggle conditional scripts on/off and scrub a truth table of all combinations">Toggles…</button>
         </div>
         <div id="scripts-kind-chips" title="Filter by script kind">
           <button class="chip active" data-kind="ALL">All</button>
@@ -417,6 +418,43 @@
     </div>
   </div>
 </main>
+
+<div id="cond-toggles-backdrop" class="modal-backdrop">
+  <div class="modal cond-toggles-modal">
+    <div class="modal-header">
+      <h2>Conditional script toggles</h2>
+      <button id="cond-toggles-clear" class="secondary" title="Clear all overrides and return to normal evaluation">Clear overrides</button>
+      <button id="cond-toggles-close" class="secondary">Close</button>
+    </div>
+    <div id="cond-toggles-empty" class="diff-empty" style="display:none;">No conditional scripts match elements in the current document.</div>
+    <div id="cond-toggles-body" class="cond-toggles-body">
+      <div id="cond-toggles-warn" class="cond-toggles-warn" style="display:none;"></div>
+      <div class="cond-toggles-split">
+        <div class="cond-toggles-left">
+          <div class="cond-toggles-section-title">Toggle individual scripts</div>
+          <div class="cond-toggles-hint">Click a row to cycle: auto → TRUE → FALSE → auto. Forced sections are outlined in the preview.</div>
+          <div id="cond-toggles-list"></div>
+        </div>
+        <div class="cond-toggles-right">
+          <div class="cond-toggles-section-title">
+            Truth table
+            <span class="spacer"></span>
+            <button id="cond-toggles-prev" title="Previous combination (← / ↑)">◀ Prev</button>
+            <span id="cond-toggles-index-label" class="cond-toggles-index">—</span>
+            <button id="cond-toggles-next" title="Next combination (→ / ↓)">Next ▶</button>
+          </div>
+          <div id="cond-toggles-table" class="cond-toggles-table">
+            <div id="cond-toggles-table-header" class="tt-header"></div>
+            <div id="cond-toggles-table-viewport" class="tt-viewport">
+              <div id="cond-toggles-table-spacer" class="tt-spacer"></div>
+              <div id="cond-toggles-table-rows" class="tt-rows"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 
 <div id="modal-backdrop" class="modal-backdrop">
   <div class="modal">

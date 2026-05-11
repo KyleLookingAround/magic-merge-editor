@@ -1,32 +1,17 @@
 // Cross-file search rendering. Carved out of legacy.ts as the
 // seventh Phase 3 module.
-//
-// Scope: just the result-rendering helpers (`appendSearchFile`,
-// `renderSnippet`). The toggle (`setSidebarMode`), the search
-// driver (`runSearch`) and the script-panel jump (`jumpToSearch`)
-// stay in legacy.ts for now - they reach into the scripts panel,
-// scenario picker, theme panel and navigator, none of which have
-// been carved yet.
-//
-// `openFile` is supplied via configureSearch so this module never
-// imports back into legacy.ts.
+// Phase 13: openFile imported directly; DI seam removed.
+// Search debounce wiring moved to module load.
 
 import { state } from './state';
 import { escapeHtml } from './tree';
+import { openFile } from './file-ops';
 
 export interface SearchHit {
   lineNo: number;
   lineText: string;
   col: number;
 }
-
-export interface SearchDeps {
-  openFile: (path: string) => void;
-}
-
-let deps: SearchDeps = { openFile: () => {} };
-
-export function configureSearch(d: SearchDeps): void { deps = d; }
 
 export function appendSearchFile(
   container: HTMLElement,
@@ -38,7 +23,7 @@ export function appendSearchFile(
   head.className = 'search-file';
   head.textContent = `${path}  (${hits.length})`;
   head.style.cursor = 'pointer';
-  head.addEventListener('click', () => deps.openFile(path));
+  head.addEventListener('click', () => openFile(path));
   container.appendChild(head);
   for (const hit of hits) {
     const el = document.createElement('div');
@@ -48,7 +33,7 @@ export function appendSearchFile(
     const snippet = renderSnippet(hit.lineText, pattern);
     el.innerHTML = lineno + snippet;
     el.addEventListener('click', () => {
-      deps.openFile(path);
+      openFile(path);
       // After Monaco loads/sets the model, position the cursor.
       setTimeout(() => {
         if (state.editor && state.monacoModels[path]) {
@@ -152,3 +137,19 @@ export function runSearch(): void {
     ? `${totalHits} match${totalHits === 1 ? '' : 'es'} in ${filesHit} file${filesHit === 1 ? '' : 's'}`
     : 'No matches';
 }
+
+// ============================================================
+// SEARCH INPUT WIRING (runs at module load)
+// ============================================================
+(function wireSearchInputs() {
+  let debounce: ReturnType<typeof setTimeout> | null = null;
+  ['search-input', 'search-case', 'search-regex', 'search-word'].forEach(id => {
+    document.getElementById(id)!.addEventListener('input', () => {
+      if (debounce != null) clearTimeout(debounce);
+      debounce = setTimeout(runSearch, 150);
+    });
+  });
+  (document.getElementById('search-input') as HTMLInputElement).addEventListener('keydown', e => {
+    if (e.key === 'Escape') { (e.target as HTMLInputElement).value = ''; runSearch(); }
+  });
+})();

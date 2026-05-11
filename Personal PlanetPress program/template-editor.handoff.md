@@ -226,16 +226,45 @@ Five new/extended modules reduced `legacy.ts` from 2,250 → 473 lines (−1,777
 
 ## Suggested next move
 
-Phase 12 is complete. Build green at 186.35 kB, `tsc --noEmit` clean. Next priorities:
+Phase 12 is complete. Build green at 186.35 kB, `tsc --noEmit` clean.
 
-- **Manual smoke test.** Open `dist/index.html` in Chrome/Edge, load `M2L-KFI.OL-template`, exercise the full round-trip: edit a script, Review & Save, reopen. Also: create/clone/delete a script, right-click context menu on file tree, Notes (Ctrl+S), Recent Scripts strip, scenario picker (if datamapper available), coverage matrix, scenario diff, locked-folder unlock, + New file, rename, delete, open folder mode.
-- **GitHub Pages deploy.** Merge to `main` and verify the Pages deploy completes.
-- **Phase 13 (optional cleanup).** What remains:
-  - Drop `setStatus` from all `configure*` DI seams (each module now has `import { setStatus } from './status'` available) — low risk, purely cosmetic.
-  - Drop `openFile` from `configureSearch`, `configureNavigator`, `configureScriptForm`, `configureTree` DI seams — all can import from `file-ops.ts` directly.
-  - Move the preview/search button event wiring from legacy.ts into their respective modules.
-  - Convert the sidebar resizer and preview-pane resizer IIFEs to a new `src/layout.ts`.
-  - Move the Monaco "Go to script" IIFE to `src/monaco-goto.ts`.
-  - At that point legacy.ts would be only the bootstrap call + configure calls + a few cross-module hooks, which could merge into `main.ts`.
+## Phase 13 (completed 2026-05-11) — eliminate legacy.ts, drop all removable DI seams
+
+**`src/legacy.ts` is gone.** All 473 remaining lines were redistributed. Build: 187.96 kB / 50.74 kB gzip. `tsc --noEmit` clean.
+
+**Bug fixed:** `btn-rezip` ("Review & Save") had no click listener — lost during Phase 12. Now wired at module load in `review-modal.ts`.
+
+**DI seam drops** (each module now imports directly from `./status` and/or `./file-ops`):
+- `review-modal.ts`: dropped `ReviewModalDeps` entirely (imports `setStatus`, `commitCurrentEdit`, `rezipAndSave` directly).
+- `notes.ts`: dropped `NotesDeps`; DOM wiring moved to module-load IIFE.
+- `navigator.ts`: dropped `NavigatorDeps` + `configureNavigator`; imports `openFile` + `setStatus` directly.
+- `search.ts`: dropped `SearchDeps` + `configureSearch`; imports `openFile` directly; debounce wiring moved to module-load IIFE.
+- `preset-overlay.ts`: dropped `PresetOverlayDeps`; DOM wiring + hook moved to module-load IIFE.
+- `scripts-panel.ts`: dropped `setStatus` from `ScriptListDeps`.
+- `script-form.ts`: dropped `openFile` + `setStatus` from `ScriptFormDeps`; `setSidebarMode` remains (cycle prevention: `sidebar.ts → preview.ts → ...`).
+- `scenarios.ts`: dropped `setStatus` + `refreshPreview` from `ScenarioDeps` (both already imported from `./preview`); `openFile` remains (cycle: `file-ops.ts → preview.ts → scenarios.ts`). Scenario picker DOM wiring moved to module-load IIFE; `configureScenarios` now only sets `deps.openFile`.
+- `preview.ts`: dropped `setStatus` + `openScriptForm` from `PreviewHelperDeps` (both imported directly); all preview buttons + zoom + CSS copy + wheel zoom wired at module load. `setSidebarMode` remains (cycle: `sidebar.ts → preview.ts`).
+
+**Event wiring moved to modules (at module load):**
+- `sidebar.ts`: `mode-files`, `mode-search`, `mode-theme` clicks + `Ctrl+Shift+F`.
+- `editor.ts`: `Ctrl+Alt+L` format shortcut.
+- `search.ts`: search input debounce.
+- `preview.ts`: all preview panel buttons.
+- `review-modal.ts`: `btn-rezip`, `btn-compare`.
+
+**New modules:**
+- `src/layout.ts`: sidebar + preview-pane drag-resizers.
+- `src/monaco-goto.ts`: Monaco "Go to script for @token@" action.
+
+**`main.ts`** is now the bootstrap + configure + cross-section hooks file (~160 lines). Remaining `configure*` calls (kept because of import cycles):
+- `configureTree({ openFile })` — `tree.ts` can't import `file-ops.ts` (cycle: `file-ops → tree → file-ops`).
+- `configureScriptsList({ openScriptForm, toggleScriptEnabled, moveScript, setSidebarMode })` — all four in modules that import `scripts-panel.ts` (would create cycles).
+- `configureScriptForm({ setSidebarMode })` — `sidebar.ts` imports `preview.ts` which imports `scripts-panel.ts` (cycle).
+- `configureScenarios({ openFile })` — `file-ops → preview → scenarios` cycle.
+- `configurePreviewHelpers({ setSidebarMode })` — `sidebar → preview` cycle.
+
+**Next priorities:**
+- **Manual smoke test.** Load `M2L-KFI.OL-template`, full round-trip: edit a script, *Review & Save*, reopen. Also: create/clone/delete a script, context menu on file tree, Notes (Ctrl+S), Recent Scripts strip, scenario picker, coverage matrix, scenario diff, locked-folder unlock, + New file, rename, delete, open folder mode.
+- **GitHub Pages deploy.** Merge to `main` and verify Pages deploy completes.
 
 Smoke target after any edit: `npm run build` → open `dist/index.html` in Chrome/Edge → load `M2L-KFI.OL-template` → edit a script → *Review & Save* → reopen → verify round-trip.
